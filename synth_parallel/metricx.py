@@ -1,0 +1,179 @@
+from __future__ import annotations
+
+import json
+import logging
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+from .caches import SQLiteKVCache
+from .config import MetricXConfig
+from .stats import StatsCollector
+from .utils import jaccard_overlap, stable_hash
+
+
+class MetricXScorer:
+    def __init__(
+        self,
+        cfg: MetricXConfig,
+        cache_db_path: str,
+        stats: StatsCollector,
+        logger: logging.Logger | None = None,
+    ):
+        self.cfg = cfg
+        self.cache = SQLiteKVCache(cache_db_path, table_name="metricx_cache")
+        self.stats = stats
+        self.logger = logger or logging.getLogger(__name__)
+
+    def _cache_key(self, source: str, hypothesis: str) -> str:
+        return stable_hash({"source": source, "hypothesis": hypothesis, "checkpoint": self.cfg.checkpoint})
+
+    def score_batch(self, pairs: list[tuple[str, str]]) -> list[float]:
+        results: list[float | None] = [None] * len(pairs)
+        uncached_indices: list[int] = []
+        uncached_pairs: list[tuple[str, str]] = []
+
+        for i, (source, hyp) in enumerate(pairs):
+            key = self._cache_key(source, hyp)
+            cached = self.cache.get(key)
+            if cached is not None:
+                self.stats.inc("metricx.cache_hit")
+                results[i] = float(cached["score"])
+            else:
+                self.stats.inc("metricx.cache_miss")
+                uncached_indices.append(i)
+                uncached_pairs.append((source, hyp))
+
+        if uncached_pairs:
+            with self.stats.time_block("metricx.score_batch"):
+                if self.cfg.backend == "metricx24_cli":
+                    scores = self._score_metricx24_cli(uncached_pairs)
+                else:
+                    scores = [self._heuristic_score(src, hyp) for src, hyp in uncached_pairs]
+                    self.logger.warning(
+                        "metricx backend '%s' is using heuristic fallback; scores are not MetricX.",
+                        self.cfg.backend,
+                    )
+            for idx, score, pair in zip(uncached_indices, scores, uncached_pairs):
+                results[idx] = score
+                key = self._cache_key(pair[0], pair[1])
+                self.cache.set(key, {"score": score, "backend": self.cfg.backend})
+
+        return [float(x) if x is not None else 25.0 for x in results]
+
+    def _score_metricx24_cli(self, pairs: list[tuple[str, str]]) -> list[float]:
+        if not pairs:
+            return []
+
+        with tempfile.TemporaryDirectory(prefix="metricx-") as tmp_dir:
+            tmp = Path(tmp_dir)
+            in_path = tmp / "input.jsonl"
+            out_path = tmp / "output.jsonl"
+
+            with in_path.open("w", encoding="utf-8") as fp:
+                for source, hyp in pairs:
+                    row = {
+                        "source": source,
+                        "hypothesis": hyp,
+                        "reference": "",
+                    }
+                    fp.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+            self._run_metricx_command(in_path, out_path)
+
+            scores: list[float] = []
+            with out_path.open("r", encoding="utf-8") as fp:
+                for line in fp:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    row = json.loads(line)
+                    score = (
+                        row.get("metricx_score")
+                        or row.get("predicted_score")
+                        or row.get("score")
+                        or row.get("prediction")
+                    )
+                    if score is None:
+                        raise RuntimeError(f"MetricX output missing score field: {row}")
+                    scores.append(float(score))
+
+            if len(scores) != len(pairs):
+                raise RuntimeError(
+                    f"MetricX output size mismatch: expected {len(pairs)} rows, got {len(scores)}"
+                )
+            self.stats.inc("metricx.success", value=len(scores))
+            return scores
+
+    def _run_metricx_command(self, in_path: Path, out_path: Path) -> None:
+        python_bin = self.cfg.python_bin.strip() if self.cfg.python_bin else ""
+        if not python_bin:
+            python_bin = sys.executable
+
+        base = [
+            python_bin,
+            "-m",
+            self.cfg.module,
+            "--model",
+            self.cfg.checkpoint,
+            "--qe",
+            "--batch_size",
+            str(self.cfg.batch_size),
+        ]
+
+        variants = [
+            base + ["--tokenizer", "google/mt5-xl", "--input", str(in_path), "--output", str(out_path)],
+            base
+            + [
+                "--tokenizer",
+                "google/mt5-xl",
+                "--input_file",
+                str(in_path),
+                "--output_file",
+                str(out_path),
+            ],
+            base + ["--tokenizer", "google/mt5-xl", str(in_path), str(out_path)],
+            base + ["--input", str(in_path), "--output", str(out_path)],
+            base + [str(in_path), str(out_path)],
+        ]
+
+        env = self._build_metricx_env()
+        last_error = ""
+        for cmd in variants:
+            proc = subprocess.run(cmd, capture_output=True, text=True, env=env)
+            if proc.returncode == 0 and out_path.exists() and out_path.stat().st_size > 0:
+                self.logger.info("MetricX command succeeded: %s", " ".join(cmd))
+                return
+            last_error = (proc.stderr or proc.stdout or "").strip()
+
+        self.stats.inc("metricx.error")
+        raise RuntimeError(
+            "Failed to run metricx24.predict. Install metricx24 and verify CLI flags. "
+            f"Last error: {last_error}"
+        )
+
+    def _build_metricx_env(self) -> dict[str, str]:
+        env = dict(os.environ)
+        device = (self.cfg.device or "").strip().lower()
+        if device.startswith("cuda:"):
+            gpu_id = device.split(":", maxsplit=1)[1]
+            if gpu_id:
+                env["CUDA_VISIBLE_DEVICES"] = gpu_id
+        elif device == "cpu":
+            env["CUDA_VISIBLE_DEVICES"] = ""
+        return env
+
+    @staticmethod
+    def _heuristic_score(source: str, hypothesis: str) -> float:
+        if not hypothesis.strip():
+            return 25.0
+        ratio = len(hypothesis) / max(1, len(source))
+        ratio_penalty = abs(1.0 - ratio) * 5.0
+        overlap_penalty = jaccard_overlap(source, hypothesis) * 10.0
+        score = 5.0 + ratio_penalty + overlap_penalty
+        return max(0.0, min(25.0, score))
+
+    def close(self) -> None:
+        self.cache.close()

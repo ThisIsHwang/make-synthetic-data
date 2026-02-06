@@ -1,0 +1,92 @@
+run:
+  out_dir: ./runs/exp001
+  seed: 1234
+  log_level: INFO
+
+data:
+  madlad_dataset: allenai/madlad-400
+  madlad_split: clean
+  src_lang: kor
+  tgt_lang: eng
+  src_lang_name: Korean
+  tgt_lang_name: English
+  target_examples_total: 10000
+  sample_pool_size: 1000000
+  text_field: text
+  streaming: true
+  sentence_ratio: 0.5
+  blob_ratio: 0.5
+
+segmentation:
+  mode: auto
+  min_chars: 20
+  max_chars: 5000
+  merge_short_lines: true
+  short_line_threshold: 12
+  split_punctuation_regex: '(?<=[.!?。！？])\s+'
+  drop_noise: true
+
+bucketing:
+  boundaries: [0, 10, 20, 40, 80, 120, 200, 400, 800, 999999]
+  measure: approx_tokens
+  per_bucket_quota: auto
+  bucket_oversample_factor: 2.0
+
+teacher:
+  backend: openai_compatible
+  base_url: https://your-qwen-endpoint.example.com/v1
+  api_key_env: QWEN_API_KEY
+  model: Qwen/Qwen3-235B-A22B-Instruct-2507
+  request_timeout_s: 120
+  max_concurrency: 32
+  retry:
+    max_attempts: 6
+    backoff_s: [1, 2, 4, 8, 16, 32]
+  generation:
+    max_tokens: 512
+    top_p: 1.0
+    greedy_temperature: 0.0
+    sample_temperature: 1.0
+    final_temperature: 1.0
+
+final_generation:
+  num_candidates: 128
+  store_top_k: 1
+  strategy: auto
+  blob:
+    enabled: true
+    blob_ratio: 0.5
+    blob_max_tokens: 512
+
+metricx:
+  checkpoint: google/metricx-24-hybrid-large-v2p6
+  batch_size: 64
+  device: cuda:0
+  cache_db: metricx_cache.sqlite
+  backend: metricx24_cli
+  python_bin: ./.venv-metricx/bin/python
+  module: metricx24.predict
+
+filters:
+  rule_based: true
+  min_chars: 1
+  max_chars: 20000
+  length_ratio_min: 0.2
+  length_ratio_max: 4.0
+  max_copy_overlap: 0.8
+  blocked_substrings:
+    - "Here is the translation"
+    - "I will translate"
+    - "번역:"
+    - "assistant:"
+    - "user:"
+    - "system:"
+    - "<think>"
+    - "</think>"
+    - "```"
+  llm_judge:
+    enabled: true
+    model: Qwen/Qwen3-235B-A22B-Instruct-2507
+    temperature: 0.0
+    max_tokens: 128
+    fail_policy: conservative
