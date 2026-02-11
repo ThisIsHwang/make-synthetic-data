@@ -39,6 +39,7 @@ TranslateGemma 방식(MADLAD-400 -> prefilter 2-sample -> final 128-sample -> Me
 - GPU: MetricX용 로컬 H100 1장 이상 권장
 - 네트워크: Qwen API endpoint 접근 가능해야 함
 - 디스크: 중간 산출물/캐시 용량 충분히 확보
+- Hugging Face 토큰: 대용량 MADLAD 접근 시 rate limit 회피를 위해 권장 (`HF_TOKEN`)
 
 ## 4. 환경 구성 (uv)
 
@@ -52,6 +53,9 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 
 # 프로젝트 루트
 cd /path/to/make-data2
+
+# Hugging Face 토큰(권장)
+export HF_TOKEN="<your-hf-token>"
 
 # 메인 env 생성
 uv venv .venv --python 3.11
@@ -118,6 +122,8 @@ source .venv/bin/activate
 - 기본값: `allenai/MADLAD-400`
 - `data.src_lang`
 - MADLAD config name (예: 한국어는 `ko`)
+- `data.hf_token_env`
+- Hugging Face 토큰 env 이름 (기본 `HF_TOKEN`)
 - `metricx.backend`
 - `metricx24_cli` 사용
 - `metricx.device`
@@ -156,6 +162,7 @@ metricx:
 
 ```bash
 export QWEN_API_KEY="<your-api-key>"
+export HF_TOKEN="<your-hf-token>"
 ```
 
 ## 6. MADLAD 다운로드/캐시 (CPU)

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import heapq
 import logging
+import os
 import random
 from dataclasses import asdict
 from pathlib import Path
@@ -184,12 +185,36 @@ class PipelineRunner:
             self.cfg.data.madlad_split,
             self.cfg.data.streaming,
         )
-        dataset = load_dataset(
-            self.cfg.data.madlad_dataset,
-            self.cfg.data.src_lang,
-            split=self.cfg.data.madlad_split,
-            streaming=self.cfg.data.streaming,
-        )
+        token = os.getenv(self.cfg.data.hf_token_env, "").strip()
+        load_kwargs: dict[str, Any] = {
+            "split": self.cfg.data.madlad_split,
+            "streaming": self.cfg.data.streaming,
+        }
+        if token:
+            load_kwargs["token"] = token
+        if self.cfg.data.madlad_revision:
+            load_kwargs["revision"] = self.cfg.data.madlad_revision
+
+        try:
+            dataset = load_dataset(
+                self.cfg.data.madlad_dataset,
+                self.cfg.data.src_lang,
+                **load_kwargs,
+            )
+        except Exception as exc:  # pylint: disable=broad-except
+            msg = str(exc).lower()
+            if "429" in msg or "rate limit" in msg:
+                raise RuntimeError(
+                    "Failed to access MADLAD due to Hugging Face rate limit. "
+                    f"Set {self.cfg.data.hf_token_env} and retry."
+                ) from exc
+            if "datafilesnotfounderror" in type(exc).__name__.lower() or "no (supported) data files found" in msg:
+                raise RuntimeError(
+                    "MADLAD files could not be resolved. "
+                    "Check data.madlad_dataset='allenai/MADLAD-400', "
+                    "data.src_lang (e.g. en/ko), and ensure HF token is configured."
+                ) from exc
+            raise
 
         processed_docs = 0
         processed_segments = 0
