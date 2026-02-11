@@ -66,23 +66,33 @@ uv pip install pytest
 
 ### 4.2 MetricX 전용 별도 환경 (구버전 호환)
 
-MetricX가 구버전 Python/라이브러리를 요구하는 경우 메인 env와 분리해서 운영합니다.
+MetricX는 PyPI 패키지로 배포되지 않는 경우가 많아서(`metricx24`가 pip에서 안 잡힘), **GitHub `google-research/metricx` 레포 기준**으로 설치합니다.
+
+또한 해당 레포의 `requirements.txt`가 구버전 의존성을 고정합니다:
+- `transformers[torch]==4.30.2`
+- `sentencepiece==0.1.99`
+- `datasets==2.13.1`
+- `git+https://github.com/google-research/mt-metrics-eval`
 
 ```bash
 cd /path/to/make-data2
+
+# MetricX 레포 clone (원하는 위치로 변경 가능)
+mkdir -p third_party
+git clone https://github.com/google-research/metricx third_party/metricx
 
 # 예시: 구버전 호환용 env (필요 버전에 맞게 변경)
 uv venv .venv-metricx --python 3.10
 source .venv-metricx/bin/activate
 
-# MetricX 설치 (환경에 맞는 버전으로 고정 권장)
-uv pip install metricx24
-
-# GPU 런타임 필요 시 torch/transformers 등 추가 설치
-# 예시(환경별로 다를 수 있음):
+# PyTorch 설치(환경/CUDA에 맞게). 아래는 예시이며, 서버 환경에 맞게 선택하세요.
 # uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
 
+# GitHub 레포 requirements 그대로 설치
+uv pip install -r third_party/metricx/requirements.txt
+
 # 설치 확인
+cd third_party/metricx
 python -m metricx24.predict --help
 ```
 
@@ -117,6 +127,10 @@ source .venv/bin/activate
 - 예: `./.venv-metricx/bin/python`
 - `metricx.module`
 - 기본 `metricx24.predict`
+- `metricx.repo_dir`
+- `google-research/metricx`를 clone한 디렉터리(예: `./third_party/metricx`)
+- `metricx.max_input_length`
+- MetricX-24 기본 1536 권장(레포 README 예시)
 
 예시(중요 부분):
 
@@ -133,6 +147,9 @@ metricx:
   device: cuda:0
   python_bin: ./.venv-metricx/bin/python
   module: metricx24.predict
+  repo_dir: ./third_party/metricx
+  tokenizer: google/mt5-xl
+  max_input_length: 1536
 ```
 
 환경변수 설정:
@@ -253,7 +270,7 @@ python -m synth_parallel.cli run --config config/example.yaml --stage export
 
 - `metricx24.predict` 실행 실패
 - `metricx.python_bin` 경로 확인
-- MetricX 전용 env에서 `python -m metricx24.predict --help` 먼저 확인
+- MetricX 전용 env에서 `cd third_party/metricx && python -m metricx24.predict --help` 먼저 확인
 - Qwen API 인증 실패
 - `QWEN_API_KEY` 값과 `teacher.api_key_env` 일치 확인
 - 처리 도중 중단됨

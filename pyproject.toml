@@ -19,9 +19,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-metricx = [
-  "metricx24",
-]
 test = [
   "pytest>=8.0.0",
 ]

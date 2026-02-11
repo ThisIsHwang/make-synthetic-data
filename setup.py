@@ -14,7 +14,6 @@ setup(
         "typing-extensions>=4.10.0",
     ],
     extras_require={
-        "metricx": ["metricx24"],
         "test": ["pytest>=8.0.0"],
     },
     entry_points={

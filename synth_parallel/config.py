@@ -103,6 +103,9 @@ class MetricXConfig:
     backend: str = "metricx24_cli"
     python_bin: str = ""
     module: str = "metricx24.predict"
+    repo_dir: str = ""
+    tokenizer: str = "google/mt5-xl"
+    max_input_length: int = 1536
 
 
 @dataclass

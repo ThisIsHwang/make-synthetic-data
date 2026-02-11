@@ -112,37 +112,39 @@ class MetricXScorer:
         if not python_bin:
             python_bin = sys.executable
 
-        base = [
-            python_bin,
-            "-m",
-            self.cfg.module,
-            "--model",
-            self.cfg.checkpoint,
-            "--qe",
-            "--batch_size",
-            str(self.cfg.batch_size),
-        ]
+        repo_dir = self.cfg.repo_dir.strip() if getattr(self.cfg, "repo_dir", "") else ""
+        cwd = repo_dir or None
+        if repo_dir and not Path(repo_dir).exists():
+            raise RuntimeError(f"metricx.repo_dir does not exist: {repo_dir}")
 
+        # Align with google-research/metricx usage:
+        # python -m metricx24.predict --tokenizer ... --model_name_or_path ... --max_input_length ...
+        #   --batch_size ... --input_file ... --output_file ... --qe
         variants = [
-            base + ["--tokenizer", "google/mt5-xl", "--input", str(in_path), "--output", str(out_path)],
-            base
-            + [
+            [
+                python_bin,
+                "-m",
+                self.cfg.module,
                 "--tokenizer",
-                "google/mt5-xl",
+                self.cfg.tokenizer,
+                "--model_name_or_path",
+                self.cfg.checkpoint,
+                "--max_input_length",
+                str(self.cfg.max_input_length),
+                "--batch_size",
+                str(self.cfg.batch_size),
                 "--input_file",
                 str(in_path),
                 "--output_file",
                 str(out_path),
-            ],
-            base + ["--tokenizer", "google/mt5-xl", str(in_path), str(out_path)],
-            base + ["--input", str(in_path), "--output", str(out_path)],
-            base + [str(in_path), str(out_path)],
+                "--qe",
+            ]
         ]
 
         env = self._build_metricx_env()
         last_error = ""
         for cmd in variants:
-            proc = subprocess.run(cmd, capture_output=True, text=True, env=env)
+            proc = subprocess.run(cmd, capture_output=True, text=True, env=env, cwd=cwd)
             if proc.returncode == 0 and out_path.exists() and out_path.stat().st_size > 0:
                 self.logger.info("MetricX command succeeded: %s", " ".join(cmd))
                 return
@@ -150,7 +152,8 @@ class MetricXScorer:
 
         self.stats.inc("metricx.error")
         raise RuntimeError(
-            "Failed to run metricx24.predict. Install metricx24 and verify CLI flags. "
+            "Failed to run MetricX (google-research/metricx). "
+            "Verify metricx.repo_dir (git clone) and that requirements are installed in metricx.python_bin env. "
             f"Last error: {last_error}"
         )
 

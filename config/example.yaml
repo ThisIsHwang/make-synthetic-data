@@ -66,6 +66,9 @@ metricx:
   backend: metricx24_cli
   python_bin: ./.venv-metricx/bin/python
   module: metricx24.predict
+  repo_dir: ./third_party/metricx
+  tokenizer: google/mt5-xl
+  max_input_length: 1536
 
 filters:
   rule_based: true
