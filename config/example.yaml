@@ -6,10 +6,10 @@ run:
 data:
   madlad_dataset: allenai/MADLAD-400
   madlad_split: clean
-  src_lang: ko
-  tgt_lang: en
-  src_lang_name: Korean
-  tgt_lang_name: English
+  src_lang: en
+  tgt_lang: ko
+  src_lang_name: English
+  tgt_lang_name: Korean
   target_examples_total: 10000
   sample_pool_size: 1000000
   text_field: text

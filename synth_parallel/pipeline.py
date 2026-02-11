@@ -148,7 +148,9 @@ class PipelineRunner:
             logger.info("sample_sources output already exists, skip due to --resume: %s", out_path)
             return
 
-        limit = self._effective_limit(default=1000)
+        # In full runs, do not cap document scan by default.
+        # In dry-run, _effective_limit() returns a small default (1000).
+        limit = self._effective_limit()
         pool_size = min(self.cfg.data.sample_pool_size, limit) if limit else self.cfg.data.sample_pool_size
 
         sentence_quota = int(pool_size * self.cfg.data.sentence_ratio)

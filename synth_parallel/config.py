@@ -18,10 +18,10 @@ class RunConfig:
 class DataConfig:
     madlad_dataset: str = "allenai/MADLAD-400"
     madlad_split: str = "clean"
-    src_lang: str = "ko"
-    tgt_lang: str = "en"
-    src_lang_name: str = "Korean"
-    tgt_lang_name: str = "English"
+    src_lang: str = "en"
+    tgt_lang: str = "ko"
+    src_lang_name: str = "English"
+    tgt_lang_name: str = "Korean"
     target_examples_total: int = 10_000
     sample_pool_size: int = 1_000_000
     text_field: str = "text"
