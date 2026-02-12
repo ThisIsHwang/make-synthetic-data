@@ -95,6 +95,9 @@ source .venv-metricx/bin/activate
 # GitHub 레포 requirements 그대로 설치
 uv pip install -r third_party/metricx/requirements.txt
 
+# datasets==2.13.1과 최신 pyarrow 충돌 방지
+uv pip install "pyarrow<21"
+
 # 설치 확인
 cd third_party/metricx
 python -m metricx24.predict --help

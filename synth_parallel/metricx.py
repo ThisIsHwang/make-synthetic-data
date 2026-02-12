@@ -154,6 +154,11 @@ class MetricXScorer:
             last_error = (proc.stderr or proc.stdout or "").strip()
 
         self.stats.inc("metricx.error")
+        if "pyextensiontype" in last_error.lower():
+            raise RuntimeError(
+                "MetricX runtime has incompatible pyarrow version for datasets==2.13.1. "
+                f"Install pyarrow<21 in metricx env: {python_bin} -m pip install 'pyarrow<21'"
+            )
         if "use_auth_token" in last_error and "hf_hub_download" in last_error:
             raise RuntimeError(
                 "MetricX runtime has incompatible huggingface stack. "
@@ -179,6 +184,12 @@ class MetricXScorer:
         proc = subprocess.run(check_cmd, capture_output=True, text=True, cwd=cwd)
         if proc.returncode != 0:
             stderr = (proc.stderr or proc.stdout or "").strip()
+            if "PyExtensionType" in stderr or "pyextensiontype" in stderr.lower():
+                raise RuntimeError(
+                    "metricx.python_bin hits datasets/pyarrow incompatibility "
+                    "(missing pyarrow.PyExtensionType). "
+                    f"Install pyarrow<21 in that env: {python_bin} -m pip install 'pyarrow<21'"
+                )
             raise RuntimeError(
                 "metricx.python_bin cannot import datasets. "
                 "Install metricx requirements in that exact interpreter. "
