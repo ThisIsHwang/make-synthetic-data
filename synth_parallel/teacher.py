@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 import httpx
-from openai import OpenAI
+from openai import APIStatusError, OpenAI
 
 from .caches import SQLiteKVCache
 from .config import TeacherConfig
@@ -178,6 +178,27 @@ class TeacherClient:
                 self.stats.inc("teacher.error")
                 wait = backoff[min(attempt, len(backoff) - 1)] if backoff else (2**attempt)
                 wait = wait + self.random.random() * 0.25
+
+                no_retry = False
+                if isinstance(exc, APIStatusError):
+                    status = int(getattr(exc, "status_code", 0) or 0)
+                    resp_text = getattr(getattr(exc, "response", None), "text", None)
+                    self.logger.error(
+                        "Teacher HTTP error status=%s type=%s body=%s",
+                        status,
+                        type(exc).__name__,
+                        (resp_text[:500] if isinstance(resp_text, str) else None),
+                    )
+                    # Fast-fail for non-retriable client errors.
+                    if status in {400, 401, 403, 404, 422}:
+                        no_retry = True
+                else:
+                    self.logger.error(
+                        "Teacher error type=%s detail=%r",
+                        type(exc).__name__,
+                        exc,
+                    )
+
                 self.logger.warning(
                     "Teacher call failed (attempt=%s/%s): %s",
                     attempt + 1,
@@ -190,7 +211,7 @@ class TeacherClient:
                     self.logger.error(
                         "vLLM chat template error detected. Start server with --chat-template if needed."
                     )
-                if attempt == max_attempts - 1:
+                if no_retry or attempt == max_attempts - 1:
                     raise
                 self.stats.inc("teacher.retry")
                 time.sleep(wait)
