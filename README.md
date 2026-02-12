@@ -137,6 +137,7 @@ source .venv/bin/activate
 - `metricx.python_bin`
 - MetricX 전용 env의 Python 경로
 - 예: `./.venv-metricx/bin/python`
+- 상대경로는 **config 파일 위치 기준**으로 해석
 - `metricx.module`
 - 기본 `metricx24.predict`
 - `metricx.repo_dir`

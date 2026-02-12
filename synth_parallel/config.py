@@ -188,10 +188,23 @@ def _coerce_dataclass(cls: type[Any], data: dict[str, Any]) -> Any:
     return cls(**kwargs)
 
 
+def _resolve_optional_path(value: str | None, base_dir: Path) -> str | None:
+    if value is None:
+        return None
+    raw = str(value).strip()
+    if not raw:
+        return value
+    expanded = Path(raw).expanduser()
+    if expanded.is_absolute():
+        return str(expanded)
+    return str((base_dir / expanded).resolve())
+
+
 def load_config(path: str | Path) -> PipelineConfig:
     config_path = Path(path)
     payload = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     cfg = _coerce_dataclass(PipelineConfig, payload)
+    config_dir = config_path.parent.resolve()
 
     # Backward-compatible aliases from older specs/examples.
     lang_alias = {
@@ -200,6 +213,11 @@ def load_config(path: str | Path) -> PipelineConfig:
     }
     cfg.data.src_lang = lang_alias.get(cfg.data.src_lang, cfg.data.src_lang)
     cfg.data.tgt_lang = lang_alias.get(cfg.data.tgt_lang, cfg.data.tgt_lang)
+
+    # Resolve file paths relative to config file location.
+    cfg.metricx.python_bin = _resolve_optional_path(cfg.metricx.python_bin, config_dir) or ""
+    cfg.metricx.repo_dir = _resolve_optional_path(cfg.metricx.repo_dir, config_dir) or ""
+    cfg.data.local_data_glob = _resolve_optional_path(cfg.data.local_data_glob, config_dir)
 
     dataset_name = cfg.data.madlad_dataset.strip()
     if "allendai/" in dataset_name.lower():
@@ -217,6 +235,11 @@ def load_config(path: str | Path) -> PipelineConfig:
         raise ValueError("teacher.max_concurrency must be > 0")
     if cfg.final_generation.num_candidates <= 0:
         raise ValueError("final_generation.num_candidates must be > 0")
+    if cfg.metricx.python_bin and not Path(cfg.metricx.python_bin).exists():
+        raise ValueError(
+            f"metricx.python_bin does not exist: {cfg.metricx.python_bin} "
+            "(path is resolved relative to the config file location)."
+        )
 
     return cfg
 
