@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -117,6 +118,8 @@ class MetricXScorer:
         if repo_dir and not Path(repo_dir).exists():
             raise RuntimeError(f"metricx.repo_dir does not exist: {repo_dir}")
 
+        self._validate_metricx_runtime(python_bin, cwd)
+
         # Align with google-research/metricx usage:
         # python -m metricx24.predict --tokenizer ... --model_name_or_path ... --max_input_length ...
         #   --batch_size ... --input_file ... --output_file ... --qe
@@ -151,11 +154,43 @@ class MetricXScorer:
             last_error = (proc.stderr or proc.stdout or "").strip()
 
         self.stats.inc("metricx.error")
+        if "use_auth_token" in last_error and "hf_hub_download" in last_error:
+            raise RuntimeError(
+                "MetricX runtime has incompatible huggingface stack. "
+                "This usually means datasets is too old (e.g. 1.x). "
+                "Reinstall metricx env with: "
+                f"{python_bin} -m pip install -r {Path(repo_dir) / 'requirements.txt' if repo_dir else 'requirements.txt'}"
+            )
         raise RuntimeError(
             "Failed to run MetricX (google-research/metricx). "
             "Verify metricx.repo_dir (git clone) and that requirements are installed in metricx.python_bin env. "
             f"Last error: {last_error}"
         )
+
+    def _validate_metricx_runtime(self, python_bin: str, cwd: str | None) -> None:
+        check_cmd = [
+            python_bin,
+            "-c",
+            (
+                "import datasets,sys;"
+                "print(datasets.__version__)"
+            ),
+        ]
+        proc = subprocess.run(check_cmd, capture_output=True, text=True, cwd=cwd)
+        if proc.returncode != 0:
+            stderr = (proc.stderr or proc.stdout or "").strip()
+            raise RuntimeError(
+                "metricx.python_bin cannot import datasets. "
+                "Install metricx requirements in that exact interpreter. "
+                f"python_bin={python_bin}, error={stderr}"
+            )
+        version = (proc.stdout or "").strip().splitlines()[-1]
+        match = re.match(r"^(\\d+)\\.(\\d+)\\.(\\d+)", version)
+        if match and int(match.group(1)) < 2:
+            raise RuntimeError(
+                "metricx.python_bin has datasets<2 installed "
+                f"(detected {version}). MetricX repo expects datasets==2.13.1."
+            )
 
     def _build_metricx_env(self) -> dict[str, str]:
         env = dict(os.environ)
