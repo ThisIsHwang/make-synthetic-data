@@ -55,6 +55,61 @@ class TeacherClient:
         self.cache = SQLiteKVCache(cache_db_path, table_name="teacher_cache")
         self.random = random.Random()
 
+    @staticmethod
+    def _content_to_text(content: Any) -> str:
+        if content is None:
+            return ""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, bytes):
+            return content.decode("utf-8", errors="ignore")
+        if isinstance(content, (int, float, bool)):
+            return str(content)
+        if isinstance(content, list):
+            return "".join(TeacherClient._content_to_text(part) for part in content)
+        if isinstance(content, dict):
+            for key in ("text", "output_text", "content", "reasoning_content", "value"):
+                if key in content:
+                    return TeacherClient._content_to_text(content.get(key))
+            return ""
+
+        for attr in ("text", "output_text", "content", "reasoning_content", "value"):
+            value = getattr(content, attr, None)
+            if value is not None:
+                text = TeacherClient._content_to_text(value)
+                if text:
+                    return text
+
+        dump = getattr(content, "model_dump", None)
+        if callable(dump):
+            try:
+                return TeacherClient._content_to_text(dump())
+            except Exception:  # pylint: disable=broad-except
+                return ""
+
+        return ""
+
+    @classmethod
+    def _extract_response_text(cls, response: Any) -> str:
+        choices = getattr(response, "choices", None) or []
+        if not choices:
+            return ""
+        choice = choices[0]
+        message = getattr(choice, "message", None)
+
+        candidates = [
+            cls._content_to_text(getattr(message, "content", None)),
+            cls._content_to_text(getattr(message, "output_text", None)),
+            cls._content_to_text(getattr(message, "text", None)),
+            cls._content_to_text(getattr(choice, "text", None)),
+            cls._content_to_text(getattr(choice, "output_text", None)),
+        ]
+        for candidate in candidates:
+            text = candidate.strip()
+            if text:
+                return text
+        return ""
+
     def _cache_key(
         self,
         model: str,
@@ -84,8 +139,12 @@ class TeacherClient:
         cache_key = self._cache_key(chosen_model, messages, temperature, top_p, max_tokens)
         cached = self.cache.get(cache_key)
         if cached is not None:
-            self.stats.inc("teacher.cache_hit")
-            return str(cached.get("text", ""))
+            cached_text = str(cached.get("text", "")).strip()
+            if cached_text:
+                self.stats.inc("teacher.cache_hit")
+                return cached_text
+            self.stats.inc("teacher.cache_stale_empty")
+            self.logger.warning("Ignoring empty teacher cache entry and refetching key=%s", cache_key[:12])
 
         self.stats.inc("teacher.cache_miss")
         backoff = self.cfg.retry.backoff_s
@@ -102,18 +161,19 @@ class TeacherClient:
                         max_tokens=max_tokens,
                         extra_headers={"Idempotency-Key": cache_key},
                     )
-                content = response.choices[0].message.content
-                if isinstance(content, list):
-                    text = "".join(
-                        part.get("text", "") if isinstance(part, dict) else str(part)
-                        for part in content
+                text = self._extract_response_text(response)
+                if not text:
+                    self.stats.inc("teacher.empty_response")
+                    choices = getattr(response, "choices", None) or []
+                    finish_reason = getattr(choices[0], "finish_reason", None) if choices else None
+                    raise RuntimeError(
+                        "Teacher returned empty completion text "
+                        f"(finish_reason={finish_reason}, model={chosen_model})"
                     )
-                else:
-                    text = str(content or "")
 
                 self.cache.set(cache_key, {"text": text, "model": chosen_model})
                 self.stats.inc("teacher.success")
-                return text.strip()
+                return text
             except Exception as exc:  # pylint: disable=broad-except
                 self.stats.inc("teacher.error")
                 wait = backoff[min(attempt, len(backoff) - 1)] if backoff else (2**attempt)
