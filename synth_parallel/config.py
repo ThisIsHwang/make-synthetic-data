@@ -78,6 +78,7 @@ class TeacherConfig:
     api_key_env: str = "QWEN_API_KEY"
     model: str = "Qwen/Qwen3-235B-A22B-Instruct-2507"
     request_timeout_s: float = 120.0
+    sdk_max_retries: int = 0
     unset_proxy_env: bool = True
     max_concurrency: int = 32
     retry: RetryConfig = field(default_factory=RetryConfig)
@@ -233,6 +234,8 @@ def load_config(path: str | Path) -> PipelineConfig:
         raise ValueError("data.target_examples_total must be > 0")
     if cfg.teacher.max_concurrency <= 0:
         raise ValueError("teacher.max_concurrency must be > 0")
+    if cfg.teacher.sdk_max_retries < 0:
+        raise ValueError("teacher.sdk_max_retries must be >= 0")
     if cfg.final_generation.num_candidates <= 0:
         raise ValueError("final_generation.num_candidates must be > 0")
     if cfg.metricx.python_bin and not Path(cfg.metricx.python_bin).exists():

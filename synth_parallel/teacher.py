@@ -47,11 +47,20 @@ class TeacherClient:
                 base_url=cfg.base_url,
                 api_key=api_key,
                 timeout=cfg.request_timeout_s,
+                max_retries=cfg.sdk_max_retries,
                 http_client=self._http_client,
             )
-            self.logger.info("Teacher client created with trust_env=False (proxy env disabled).")
+            self.logger.info(
+                "Teacher client created with trust_env=False (proxy env disabled), sdk_max_retries=%s.",
+                cfg.sdk_max_retries,
+            )
         else:
-            self.client = OpenAI(base_url=cfg.base_url, api_key=api_key, timeout=cfg.request_timeout_s)
+            self.client = OpenAI(
+                base_url=cfg.base_url,
+                api_key=api_key,
+                timeout=cfg.request_timeout_s,
+                max_retries=cfg.sdk_max_retries,
+            )
         self.cache = SQLiteKVCache(cache_db_path, table_name="teacher_cache")
         self.random = random.Random()
 

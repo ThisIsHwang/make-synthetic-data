@@ -121,6 +121,8 @@ source .venv/bin/activate
 - API 키를 읽을 환경변수 이름 (기본: `QWEN_API_KEY`)
 - `teacher.model`
 - 호출할 model 이름
+- `teacher.sdk_max_retries`
+- OpenAI Python SDK 내부 재시도 횟수. 파이프라인 자체 재시도와 중복되므로 기본 `0` 권장
 - `teacher.unset_proxy_env`
 - `true`면 teacher API 호출 시 `HTTP_PROXY`/`HTTPS_PROXY` 환경변수를 무시(`trust_env=False`)
 - `data.madlad_dataset`
@@ -156,6 +158,8 @@ teacher:
   base_url: https://your-qwen-endpoint.example.com/v1
   api_key_env: QWEN_API_KEY
   model: Qwen/Qwen3-235B-A22B-Instruct-2507
+  sdk_max_retries: 0
+  max_concurrency: 8
 
 metricx:
   backend: metricx24_cli
