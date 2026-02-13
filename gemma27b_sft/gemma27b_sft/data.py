@@ -648,6 +648,56 @@ def _to_training_dataset(dataset: Dataset) -> Dataset:
     return dataset
 
 
+def _truncate_for_log(text: str, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text
+    extra = len(text) - max_chars
+    return f"{text[:max_chars]} ... [truncated {extra} chars]"
+
+
+def _log_pre_tokenization_samples(dataset: Dataset, cfg: SFTConfig, split_name: str) -> None:
+    sample_limit = min(len(dataset), cfg.data.log_text_samples)
+    if sample_limit <= 0:
+        return
+
+    logger.info("%s pre-tokenization preview sample_count=%s", split_name, sample_limit)
+    sampled = dataset.select(range(sample_limit))
+    max_chars = cfg.data.log_text_max_chars
+
+    for idx, row in enumerate(sampled):
+        try:
+            source_text = _safe_string(row.get(cfg.data.source_field))
+            target_text = _safe_string(row.get(cfg.data.target_field))
+            source_lang, src_lang_code, target_lang, tgt_lang_code = _resolve_languages(cfg.data, row)
+            prompt_messages, _ = _messages(cfg.data, row, source_text, target_text)
+            prompt_text = prompt_messages[0]["content"] if prompt_messages else ""
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.warning("%s pre-tokenization preview failed idx=%s: %s", split_name, idx, exc)
+            continue
+
+        source_log = _truncate_for_log(source_text, max_chars)
+        prompt_log = _truncate_for_log(prompt_text, max_chars)
+        target_log = _truncate_for_log(target_text, max_chars)
+        logger.info(
+            "%s pre-tokenization sample idx=%s src=%s(%s) tgt=%s(%s) chars(source/prompt/target)=%s/%s/%s\n"
+            "SOURCE>>> %s\n"
+            "PROMPT>>> %s\n"
+            "TARGET>>> %s",
+            split_name,
+            idx,
+            source_lang,
+            src_lang_code,
+            target_lang,
+            tgt_lang_code,
+            len(source_text),
+            len(prompt_text),
+            len(target_text),
+            source_log,
+            prompt_log,
+            target_log,
+        )
+
+
 def build_datasets(cfg: SFTConfig, tokenizer: PreTrainedTokenizerBase) -> tuple[Dataset, Dataset | None]:
     data_cfg: DataConfig = cfg.data
     train_rows = _load_json_dataset_resilient(data_cfg.train_file, data_cfg)
@@ -676,6 +726,9 @@ def build_datasets(cfg: SFTConfig, tokenizer: PreTrainedTokenizerBase) -> tuple[
         cfg.data.source_lang_code_field,
         cfg.data.target_lang_code_field,
     )
+    _log_pre_tokenization_samples(train_rows, cfg, "Train")
+    if eval_rows is not None:
+        _log_pre_tokenization_samples(eval_rows, cfg, "Eval")
     tokenize_fn = _build_tokenize_fn(cfg, tokenizer)
     train_mapped = _tokenize_dataset(
         train_rows,

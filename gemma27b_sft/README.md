@@ -117,6 +117,9 @@ CONFIG_PATH=configs/train_8xh100_fsdp.yaml bash scripts/sample_infer.sh
   - Optional per-row language-code columns for multilingual mixed datasets.
 - `data.source_lang_name`, `data.target_lang_name`
   - Use `auto` to infer language names from WMT-style codes.
+- `data.log_text_samples`, `data.log_text_max_chars`
+  - Logs pre-tokenization training text previews (`SOURCE`, rendered `PROMPT`, `TARGET`)
+    so you can inspect exactly what goes into tokenization.
 
 ## 7) Output
 

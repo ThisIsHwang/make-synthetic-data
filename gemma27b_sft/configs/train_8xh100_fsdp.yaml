@@ -30,6 +30,8 @@ data:
   max_train_samples:
   max_eval_samples:
   preprocessing_num_workers: 8
+  log_text_samples: 3
+  log_text_max_chars: 1200
 
 train:
   output_dir: ../outputs/gemma3-27b-it-sft-fsdp
