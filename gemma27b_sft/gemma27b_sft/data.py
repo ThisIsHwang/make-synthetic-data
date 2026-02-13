@@ -7,8 +7,8 @@ from pathlib import Path
 from typing import Any
 
 import torch
-from datasets import Dataset
 from transformers import PreTrainedTokenizerBase
+from torch.utils.data import Dataset as TorchDataset
 
 from .config import DataConfig, SFTConfig
 
@@ -276,6 +276,17 @@ class CompletionDataCollator:
         return padded
 
 
+class TokenizedListDataset(TorchDataset):
+    def __init__(self, rows: list[dict[str, Any]]):
+        self._rows = rows
+
+    def __len__(self) -> int:
+        return len(self._rows)
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        return self._rows[index]
+
+
 def _safe_string(value: Any) -> str:
     if value is None:
         return ""
@@ -299,7 +310,7 @@ def _required_json_fields(cfg: DataConfig) -> list[str]:
     return fields
 
 
-def _safe_load_json_dataset(path: str, cfg: DataConfig) -> Dataset:
+def _safe_load_json_dataset(path: str, cfg: DataConfig) -> list[dict[str, str]]:
     required_fields = _required_json_fields(cfg)
     rows: list[dict[str, str]] = []
     bad_json = 0
@@ -349,51 +360,17 @@ def _safe_load_json_dataset(path: str, cfg: DataConfig) -> Dataset:
         non_string_counts,
         missing_counts,
     )
-    return Dataset.from_list(rows)
+    return rows
 
 
-def _load_json_dataset_resilient(path: str, cfg: DataConfig) -> Dataset:
+def _load_json_dataset_resilient(path: str, cfg: DataConfig) -> list[dict[str, str]]:
     # Root-cause fix: avoid pyarrow JSON schema inference for mixed-type columns.
     # We parse JSONL ourselves and normalize required fields to strings up front.
     return _safe_load_json_dataset(path, cfg)
 
 
-def _map_with_retry(ds: Dataset, fn, num_proc: int, desc: str) -> Dataset:
-    proc = num_proc or None
-    try:
-        return ds.map(fn, num_proc=proc, desc=desc)
-    except Exception as exc:  # pylint: disable=broad-except
-        if proc is not None and int(proc) > 1:
-            logger.warning(
-                "%s failed with num_proc=%s (%s: %s). Retrying with single process.",
-                desc,
-                proc,
-                type(exc).__name__,
-                exc,
-            )
-            return ds.map(fn, num_proc=None, desc=desc)
-        raise
-
-
-def _filter_with_retry(ds: Dataset, fn, num_proc: int, desc: str) -> Dataset:
-    proc = num_proc or None
-    try:
-        return ds.filter(fn, num_proc=proc, desc=desc)
-    except Exception as exc:  # pylint: disable=broad-except
-        if proc is not None and int(proc) > 1:
-            logger.warning(
-                "%s failed with num_proc=%s (%s: %s). Retrying with single process.",
-                desc,
-                proc,
-                type(exc).__name__,
-                exc,
-            )
-            return ds.filter(fn, num_proc=None, desc=desc)
-        raise
-
-
-def _summarize_tokenization(ds: Dataset, max_seq_length: int, sample_limit: int = 4096) -> dict[str, int | float]:
-    sample_size = min(len(ds), sample_limit)
+def _summarize_tokenization(rows: list[dict[str, Any]], max_seq_length: int, sample_limit: int = 4096) -> dict[str, int | float]:
+    sample_size = min(len(rows), sample_limit)
     if sample_size == 0:
         return {
             "sample_size": 0,
@@ -408,22 +385,22 @@ def _summarize_tokenization(ds: Dataset, max_seq_length: int, sample_limit: int 
             "max_source_shrink_steps": 0,
         }
 
-    sampled = ds.select(range(sample_size))
-    num_target_tokens = sampled["num_target_tokens"]
-    prompt_tokens = sampled["prompt_tokens"]
-    full_tokens = sampled["full_tokens"]
-    target_chars = sampled["target_chars"]
-    source_shrink_steps = sampled["source_shrink_steps"]
+    sampled = rows[:sample_size]
+    num_target_tokens = [int(row.get("num_target_tokens", 0)) for row in sampled]
+    prompt_tokens = [int(row.get("prompt_tokens", 0)) for row in sampled]
+    full_tokens = [int(row.get("full_tokens", 0)) for row in sampled]
+    target_chars = [int(row.get("target_chars", 0)) for row in sampled]
+    source_shrink_steps = [int(row.get("source_shrink_steps", 0)) for row in sampled]
 
-    zero_target_count = sum(1 for v in num_target_tokens if int(v) <= 0)
-    empty_target_text_count = sum(1 for v in target_chars if int(v) <= 0)
-    prompt_ge_max_count = sum(1 for v in prompt_tokens if int(v) >= max_seq_length)
-    full_ge_max_count = sum(1 for v in full_tokens if int(v) >= max_seq_length)
-    max_prompt_tokens = max((int(v) for v in prompt_tokens), default=0)
-    max_full_tokens = max((int(v) for v in full_tokens), default=0)
-    mean_target_tokens = float(sum(int(v) for v in num_target_tokens)) / float(sample_size)
-    source_shrunk_count = sum(1 for v in source_shrink_steps if int(v) > 0)
-    max_source_shrink_steps = max((int(v) for v in source_shrink_steps), default=0)
+    zero_target_count = sum(1 for v in num_target_tokens if v <= 0)
+    empty_target_text_count = sum(1 for v in target_chars if v <= 0)
+    prompt_ge_max_count = sum(1 for v in prompt_tokens if v >= max_seq_length)
+    full_ge_max_count = sum(1 for v in full_tokens if v >= max_seq_length)
+    max_prompt_tokens = max(prompt_tokens, default=0)
+    max_full_tokens = max(full_tokens, default=0)
+    mean_target_tokens = float(sum(num_target_tokens)) / float(sample_size)
+    source_shrunk_count = sum(1 for v in source_shrink_steps if v > 0)
+    max_source_shrink_steps = max(source_shrink_steps, default=0)
 
     return {
         "sample_size": sample_size,
@@ -457,24 +434,62 @@ def _raise_empty_train_dataset_error(cfg: SFTConfig, raw_rows: int, token_stats:
     )
 
 
-def build_datasets(cfg: SFTConfig, tokenizer: PreTrainedTokenizerBase) -> tuple[Dataset, Dataset | None]:
+def _tokenize_rows(
+    rows: list[dict[str, str]],
+    tokenize_fn,
+    split_name: str,
+) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    errors = 0
+    for idx, row in enumerate(rows, start=1):
+        try:
+            out.append(tokenize_fn(row))
+        except Exception as exc:  # pylint: disable=broad-except
+            errors += 1
+            if errors <= 3:
+                logger.warning(
+                    "%s tokenization failed at row=%s (%s: %s). Row will be skipped.",
+                    split_name,
+                    idx,
+                    type(exc).__name__,
+                    exc,
+                )
+        if idx % 2000 == 0:
+            logger.info("%s tokenization progress rows=%s errors=%s", split_name, idx, errors)
+    if errors > 0:
+        logger.warning("%s tokenization skipped_rows=%s", split_name, errors)
+    return out
+
+
+def _to_training_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "input_ids": row["input_ids"],
+            "attention_mask": row["attention_mask"],
+            "labels": row["labels"],
+        }
+        for row in rows
+    ]
+
+
+def build_datasets(cfg: SFTConfig, tokenizer: PreTrainedTokenizerBase) -> tuple[TorchDataset, TorchDataset | None]:
     data_cfg: DataConfig = cfg.data
-    train_ds = _load_json_dataset_resilient(data_cfg.train_file, data_cfg)
-    raw_train_rows = len(train_ds)
+    train_rows = _load_json_dataset_resilient(data_cfg.train_file, data_cfg)
+    raw_train_rows = len(train_rows)
     logger.info("Loaded train dataset rows=%s path=%s", raw_train_rows, data_cfg.train_file)
     if raw_train_rows == 0:
         raise ValueError(f"Train dataset is empty: {data_cfg.train_file}")
     if data_cfg.max_train_samples is not None:
-        train_ds = train_ds.select(range(min(len(train_ds), data_cfg.max_train_samples)))
-        logger.info("Applied data.max_train_samples=%s -> train rows=%s", data_cfg.max_train_samples, len(train_ds))
+        train_rows = train_rows[: min(len(train_rows), data_cfg.max_train_samples)]
+        logger.info("Applied data.max_train_samples=%s -> train rows=%s", data_cfg.max_train_samples, len(train_rows))
 
-    eval_ds = None
+    eval_rows: list[dict[str, str]] | None = None
     if data_cfg.eval_file:
-        eval_ds = _load_json_dataset_resilient(data_cfg.eval_file, data_cfg)
-        logger.info("Loaded eval dataset rows=%s path=%s", len(eval_ds), data_cfg.eval_file)
+        eval_rows = _load_json_dataset_resilient(data_cfg.eval_file, data_cfg)
+        logger.info("Loaded eval dataset rows=%s path=%s", len(eval_rows), data_cfg.eval_file)
         if data_cfg.max_eval_samples is not None:
-            eval_ds = eval_ds.select(range(min(len(eval_ds), data_cfg.max_eval_samples)))
-            logger.info("Applied data.max_eval_samples=%s -> eval rows=%s", data_cfg.max_eval_samples, len(eval_ds))
+            eval_rows = eval_rows[: min(len(eval_rows), data_cfg.max_eval_samples)]
+            logger.info("Applied data.max_eval_samples=%s -> eval rows=%s", data_cfg.max_eval_samples, len(eval_rows))
 
     logger.info(
         "Tokenization language setup src_code=%s tgt_code=%s src_code_field=%s tgt_code_field=%s",
@@ -484,12 +499,7 @@ def build_datasets(cfg: SFTConfig, tokenizer: PreTrainedTokenizerBase) -> tuple[
         cfg.data.target_lang_code_field,
     )
     tokenize_fn = _build_tokenize_fn(cfg, tokenizer)
-    train_mapped = _map_with_retry(
-        train_ds,
-        tokenize_fn,
-        data_cfg.preprocessing_num_workers,
-        "Tokenizing train dataset",
-    )
+    train_mapped = _tokenize_rows(train_rows, tokenize_fn, "Train")
     train_stats = _summarize_tokenization(train_mapped, cfg.train.max_seq_length)
     logger.info(
         "Train tokenization stats sample_size=%s zero_target=%s empty_target=%s prompt_ge_max=%s source_shrunk=%s max_shrink_steps=%s max_prompt=%s max_full=%s mean_target_tokens=%.2f",
@@ -503,27 +513,16 @@ def build_datasets(cfg: SFTConfig, tokenizer: PreTrainedTokenizerBase) -> tuple[
         train_stats["max_full_tokens"],
         train_stats["mean_target_tokens"],
     )
-    train_filtered = _filter_with_retry(
-        train_mapped,
-        lambda ex: ex["num_target_tokens"] > 0,
-        data_cfg.preprocessing_num_workers,
-        "Filtering empty-train labels",
-    )
+    train_filtered = [row for row in train_mapped if int(row.get("num_target_tokens", 0)) > 0]
     train_kept = len(train_filtered)
     logger.info("Train filtering kept=%s dropped=%s", train_kept, len(train_mapped) - train_kept)
     if train_kept == 0:
         _raise_empty_train_dataset_error(cfg, len(train_mapped), train_stats)
-    train_ds = train_filtered.remove_columns(
-        [c for c in train_filtered.column_names if c not in {"input_ids", "attention_mask", "labels"}]
-    )
+    train_ds: TorchDataset = TokenizedListDataset(_to_training_rows(train_filtered))
 
-    if eval_ds is not None:
-        eval_mapped = _map_with_retry(
-            eval_ds,
-            tokenize_fn,
-            data_cfg.preprocessing_num_workers,
-            "Tokenizing eval dataset",
-        )
+    eval_ds: TorchDataset | None = None
+    if eval_rows is not None:
+        eval_mapped = _tokenize_rows(eval_rows, tokenize_fn, "Eval")
         eval_stats = _summarize_tokenization(eval_mapped, cfg.train.max_seq_length)
         logger.info(
             "Eval tokenization stats sample_size=%s zero_target=%s empty_target=%s prompt_ge_max=%s source_shrunk=%s max_shrink_steps=%s max_prompt=%s max_full=%s mean_target_tokens=%.2f",
@@ -537,21 +536,14 @@ def build_datasets(cfg: SFTConfig, tokenizer: PreTrainedTokenizerBase) -> tuple[
             eval_stats["max_full_tokens"],
             eval_stats["mean_target_tokens"],
         )
-        eval_filtered = _filter_with_retry(
-            eval_mapped,
-            lambda ex: ex["num_target_tokens"] > 0,
-            data_cfg.preprocessing_num_workers,
-            "Filtering empty-eval labels",
-        )
+        eval_filtered = [row for row in eval_mapped if int(row.get("num_target_tokens", 0)) > 0]
         eval_kept = len(eval_filtered)
         logger.info("Eval filtering kept=%s dropped=%s", eval_kept, len(eval_mapped) - eval_kept)
         if eval_kept == 0:
             logger.warning("Eval dataset became empty after filtering; training will continue without eval.")
             eval_ds = None
         else:
-            eval_ds = eval_filtered.remove_columns(
-                [c for c in eval_filtered.column_names if c not in {"input_ids", "attention_mask", "labels"}]
-            )
+            eval_ds = TokenizedListDataset(_to_training_rows(eval_filtered))
 
     logger.info(
         "Final prepared datasets train=%s eval=%s",

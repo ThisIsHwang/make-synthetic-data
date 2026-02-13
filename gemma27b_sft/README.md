@@ -17,6 +17,9 @@ source .venv/bin/activate
 uv pip install -e .
 ```
 
+This project uses a pure JSONL loader for training data preprocessing
+(no `datasets` / `pyarrow` dependency in the training path).
+
 ## 2) Prepare Data
 
 Expected JSONL fields:
