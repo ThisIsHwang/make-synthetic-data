@@ -7,6 +7,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 from .caches import SQLiteKVCache
@@ -146,12 +147,43 @@ class MetricXScorer:
 
         env = self._build_metricx_env()
         last_error = ""
+        with in_path.open("r", encoding="utf-8") as fp:
+            pair_count = sum(1 for _ in fp)
         for cmd in variants:
-            proc = subprocess.run(cmd, capture_output=True, text=True, env=env, cwd=cwd)
+            start = time.perf_counter()
+            self.logger.info(
+                "MetricX command start pairs=%s batch_size=%s device=%s",
+                pair_count,
+                self.cfg.batch_size,
+                self.cfg.device,
+            )
+            self.logger.info("MetricX command: %s", " ".join(cmd))
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=env,
+                cwd=cwd,
+            )
+            heartbeat_s = 30
+            while proc.poll() is None:
+                try:
+                    proc.wait(timeout=heartbeat_s)
+                except subprocess.TimeoutExpired:
+                    self.logger.info(
+                        "MetricX still running elapsed=%.1fs pairs=%s",
+                        time.perf_counter() - start,
+                        pair_count,
+                    )
+
+            stdout, stderr = proc.communicate()
             if proc.returncode == 0 and out_path.exists() and out_path.stat().st_size > 0:
                 self.logger.info("MetricX command succeeded: %s", " ".join(cmd))
                 return
-            last_error = (proc.stderr or proc.stdout or "").strip()
+            last_error = (stderr or stdout or "").strip()
+            if last_error:
+                self.logger.error("MetricX command failed rc=%s output=%s", proc.returncode, last_error[:1200])
 
         self.stats.inc("metricx.error")
         if "pyextensiontype" in last_error.lower():

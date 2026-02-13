@@ -5,6 +5,7 @@ import heapq
 import logging
 import os
 import random
+import time
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -397,6 +398,7 @@ class PipelineRunner:
         if not chunk_rows:
             return 0
 
+        t0 = time.perf_counter()
         tasks: list[CompletionTask] = []
         for row in chunk_rows:
             messages = build_translation_messages(
@@ -425,9 +427,22 @@ class PipelineRunner:
                 )
             )
 
+        logger.info(
+            "prefilter chunk start rows=%s teacher_tasks=%s (concurrency=%s)",
+            len(chunk_rows),
+            len(tasks),
+            self.cfg.teacher.max_concurrency,
+        )
         results = self.teacher.run_tasks(
             tasks=tasks,
             worker_fn=lambda task, text: {"item_id": task.item_id, "text": text},
+        )
+        t_teacher = time.perf_counter()
+        logger.info(
+            "prefilter chunk teacher done rows=%s tasks=%s elapsed=%.2fs",
+            len(chunk_rows),
+            len(tasks),
+            t_teacher - t0,
         )
 
         by_source: dict[str, dict[str, str]] = {}
@@ -448,7 +463,14 @@ class PipelineRunner:
             pairs.append((source_text, sampled))
             score_index.append((source_id, "sample"))
 
+        logger.info("prefilter chunk metricx start pairs=%s", len(pairs))
         scores = self.metricx.score_batch(pairs)
+        t_metricx = time.perf_counter()
+        logger.info(
+            "prefilter chunk metricx done pairs=%s elapsed=%.2fs",
+            len(pairs),
+            t_metricx - t_teacher,
+        )
         scores_by_source: dict[str, dict[str, float]] = {}
         for (source_id, mode), score in zip(score_index, scores):
             scores_by_source.setdefault(source_id, {})[mode] = score
@@ -499,10 +521,11 @@ class PipelineRunner:
 
         self.progress.add_many(stage_name, processed_ids)
         logger.info(
-            "prefilter chunk done size=%s written=%s progress=%s",
+            "prefilter chunk done size=%s written=%s progress=%s total_elapsed=%.2fs",
             len(chunk_rows),
             written,
             self.progress.count_stage(stage_name),
+            time.perf_counter() - t0,
         )
         return written
 
