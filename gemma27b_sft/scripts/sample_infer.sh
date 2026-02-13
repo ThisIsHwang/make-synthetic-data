@@ -52,14 +52,24 @@ prompt = (
 
 with torch.inference_mode():
     if getattr(tokenizer, "chat_template", None):
-        inputs = tokenizer.apply_chat_template(
+        chat_inputs = tokenizer.apply_chat_template(
             [{"role": "user", "content": prompt}],
             tokenize=True,
             add_generation_prompt=True,
             return_tensors="pt",
-        ).to(model.device)
-        out = model.generate(inputs, max_new_tokens=256, do_sample=False)
-        gen = out[0][inputs.shape[1] :]
+        )
+        if isinstance(chat_inputs, torch.Tensor):
+            input_ids = chat_inputs.to(model.device)
+            model_inputs = {"input_ids": input_ids}
+        else:
+            # Some tokenizer versions return BatchEncoding here.
+            chat_inputs = chat_inputs.to(model.device)
+            if "input_ids" not in chat_inputs:
+                raise ValueError("chat template output has no input_ids")
+            model_inputs = dict(chat_inputs)
+            input_ids = model_inputs["input_ids"]
+        out = model.generate(**model_inputs, max_new_tokens=256, do_sample=False)
+        gen = out[0][input_ids.shape[1] :]
     else:
         enc = tokenizer(prompt, return_tensors="pt").to(model.device)
         out = model.generate(**enc, max_new_tokens=256, do_sample=False)
