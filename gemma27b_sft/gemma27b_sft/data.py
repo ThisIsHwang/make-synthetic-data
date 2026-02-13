@@ -655,7 +655,37 @@ def _truncate_for_log(text: str, max_chars: int) -> str:
     return f"{text[:max_chars]} ... [truncated {extra} chars]"
 
 
-def _log_pre_tokenization_samples(dataset: Dataset, cfg: SFTConfig, split_name: str) -> None:
+def _render_chat_template_text(
+    tokenizer: PreTrainedTokenizerBase,
+    messages: list[dict[str, str]],
+    add_generation_prompt: bool,
+) -> str:
+    if getattr(tokenizer, "chat_template", None):
+        try:
+            rendered = tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=add_generation_prompt,
+            )
+            if isinstance(rendered, str):
+                return rendered
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.warning("Failed to render chat template text: %s", exc)
+
+    parts = []
+    for msg in messages:
+        parts.append(f"{msg['role'].upper()}: {msg['content']}")
+    if add_generation_prompt:
+        parts.append("ASSISTANT:")
+    return "\n\n".join(parts)
+
+
+def _log_pre_tokenization_samples(
+    dataset: Dataset,
+    cfg: SFTConfig,
+    tokenizer: PreTrainedTokenizerBase,
+    split_name: str,
+) -> None:
     sample_limit = min(len(dataset), cfg.data.log_text_samples)
     if sample_limit <= 0:
         return
@@ -669,8 +699,18 @@ def _log_pre_tokenization_samples(dataset: Dataset, cfg: SFTConfig, split_name: 
             source_text = _safe_string(row.get(cfg.data.source_field))
             target_text = _safe_string(row.get(cfg.data.target_field))
             source_lang, src_lang_code, target_lang, tgt_lang_code = _resolve_languages(cfg.data, row)
-            prompt_messages, _ = _messages(cfg.data, row, source_text, target_text)
+            prompt_messages, full_messages = _messages(cfg.data, row, source_text, target_text)
             prompt_text = prompt_messages[0]["content"] if prompt_messages else ""
+            chat_prompt_text = _render_chat_template_text(
+                tokenizer=tokenizer,
+                messages=prompt_messages,
+                add_generation_prompt=True,
+            )
+            chat_full_text = _render_chat_template_text(
+                tokenizer=tokenizer,
+                messages=full_messages,
+                add_generation_prompt=False,
+            )
         except Exception as exc:  # pylint: disable=broad-except
             logger.warning("%s pre-tokenization preview failed idx=%s: %s", split_name, idx, exc)
             continue
@@ -678,11 +718,16 @@ def _log_pre_tokenization_samples(dataset: Dataset, cfg: SFTConfig, split_name: 
         source_log = _truncate_for_log(source_text, max_chars)
         prompt_log = _truncate_for_log(prompt_text, max_chars)
         target_log = _truncate_for_log(target_text, max_chars)
+        chat_prompt_log = _truncate_for_log(chat_prompt_text, max_chars)
+        chat_full_log = _truncate_for_log(chat_full_text, max_chars)
         logger.info(
-            "%s pre-tokenization sample idx=%s src=%s(%s) tgt=%s(%s) chars(source/prompt/target)=%s/%s/%s\n"
+            "%s pre-tokenization sample idx=%s src=%s(%s) tgt=%s(%s) "
+            "chars(source/prompt/target/chat_prompt/chat_full)=%s/%s/%s/%s/%s\n"
             "SOURCE>>> %s\n"
             "PROMPT>>> %s\n"
-            "TARGET>>> %s",
+            "TARGET>>> %s\n"
+            "CHAT_TEMPLATE_PROMPT>>> %s\n"
+            "CHAT_TEMPLATE_FULL>>> %s",
             split_name,
             idx,
             source_lang,
@@ -692,9 +737,13 @@ def _log_pre_tokenization_samples(dataset: Dataset, cfg: SFTConfig, split_name: 
             len(source_text),
             len(prompt_text),
             len(target_text),
+            len(chat_prompt_text),
+            len(chat_full_text),
             source_log,
             prompt_log,
             target_log,
+            chat_prompt_log,
+            chat_full_log,
         )
 
 
@@ -726,9 +775,9 @@ def build_datasets(cfg: SFTConfig, tokenizer: PreTrainedTokenizerBase) -> tuple[
         cfg.data.source_lang_code_field,
         cfg.data.target_lang_code_field,
     )
-    _log_pre_tokenization_samples(train_rows, cfg, "Train")
+    _log_pre_tokenization_samples(train_rows, cfg, tokenizer, "Train")
     if eval_rows is not None:
-        _log_pre_tokenization_samples(eval_rows, cfg, "Eval")
+        _log_pre_tokenization_samples(eval_rows, cfg, tokenizer, "Eval")
     tokenize_fn = _build_tokenize_fn(cfg, tokenizer)
     train_mapped = _tokenize_dataset(
         train_rows,

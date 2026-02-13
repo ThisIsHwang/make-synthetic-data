@@ -118,8 +118,10 @@ CONFIG_PATH=configs/train_8xh100_fsdp.yaml bash scripts/sample_infer.sh
 - `data.source_lang_name`, `data.target_lang_name`
   - Use `auto` to infer language names from WMT-style codes.
 - `data.log_text_samples`, `data.log_text_max_chars`
-  - Logs pre-tokenization training text previews (`SOURCE`, rendered `PROMPT`, `TARGET`)
-    so you can inspect exactly what goes into tokenization.
+  - Logs pre-tokenization training text previews:
+    `SOURCE`, rendered `PROMPT`, `TARGET`,
+    `CHAT_TEMPLATE_PROMPT`, and `CHAT_TEMPLATE_FULL`.
+    This lets you inspect the exact chat-template-applied text before token IDs are built.
 
 ## 7) Output
 
