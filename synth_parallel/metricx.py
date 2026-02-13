@@ -186,6 +186,13 @@ class MetricXScorer:
                 self.logger.error("MetricX command failed rc=%s output=%s", proc.returncode, last_error[:1200])
 
         self.stats.inc("metricx.error")
+        if "loading a dataset cached in a localfilesystem is not supported" in last_error.lower():
+            raise RuntimeError(
+                "MetricX runtime hit datasets/fsspec incompatibility "
+                "(NotImplementedError: LocalFileSystem). "
+                "In the metricx env, pin fsspec to <2023.10.0 and retry: "
+                f"{python_bin} -m pip install 'fsspec<2023.10.0'"
+            )
         if "pyextensiontype" in last_error.lower():
             raise RuntimeError(
                 "MetricX runtime has incompatible pyarrow version for datasets==2.13.1. "

@@ -95,6 +95,9 @@ source .venv-metricx/bin/activate
 # GitHub 레포 requirements 그대로 설치
 uv pip install -r third_party/metricx/requirements.txt
 
+# datasets==2.13.1과 fsspec 신버전 충돌 방지
+uv pip install "fsspec<2023.10.0"
+
 # datasets==2.13.1과 최신 pyarrow 충돌 방지
 uv pip install "pyarrow<21"
 
@@ -321,6 +324,9 @@ python -m synth_parallel.cli run --config config/example.yaml --stage export
 - `metricx24.predict` 실행 실패
 - `metricx.python_bin` 경로 확인
 - MetricX 전용 env에서 `cd third_party/metricx && python -m metricx24.predict --help` 먼저 확인
+- `NotImplementedError: Loading a dataset cached in a LocalFileSystem is not supported`
+- MetricX env에서 `fsspec` 버전 충돌 가능성이 큼
+- `uv pip install \"fsspec<2023.10.0\"` 후 재시도
 - Qwen API 인증 실패
 - `QWEN_API_KEY` 값과 `teacher.api_key_env` 일치 확인
 - Qwen API timeout
