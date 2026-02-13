@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -280,6 +282,74 @@ def _load_json_dataset(path: str) -> Dataset:
     return ds
 
 
+def _safe_string(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False)
+    return str(value)
+
+
+def _required_json_fields(cfg: DataConfig) -> list[str]:
+    fields = [cfg.source_field, cfg.target_field]
+    for name in [
+        cfg.source_lang_name_field,
+        cfg.target_lang_name_field,
+        cfg.source_lang_code_field,
+        cfg.target_lang_code_field,
+    ]:
+        if name and name not in fields:
+            fields.append(name)
+    return fields
+
+
+def _safe_load_json_dataset(path: str, cfg: DataConfig) -> Dataset:
+    required_fields = _required_json_fields(cfg)
+    rows: list[dict[str, str]] = []
+    bad_json = 0
+    total_lines = 0
+    with Path(path).open("r", encoding="utf-8") as f:
+        for line_no, line in enumerate(f, start=1):
+            total_lines += 1
+            raw = line.strip()
+            if not raw:
+                continue
+            try:
+                record = json.loads(raw)
+            except json.JSONDecodeError:
+                bad_json += 1
+                if bad_json <= 3:
+                    logger.warning("Skipping invalid JSON line=%s in %s", line_no, path)
+                continue
+            if not isinstance(record, dict):
+                continue
+            out: dict[str, str] = {}
+            for field in required_fields:
+                out[field] = _safe_string(record.get(field))
+            rows.append(out)
+    if bad_json > 0:
+        logger.warning("Ignored invalid JSON lines=%s while reading %s", bad_json, path)
+    logger.info("Safe JSON loader rows=%s total_lines=%s required_fields=%s", len(rows), total_lines, required_fields)
+    return Dataset.from_list(rows)
+
+
+def _load_json_dataset_resilient(path: str, cfg: DataConfig) -> Dataset:
+    try:
+        return _load_json_dataset(path)
+    except Exception as exc:  # pylint: disable=broad-except
+        msg = str(exc).lower()
+        if "arrowtypeerror" in type(exc).__name__.lower() or "expected bytes" in msg:
+            logger.warning(
+                "Falling back to safe JSON loader due to Arrow type mismatch: %s: %s",
+                type(exc).__name__,
+                exc,
+            )
+            return _safe_load_json_dataset(path, cfg)
+        raise
+
+
 def _summarize_tokenization(ds: Dataset, max_seq_length: int, sample_limit: int = 4096) -> dict[str, int | float]:
     sample_size = min(len(ds), sample_limit)
     if sample_size == 0:
@@ -347,7 +417,7 @@ def _raise_empty_train_dataset_error(cfg: SFTConfig, raw_rows: int, token_stats:
 
 def build_datasets(cfg: SFTConfig, tokenizer: PreTrainedTokenizerBase) -> tuple[Dataset, Dataset | None]:
     data_cfg: DataConfig = cfg.data
-    train_ds = _load_json_dataset(data_cfg.train_file)
+    train_ds = _load_json_dataset_resilient(data_cfg.train_file, data_cfg)
     raw_train_rows = len(train_ds)
     logger.info("Loaded train dataset rows=%s path=%s", raw_train_rows, data_cfg.train_file)
     if raw_train_rows == 0:
@@ -358,7 +428,7 @@ def build_datasets(cfg: SFTConfig, tokenizer: PreTrainedTokenizerBase) -> tuple[
 
     eval_ds = None
     if data_cfg.eval_file:
-        eval_ds = _load_json_dataset(data_cfg.eval_file)
+        eval_ds = _load_json_dataset_resilient(data_cfg.eval_file, data_cfg)
         logger.info("Loaded eval dataset rows=%s path=%s", len(eval_ds), data_cfg.eval_file)
         if data_cfg.max_eval_samples is not None:
             eval_ds = eval_ds.select(range(min(len(eval_ds), data_cfg.max_eval_samples)))
