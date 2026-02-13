@@ -242,6 +242,70 @@ def _apply_chat_template(
     return _coerce_token_ids(tokenizer(text, **tok_kwargs)["input_ids"], "input_ids")
 
 
+def _common_prefix_len(left: list[int], right: list[int]) -> int:
+    n = min(len(left), len(right))
+    i = 0
+    while i < n and left[i] == right[i]:
+        i += 1
+    return i
+
+
+def _common_suffix_len(left: list[int], right: list[int], left_stop: int, right_stop: int) -> int:
+    i = 0
+    while left_stop - i - 1 >= 0 and right_stop - i - 1 >= 0:
+        if left[left_stop - i - 1] != right[right_stop - i - 1]:
+            break
+        i += 1
+    return i
+
+
+def _extract_template_target_span(
+    tokenizer: PreTrainedTokenizerBase,
+    prompt_messages: list[dict[str, str]],
+    target_text: str,
+    max_seq_length: int,
+) -> tuple[list[int], list[int]] | None:
+    if not getattr(tokenizer, "chat_template", None):
+        return None
+
+    full_with_target = prompt_messages + [{"role": "assistant", "content": target_text}]
+    full_with_empty = prompt_messages + [{"role": "assistant", "content": ""}]
+
+    target_ids_full = _apply_chat_template(
+        tokenizer=tokenizer,
+        messages=full_with_target,
+        add_generation_prompt=False,
+        max_seq_length=max_seq_length,
+        truncate=False,
+    )
+    empty_ids_full = _apply_chat_template(
+        tokenizer=tokenizer,
+        messages=full_with_empty,
+        add_generation_prompt=False,
+        max_seq_length=max_seq_length,
+        truncate=False,
+    )
+    if not target_ids_full:
+        return None
+
+    prefix_len = _common_prefix_len(empty_ids_full, target_ids_full)
+    suffix_len = _common_suffix_len(
+        empty_ids_full,
+        target_ids_full,
+        left_stop=len(empty_ids_full),
+        right_stop=len(target_ids_full),
+    )
+    # Prevent over-trimming when target text happens to share tail tokens.
+    max_wrapper_suffix = max(0, len(empty_ids_full) - prefix_len)
+    suffix_len = min(suffix_len, max_wrapper_suffix)
+    target_end = max(prefix_len, len(target_ids_full) - suffix_len)
+    target_span = target_ids_full[prefix_len:target_end]
+    if not target_span:
+        return None
+    prompt_prefix = target_ids_full[:prefix_len]
+    return prompt_prefix, target_span
+
+
 def _build_tokenize_fn(cfg: SFTConfig, tokenizer: PreTrainedTokenizerBase):
     data_cfg = cfg.data
     max_len = cfg.train.max_seq_length
@@ -256,15 +320,15 @@ def _build_tokenize_fn(cfg: SFTConfig, tokenizer: PreTrainedTokenizerBase):
         labels: list[int] = []
         non_ignored = 0
 
-        target_ids_raw = list(
+        target_ids_fallback = list(
             tokenizer(
                 target_text,
                 truncation=False,
                 add_special_tokens=False,
             )["input_ids"]
         )
-        target_ids_raw = _coerce_token_ids(target_ids_raw, "target_ids")
-        has_target = len(target_ids_raw) > 0 and bool(target_text.strip())
+        target_ids_fallback = _coerce_token_ids(target_ids_fallback, "target_ids")
+        has_target = len(target_ids_fallback) > 0 and bool(target_text.strip())
 
         # Build training sample as: [prompt-with-generation-prefix] + [target tokens].
         # This avoids template-diff corner cases that can produce zero target labels.
@@ -277,20 +341,32 @@ def _build_tokenize_fn(cfg: SFTConfig, tokenizer: PreTrainedTokenizerBase):
                 max_seq_length=max_len,
                 truncate=False,
             )
+            target_ids_effective = target_ids_fallback
+            template_span = _extract_template_target_span(
+                tokenizer=tokenizer,
+                prompt_messages=prompt_messages,
+                target_text=target_text,
+                max_seq_length=max_len,
+            )
+            if template_span is not None:
+                template_prompt_ids, template_target_ids = template_span
+                if template_target_ids:
+                    prompt_ids_raw = template_prompt_ids
+                    target_ids_effective = template_target_ids
 
             if not has_target:
                 prompt_ids = prompt_ids_raw[:max_len]
                 target_ids = []
             else:
-                if len(prompt_ids_raw) + len(target_ids_raw) <= max_len:
+                if len(prompt_ids_raw) + len(target_ids_effective) <= max_len:
                     prompt_ids = prompt_ids_raw
-                    target_ids = target_ids_raw
+                    target_ids = target_ids_effective
                 else:
-                    target_reserve = min(len(target_ids_raw), max(32, max_len // 8))
+                    target_reserve = min(len(target_ids_effective), max(32, max_len // 8))
                     prompt_budget = max(0, max_len - target_reserve)
                     prompt_ids = prompt_ids_raw[:prompt_budget]
                     target_budget = max(0, max_len - len(prompt_ids))
-                    target_ids = target_ids_raw[:target_budget]
+                    target_ids = target_ids_effective[:target_budget]
 
             full_ids = prompt_ids + target_ids
             labels = ([-100] * len(prompt_ids)) + target_ids
