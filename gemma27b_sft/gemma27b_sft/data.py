@@ -649,6 +649,8 @@ def _to_training_dataset(dataset: Dataset) -> Dataset:
 
 
 def _truncate_for_log(text: str, max_chars: int) -> str:
+    if max_chars <= 0:
+        return text
     if len(text) <= max_chars:
         return text
     extra = len(text) - max_chars

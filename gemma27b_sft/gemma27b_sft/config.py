@@ -46,7 +46,7 @@ class DataConfig:
     max_eval_samples: int | None = None
     preprocessing_num_workers: int = 4
     log_text_samples: int = 3
-    log_text_max_chars: int = 1200
+    log_text_max_chars: int = 0
 
 
 @dataclass
@@ -179,8 +179,8 @@ def load_config(path: str | Path) -> SFTConfig:
         raise ValueError("data.preprocessing_num_workers must be >= 0")
     if cfg.data.log_text_samples < 0:
         raise ValueError("data.log_text_samples must be >= 0")
-    if cfg.data.log_text_max_chars <= 0:
-        raise ValueError("data.log_text_max_chars must be > 0")
+    if cfg.data.log_text_max_chars < 0:
+        raise ValueError("data.log_text_max_chars must be >= 0 (0 disables truncation).")
     if cfg.data.max_train_samples is not None and cfg.data.max_train_samples <= 0:
         raise ValueError("data.max_train_samples must be > 0 when set.")
     if cfg.data.max_eval_samples is not None and cfg.data.max_eval_samples <= 0:

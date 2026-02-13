@@ -122,6 +122,7 @@ CONFIG_PATH=configs/train_8xh100_fsdp.yaml bash scripts/sample_infer.sh
     `SOURCE`, rendered `PROMPT`, `TARGET`,
     `CHAT_TEMPLATE_PROMPT`, and `CHAT_TEMPLATE_FULL`.
     This lets you inspect the exact chat-template-applied text before token IDs are built.
+  - Set `data.log_text_max_chars: 0` to disable truncation completely.
 
 ## 7) Output
 
