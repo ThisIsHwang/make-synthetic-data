@@ -329,6 +329,13 @@ class CompletionDataCollator:
                 input_ids = _coerce_token_ids(feature.get("input_ids"), "input_ids")
                 attention_mask = _coerce_token_ids(feature.get("attention_mask"), "attention_mask")
                 labels = _coerce_token_ids(feature.get("labels"), "labels")
+                token_type_ids = _coerce_token_ids(feature.get("token_type_ids"), "token_type_ids")
+                if not token_type_ids:
+                    token_type_ids = [0] * len(input_ids)
+                elif len(token_type_ids) < len(input_ids):
+                    token_type_ids = token_type_ids + ([0] * (len(input_ids) - len(token_type_ids)))
+                elif len(token_type_ids) > len(input_ids):
+                    token_type_ids = token_type_ids[: len(input_ids)]
             except Exception as exc:  # pylint: disable=broad-except
                 raise ValueError(
                     f"Feature normalization failed at batch_index={idx}: {exc}. "
@@ -339,11 +346,16 @@ class CompletionDataCollator:
                     "input_ids": input_ids,
                     "attention_mask": attention_mask,
                     "labels": labels,
+                    "token_type_ids": token_type_ids,
                 }
             )
 
         batch_inputs = [
-            {"input_ids": f["input_ids"], "attention_mask": f["attention_mask"]}
+            {
+                "input_ids": f["input_ids"],
+                "attention_mask": f["attention_mask"],
+                "token_type_ids": f["token_type_ids"],
+            }
             for f in normalized_features
         ]
         padded = self.tokenizer.pad(
@@ -351,6 +363,10 @@ class CompletionDataCollator:
             return_tensors="pt",
             pad_to_multiple_of=self.pad_to_multiple_of,
         )
+        if "token_type_ids" not in padded:
+            padded["token_type_ids"] = torch.zeros_like(padded["input_ids"], dtype=torch.long)
+        else:
+            padded["token_type_ids"] = padded["token_type_ids"].to(dtype=torch.long)
         seq_len = int(padded["input_ids"].shape[1])
         labels = []
         for feature in normalized_features:
