@@ -14,11 +14,12 @@ This project enforces:
 cd gemma27b_sft
 uv venv .venv --python 3.10
 source .venv/bin/activate
+uv pip install -r requirements.txt
 uv pip install -e .
 ```
 
-This project uses a pure JSONL loader for training data preprocessing
-(no `datasets` / `pyarrow` dependency in the training path).
+Training preprocessing uses Hugging Face `datasets` (version-pinned in
+`requirements.txt` and `pyproject.toml`).
 
 ## 2) Prepare Data
 
