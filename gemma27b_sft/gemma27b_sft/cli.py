@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import importlib.util
 import inspect
 import logging
@@ -135,12 +136,14 @@ def _build_training_arguments(cfg: SFTConfig, grad_accum: int, has_eval: bool) -
     if cfg.train.fsdp:
         kwargs["fsdp"] = cfg.train.fsdp
         kwargs["fsdp_config"] = {
-            "transformer_layer_cls_to_wrap": [cfg.train.fsdp_transformer_layer_cls_to_wrap],
             "backward_prefetch": cfg.train.fsdp_backward_prefetch,
             "forward_prefetch": cfg.train.fsdp_forward_prefetch,
             "cpu_offload": cfg.train.fsdp_cpu_offload,
             "use_orig_params": cfg.train.fsdp_use_orig_params,
         }
+        layer_cls = cfg.train.fsdp_transformer_layer_cls_to_wrap
+        if layer_cls and layer_cls.strip().lower() not in {"", "auto"}:
+            kwargs["fsdp_config"]["transformer_layer_cls_to_wrap"] = [layer_cls]
     eval_mode = "steps" if has_eval else "no"
     if "evaluation_strategy" in ta_params:
         kwargs["evaluation_strategy"] = eval_mode
@@ -169,9 +172,55 @@ def _build_training_arguments(cfg: SFTConfig, grad_accum: int, has_eval: bool) -
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Gemma 27B IT SFT")
+    parser = argparse.ArgumentParser(description="Gemma 3 27B IT SFT")
     parser.add_argument("--config", required=True, help="Path to YAML config")
     return parser
+
+
+def _resolve_fsdp_layer_cls_to_wrap(model: AutoModelForCausalLM, cfg: SFTConfig) -> str | None:
+    if not cfg.train.fsdp or "auto_wrap" not in str(cfg.train.fsdp):
+        return None
+
+    available = Counter(module.__class__.__name__ for module in model.modules())
+    requested = (cfg.train.fsdp_transformer_layer_cls_to_wrap or "").strip()
+    if requested and requested.lower() != "auto":
+        if requested in available:
+            return requested
+        logger.warning(
+            "Requested fsdp_transformer_layer_cls_to_wrap=%s not found in model. Available sample=%s",
+            requested,
+            ", ".join(name for name, _ in available.most_common(12)),
+        )
+
+    preferred = [
+        "Gemma3DecoderLayer",
+        "Gemma3TextDecoderLayer",
+        "Gemma2DecoderLayer",
+        "GemmaDecoderLayer",
+        "LlamaDecoderLayer",
+        "Qwen2DecoderLayer",
+        "MistralDecoderLayer",
+    ]
+    for candidate in preferred:
+        if candidate in available:
+            logger.info("Auto-detected FSDP wrap layer class: %s", candidate)
+            return candidate
+
+    decoder_like = [(name, count) for name, count in available.items() if "DecoderLayer" in name]
+    if decoder_like:
+        decoder_like.sort(key=lambda x: x[1], reverse=True)
+        chosen = decoder_like[0][0]
+        logger.info("Auto-detected FSDP wrap layer class by pattern: %s", chosen)
+        return chosen
+
+    block_like = [(name, count) for name, count in available.items() if name.endswith("Block")]
+    if block_like:
+        block_like.sort(key=lambda x: x[1], reverse=True)
+        chosen = block_like[0][0]
+        logger.info("Auto-detected FSDP wrap layer class by block fallback: %s", chosen)
+        return chosen
+
+    return None
 
 
 def _build_trainer(
@@ -223,6 +272,15 @@ def run(cfg: SFTConfig) -> None:
         model.config.use_cache = False
 
     _freeze_embeddings(model, cfg.model.freeze_output_embeddings)
+
+    resolved_layer = _resolve_fsdp_layer_cls_to_wrap(model, cfg)
+    if cfg.train.fsdp and "auto_wrap" in str(cfg.train.fsdp) and not resolved_layer:
+        logger.warning(
+            "Could not resolve FSDP transformer layer class; disabling auto_wrap and keeping full_shard."
+        )
+        cfg.train.fsdp = " ".join(part for part in str(cfg.train.fsdp).split() if part != "auto_wrap")
+    elif resolved_layer:
+        cfg.train.fsdp_transformer_layer_cls_to_wrap = resolved_layer
 
     grad_accum = compute_gradient_accumulation_steps(cfg)
     world_size = int(os.environ.get("WORLD_SIZE", "1"))

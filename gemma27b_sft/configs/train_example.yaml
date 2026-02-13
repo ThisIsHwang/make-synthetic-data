@@ -1,5 +1,5 @@
 model:
-  name_or_path: google/gemma-2-27b-it
+  name_or_path: google/gemma-3-27b-it
   trust_remote_code: false
   attn_implementation: auto
   freeze_output_embeddings: true
@@ -32,7 +32,7 @@ data:
   preprocessing_num_workers: 8
 
 train:
-  output_dir: ../outputs/gemma2-27b-it-sft
+  output_dir: ../outputs/gemma3-27b-it-sft
   seed: 42
   num_train_epochs: 1.0
   max_steps: -1

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "gemma27b-sft"
 version = "0.1.0"
-description = "Full SFT pipeline for Gemma 27B IT with frozen embeddings and Adafactor."
+description = "Full SFT pipeline for Gemma 3 27B IT with frozen embeddings and Adafactor."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [

@@ -1,6 +1,6 @@
-# Gemma 27B IT SFT
+# Gemma 3 27B IT SFT
 
-Full-parameter SFT project for `google/gemma-2-27b-it` on the synthetic translation dataset.
+Full-parameter SFT project for `google/gemma-3-27b-it` on the synthetic translation dataset.
 
 This project enforces:
 - Optimizer: `Adafactor`
@@ -71,7 +71,7 @@ python -m gemma27b_sft.cli --config configs/train_example.yaml
 - `model.freeze_output_embeddings: true`
   - Keeps output embeddings frozen too (if not tied to input embeddings)
 - `train.gradient_checkpointing: true`
-  - Recommended for Gemma 27B full SFT memory
+  - Recommended for Gemma 3 27B full SFT memory
 - `model.attn_implementation: auto` (recommended default)
   - Uses `flash_attention_2` automatically when CUDA + `flash_attn` are available.
   - Falls back to `sdpa` automatically if FlashAttention is unavailable.
@@ -79,7 +79,7 @@ python -m gemma27b_sft.cli --config configs/train_example.yaml
 - `train.fsdp`
   - Set to `full_shard auto_wrap` for 27B full fine-tuning on 8x H100.
 - `train.fsdp_transformer_layer_cls_to_wrap`
-  - Gemma 2 uses `Gemma2DecoderLayer`.
+  - Set `auto` (recommended): class name is auto-detected from the loaded model.
 - `data.source_lang_code`, `data.target_lang_code`
   - Set fixed language codes (example: `en`, `ko`).
   - WMT-style codes are supported directly; unknown codes are still accepted.

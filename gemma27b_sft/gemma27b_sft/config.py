@@ -21,7 +21,7 @@ DEFAULT_TRANSLATION_PROMPT_TEMPLATE = (
 
 @dataclass
 class ModelConfig:
-    name_or_path: str = "google/gemma-2-27b-it"
+    name_or_path: str = "google/gemma-3-27b-it"
     trust_remote_code: bool = False
     attn_implementation: str | None = "auto"
     freeze_output_embeddings: bool = True
@@ -49,7 +49,7 @@ class DataConfig:
 
 @dataclass
 class TrainConfig:
-    output_dir: str = "./outputs/gemma2-27b-it-sft"
+    output_dir: str = "./outputs/gemma3-27b-it-sft"
     seed: int = 42
     num_train_epochs: float = 1.0
     max_steps: int = -1
@@ -73,7 +73,7 @@ class TrainConfig:
     resume_from_checkpoint: str | None = None
     ddp_find_unused_parameters: bool = False
     fsdp: str | None = None
-    fsdp_transformer_layer_cls_to_wrap: str = "Gemma2DecoderLayer"
+    fsdp_transformer_layer_cls_to_wrap: str = "auto"
     fsdp_backward_prefetch: str = "BACKWARD_PRE"
     fsdp_forward_prefetch: bool = False
     fsdp_cpu_offload: bool = False
