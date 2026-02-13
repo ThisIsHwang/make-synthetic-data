@@ -163,6 +163,34 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _build_trainer(
+    model: AutoModelForCausalLM,
+    args: TrainingArguments,
+    train_ds,
+    eval_ds,
+    tokenizer,
+    collator: CompletionDataCollator,
+) -> FixedAdafactorTrainer:
+    trainer_params = set(inspect.signature(FixedAdafactorTrainer.__init__).parameters)
+    kwargs: dict[str, object] = {
+        "model": model,
+        "args": args,
+        "train_dataset": train_ds,
+        "eval_dataset": eval_ds,
+        "data_collator": collator,
+    }
+    if "tokenizer" in trainer_params:
+        kwargs["tokenizer"] = tokenizer
+    elif "processing_class" in trainer_params:
+        kwargs["processing_class"] = tokenizer
+
+    supported_kwargs = {k: v for k, v in kwargs.items() if k in trainer_params}
+    dropped_kwargs = sorted(set(kwargs) - set(supported_kwargs))
+    if dropped_kwargs:
+        logger.info("Skipping unsupported Trainer kwargs: %s", ", ".join(dropped_kwargs))
+    return FixedAdafactorTrainer(**supported_kwargs)
+
+
 def run(cfg: SFTConfig) -> None:
     output_dir = Path(cfg.train.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -196,13 +224,13 @@ def run(cfg: SFTConfig) -> None:
     args = _build_training_arguments(cfg, grad_accum, has_eval=eval_ds is not None)
     collator = CompletionDataCollator(tokenizer=tokenizer)
 
-    trainer = FixedAdafactorTrainer(
+    trainer = _build_trainer(
         model=model,
         args=args,
-        train_dataset=train_ds,
-        eval_dataset=eval_ds,
+        train_ds=train_ds,
+        eval_ds=eval_ds,
         tokenizer=tokenizer,
-        data_collator=collator,
+        collator=collator,
     )
     trainer.train(resume_from_checkpoint=cfg.train.resume_from_checkpoint)
     trainer.save_model()
