@@ -104,7 +104,12 @@ def _load_model(cfg: SFTConfig):
         raise
 
 
-def _build_training_arguments(cfg: SFTConfig, grad_accum: int, has_eval: bool) -> TrainingArguments:
+def _build_training_arguments(
+    cfg: SFTConfig,
+    grad_accum: int,
+    has_eval: bool,
+    hf_gradient_checkpointing: bool,
+) -> TrainingArguments:
     output_dir = Path(cfg.train.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     ta_params = set(inspect.signature(TrainingArguments.__init__).parameters)
@@ -127,7 +132,7 @@ def _build_training_arguments(cfg: SFTConfig, grad_accum: int, has_eval: bool) -
         "save_total_limit": cfg.train.save_total_limit,
         "bf16": cfg.train.bf16,
         "tf32": cfg.train.tf32,
-        "gradient_checkpointing": cfg.train.gradient_checkpointing,
+        "gradient_checkpointing": hf_gradient_checkpointing,
         "dataloader_num_workers": cfg.train.dataloader_num_workers,
         "report_to": cfg.train.report_to,
         "remove_unused_columns": False,
@@ -294,8 +299,17 @@ def run(cfg: SFTConfig) -> None:
 
     model = _load_model(cfg)
     model.config.pad_token_id = tokenizer.pad_token_id
-    if cfg.train.gradient_checkpointing:
+    use_fsdp_activation_ckpt = bool(cfg.train.fsdp and cfg.train.fsdp_activation_checkpointing)
+    use_hf_gradient_ckpt = bool(cfg.train.gradient_checkpointing)
+    if use_hf_gradient_ckpt and use_fsdp_activation_ckpt:
+        logger.warning(
+            "Both train.gradient_checkpointing and train.fsdp_activation_checkpointing are true. "
+            "Disabling HF gradient_checkpointing and using FSDP activation_checkpointing only."
+        )
+        use_hf_gradient_ckpt = False
+    if use_hf_gradient_ckpt:
         model.gradient_checkpointing_enable()
+    if use_hf_gradient_ckpt or use_fsdp_activation_ckpt:
         model.config.use_cache = False
 
     _freeze_embeddings(model, cfg.model.freeze_output_embeddings)
@@ -319,7 +333,12 @@ def run(cfg: SFTConfig) -> None:
         grad_accum,
     )
 
-    args = _build_training_arguments(cfg, grad_accum, has_eval=eval_ds is not None)
+    args = _build_training_arguments(
+        cfg,
+        grad_accum,
+        has_eval=eval_ds is not None,
+        hf_gradient_checkpointing=use_hf_gradient_ckpt,
+    )
     collator = CompletionDataCollator(tokenizer=tokenizer)
 
     trainer = _build_trainer(

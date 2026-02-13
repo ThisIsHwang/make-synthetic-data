@@ -70,8 +70,8 @@ python -m gemma27b_sft.cli --config configs/train_example.yaml
 
 - `model.freeze_output_embeddings: true`
   - Keeps output embeddings frozen too (if not tied to input embeddings)
-- `train.gradient_checkpointing: true`
-  - Recommended for Gemma 3 27B full SFT memory
+- `train.gradient_checkpointing: true` (non-FSDP runs)
+  - Recommended for memory reduction when FSDP activation checkpointing is not used.
 - `train.max_seq_length: 1024` (default in provided configs)
   - 27B full SFT at 2048 can easily OOM even on 8x H100 depending on stack version.
   - Increase to 1536/2048 only after 1024 is stable.
@@ -87,6 +87,8 @@ python -m gemma27b_sft.cli --config configs/train_example.yaml
   - Set `auto` (recommended): class name is auto-detected from the loaded model.
 - `train.fsdp_limit_all_gathers`, `train.fsdp_activation_checkpointing`
   - Enabled in `train_8xh100_fsdp.yaml` to reduce peak memory.
+  - When `train.fsdp_activation_checkpointing=true`, HF `gradient_checkpointing` must be `false`.
+    The CLI enforces this automatically if both are set to `true`.
 - `data.source_lang_code`, `data.target_lang_code`
   - Set fixed language codes (example: `en`, `ko`).
   - WMT-style codes are supported directly; unknown codes are still accepted.
