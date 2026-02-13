@@ -46,7 +46,7 @@ teacher:
   request_timeout_s: 300
   sdk_max_retries: 0
   unset_proxy_env: true
-  max_concurrency: 4
+  max_concurrency: 64
   retry:
     max_attempts: 6
     backoff_s: [1, 2, 4, 8, 16, 32]

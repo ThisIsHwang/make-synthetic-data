@@ -175,7 +175,7 @@ teacher:
   api_key_env: QWEN_API_KEY
   model: Qwen/Qwen3-235B-A22B-Instruct-2507
   sdk_max_retries: 0
-  max_concurrency: 8
+  max_concurrency: 64
 
 metricx:
   backend: metricx24_cli
