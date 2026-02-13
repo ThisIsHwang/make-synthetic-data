@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Any
 
@@ -10,14 +11,133 @@ from transformers import PreTrainedTokenizerBase
 from .config import DataConfig, SFTConfig
 
 
-def _messages(source_lang_name: str, target_lang_name: str, source_text: str, target_text: str) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
-    system = "You are a professional translator."
-    user = (
-        f"Translate the following text from {source_lang_name} to {target_lang_name}.\n"
-        "Output only the translation without additional commentary.\n\n"
-        f"Source:\n{source_text}"
+logger = logging.getLogger(__name__)
+
+
+_WMT_LANGUAGE_NAMES: dict[str, str] = {
+    "ar": "Arabic",
+    "bg": "Bulgarian",
+    "bn": "Bengali",
+    "cs": "Czech",
+    "da": "Danish",
+    "de": "German",
+    "el": "Greek",
+    "en": "English",
+    "es": "Spanish",
+    "et": "Estonian",
+    "fa": "Persian",
+    "fi": "Finnish",
+    "fr": "French",
+    "gu": "Gujarati",
+    "ha": "Hausa",
+    "he": "Hebrew",
+    "hi": "Hindi",
+    "hr": "Croatian",
+    "hu": "Hungarian",
+    "id": "Indonesian",
+    "is": "Icelandic",
+    "it": "Italian",
+    "ja": "Japanese",
+    "kk": "Kazakh",
+    "km": "Khmer",
+    "ko": "Korean",
+    "lt": "Lithuanian",
+    "lv": "Latvian",
+    "mr": "Marathi",
+    "ms": "Malay",
+    "mt": "Maltese",
+    "ne": "Nepali",
+    "nl": "Dutch",
+    "no": "Norwegian",
+    "pl": "Polish",
+    "ps": "Pashto",
+    "pt": "Portuguese",
+    "ro": "Romanian",
+    "ru": "Russian",
+    "si": "Sinhala",
+    "sk": "Slovak",
+    "sl": "Slovenian",
+    "sr": "Serbian",
+    "sv": "Swedish",
+    "ta": "Tamil",
+    "te": "Telugu",
+    "th": "Thai",
+    "tr": "Turkish",
+    "uk": "Ukrainian",
+    "vi": "Vietnamese",
+    "zh": "Chinese",
+}
+
+
+def _normalize_code(code: str) -> str:
+    return code.strip().replace("_", "-").lower()
+
+
+def _resolve_language_name(name: str, code: str) -> str:
+    if name and name.strip() and name.strip().lower() != "auto":
+        return name.strip()
+    normalized_code = _normalize_code(code)
+    if normalized_code in _WMT_LANGUAGE_NAMES:
+        return _WMT_LANGUAGE_NAMES[normalized_code]
+    base_code = normalized_code.split("-", 1)[0]
+    if base_code in _WMT_LANGUAGE_NAMES:
+        return _WMT_LANGUAGE_NAMES[base_code]
+    return normalized_code
+
+
+def _example_value(example: dict[str, Any], field_name: str | None) -> str | None:
+    if not field_name:
+        return None
+    if field_name not in example:
+        return None
+    value = str(example[field_name]).strip()
+    return value or None
+
+
+def _resolve_languages(data_cfg: DataConfig, example: dict[str, Any]) -> tuple[str, str, str, str]:
+    src_code = _example_value(example, data_cfg.source_lang_code_field) or str(data_cfg.source_lang_code).strip()
+    tgt_code = _example_value(example, data_cfg.target_lang_code_field) or str(data_cfg.target_lang_code).strip()
+    if not src_code or not tgt_code:
+        raise ValueError("source/target language code is empty. Set code fields or fixed codes in config.")
+    src_code = _normalize_code(src_code)
+    tgt_code = _normalize_code(tgt_code)
+
+    src_name_raw = _example_value(example, data_cfg.source_lang_name_field) or data_cfg.source_lang_name
+    tgt_name_raw = _example_value(example, data_cfg.target_lang_name_field) or data_cfg.target_lang_name
+    src_name = _resolve_language_name(src_name_raw, src_code)
+    tgt_name = _resolve_language_name(tgt_name_raw, tgt_code)
+    return src_name, src_code, tgt_name, tgt_code
+
+
+def _build_prompt(data_cfg: DataConfig, source_text: str, source_lang: str, src_lang_code: str, target_lang: str, tgt_lang_code: str) -> str:
+    variables = {
+        "source_lang": source_lang,
+        "src_lang_code": src_lang_code,
+        "target_lang": target_lang,
+        "tgt_lang_code": tgt_lang_code,
+        "text": source_text,
+    }
+    try:
+        return data_cfg.prompt_template.format(**variables)
+    except KeyError as exc:
+        missing = exc.args[0]
+        raise ValueError(
+            f"Unknown placeholder in data.prompt_template: {missing}. "
+            "Allowed placeholders: source_lang, src_lang_code, target_lang, tgt_lang_code, text."
+        ) from exc
+
+
+def _messages(data_cfg: DataConfig, example: dict[str, Any], source_text: str, target_text: str) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    source_lang, src_lang_code, target_lang, tgt_lang_code = _resolve_languages(data_cfg, example)
+    user = _build_prompt(
+        data_cfg=data_cfg,
+        source_text=source_text,
+        source_lang=source_lang,
+        src_lang_code=src_lang_code,
+        target_lang=target_lang,
+        tgt_lang_code=tgt_lang_code,
     )
-    prompt_messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+    prompt_messages = [{"role": "user", "content": user}]
     full_messages = prompt_messages + [{"role": "assistant", "content": target_text}]
     return prompt_messages, full_messages
 
@@ -62,12 +182,7 @@ def _build_tokenize_fn(cfg: SFTConfig, tokenizer: PreTrainedTokenizerBase):
     def _tokenize(example: dict[str, Any]) -> dict[str, Any]:
         source_text = str(example[data_cfg.source_field])
         target_text = str(example[data_cfg.target_field])
-        prompt_messages, full_messages = _messages(
-            data_cfg.source_lang_name,
-            data_cfg.target_lang_name,
-            source_text,
-            target_text,
-        )
+        prompt_messages, full_messages = _messages(data_cfg, example, source_text, target_text)
         prompt_ids = _apply_chat_template(
             tokenizer=tokenizer,
             messages=prompt_messages,
@@ -135,6 +250,13 @@ def build_datasets(cfg: SFTConfig, tokenizer: PreTrainedTokenizerBase) -> tuple[
         if data_cfg.max_eval_samples is not None:
             eval_ds = eval_ds.select(range(min(len(eval_ds), data_cfg.max_eval_samples)))
 
+    logger.info(
+        "Tokenization language setup src_code=%s tgt_code=%s src_code_field=%s tgt_code_field=%s",
+        cfg.data.source_lang_code,
+        cfg.data.target_lang_code,
+        cfg.data.source_lang_code_field,
+        cfg.data.target_lang_code_field,
+    )
     tokenize_fn = _build_tokenize_fn(cfg, tokenizer)
     train_ds = train_ds.map(
         tokenize_fn,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import inspect
 import logging
 import os
 from pathlib import Path
@@ -105,34 +106,55 @@ def _load_model(cfg: SFTConfig):
 def _build_training_arguments(cfg: SFTConfig, grad_accum: int, has_eval: bool) -> TrainingArguments:
     output_dir = Path(cfg.train.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    return TrainingArguments(
-        output_dir=str(output_dir),
-        seed=cfg.train.seed,
-        num_train_epochs=cfg.train.num_train_epochs,
-        max_steps=cfg.train.max_steps,
-        per_device_train_batch_size=cfg.train.per_device_train_batch_size,
-        per_device_eval_batch_size=cfg.train.per_device_eval_batch_size,
-        gradient_accumulation_steps=grad_accum,
-        learning_rate=cfg.train.learning_rate,
-        lr_scheduler_type=cfg.train.lr_scheduler_type,
-        warmup_ratio=cfg.train.warmup_ratio,
-        weight_decay=cfg.train.weight_decay,
-        logging_steps=cfg.train.logging_steps,
-        save_steps=cfg.train.save_steps,
-        eval_steps=cfg.train.eval_steps,
-        save_total_limit=cfg.train.save_total_limit,
-        bf16=cfg.train.bf16,
-        tf32=cfg.train.tf32,
-        gradient_checkpointing=cfg.train.gradient_checkpointing,
-        dataloader_num_workers=cfg.train.dataloader_num_workers,
-        report_to=cfg.train.report_to,
-        remove_unused_columns=False,
-        ddp_find_unused_parameters=cfg.train.ddp_find_unused_parameters,
-        evaluation_strategy="steps" if has_eval else "no",
-        save_strategy="steps",
-        logging_strategy="steps",
-        optim="adafactor",
-    )
+    ta_params = set(inspect.signature(TrainingArguments.__init__).parameters)
+
+    kwargs: dict[str, object] = {
+        "output_dir": str(output_dir),
+        "seed": cfg.train.seed,
+        "num_train_epochs": cfg.train.num_train_epochs,
+        "max_steps": cfg.train.max_steps,
+        "per_device_train_batch_size": cfg.train.per_device_train_batch_size,
+        "per_device_eval_batch_size": cfg.train.per_device_eval_batch_size,
+        "gradient_accumulation_steps": grad_accum,
+        "learning_rate": cfg.train.learning_rate,
+        "lr_scheduler_type": cfg.train.lr_scheduler_type,
+        "warmup_ratio": cfg.train.warmup_ratio,
+        "weight_decay": cfg.train.weight_decay,
+        "logging_steps": cfg.train.logging_steps,
+        "save_steps": cfg.train.save_steps,
+        "eval_steps": cfg.train.eval_steps,
+        "save_total_limit": cfg.train.save_total_limit,
+        "bf16": cfg.train.bf16,
+        "tf32": cfg.train.tf32,
+        "gradient_checkpointing": cfg.train.gradient_checkpointing,
+        "dataloader_num_workers": cfg.train.dataloader_num_workers,
+        "report_to": cfg.train.report_to,
+        "remove_unused_columns": False,
+        "ddp_find_unused_parameters": cfg.train.ddp_find_unused_parameters,
+    }
+    eval_mode = "steps" if has_eval else "no"
+    if "evaluation_strategy" in ta_params:
+        kwargs["evaluation_strategy"] = eval_mode
+    elif "eval_strategy" in ta_params:
+        kwargs["eval_strategy"] = eval_mode
+    elif "do_eval" in ta_params:
+        kwargs["do_eval"] = has_eval
+
+    if "save_strategy" in ta_params:
+        kwargs["save_strategy"] = "steps"
+    if "logging_strategy" in ta_params:
+        kwargs["logging_strategy"] = "steps"
+    if "optim" in ta_params:
+        kwargs["optim"] = "adafactor"
+    elif "adafactor" in ta_params:
+        kwargs["adafactor"] = True
+
+    supported_kwargs = {k: v for k, v in kwargs.items() if k in ta_params}
+    dropped_kwargs = sorted(set(kwargs) - set(supported_kwargs))
+    if dropped_kwargs:
+        logger.info("Skipping unsupported TrainingArguments kwargs: %s", ", ".join(dropped_kwargs))
+
+    return TrainingArguments(**supported_kwargs)
 
 
 def _build_parser() -> argparse.ArgumentParser:

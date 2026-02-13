@@ -29,6 +29,10 @@ Example input:
 Set it in `configs/train_example.yaml`:
 - `data.train_file`
 
+Prompt formatting is configurable with `data.prompt_template`.
+Default template matches:
+- `{source_lang}`, `{src_lang_code}`, `{target_lang}`, `{tgt_lang_code}`, `{text}`
+
 ## 3) Batch Size Rule
 
 Global batch is fixed to `64` and is checked at startup.
@@ -63,6 +67,13 @@ python -m gemma27b_sft.cli --config configs/train_example.yaml
   - Uses `flash_attention_2` automatically when CUDA + `flash_attn` are available.
   - Falls back to `sdpa` automatically if FlashAttention is unavailable.
   - Install with `uv pip install flash-attn --no-build-isolation` when your CUDA toolchain supports it.
+- `data.source_lang_code`, `data.target_lang_code`
+  - Set fixed language codes (example: `en`, `ko`).
+  - WMT-style codes are supported directly; unknown codes are still accepted.
+- `data.source_lang_code_field`, `data.target_lang_code_field`
+  - Optional per-row language-code columns for multilingual mixed datasets.
+- `data.source_lang_name`, `data.target_lang_name`
+  - Use `auto` to infer language names from WMT-style codes.
 
 ## 6) Output
 

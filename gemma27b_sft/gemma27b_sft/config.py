@@ -3,9 +3,20 @@ from __future__ import annotations
 import os
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from string import Formatter
 from typing import Any
 
 import yaml
+
+
+DEFAULT_TRANSLATION_PROMPT_TEMPLATE = (
+    "You are a professional {source_lang} ({src_lang_code}) to {target_lang}\n"
+    "({tgt_lang_code}) translator. Your goal is to accurately convey the meaning and\n"
+    "nuances of the original {source_lang} text while adhering to {target_lang} grammar,\n"
+    "vocabulary, and cultural sensitivities. Produce only the {target_lang}\n"
+    "translation, without any additional explanations or commentary. Please translate\n"
+    "the following {source_lang} text into {target_lang}:\n\n\n{text}"
+)
 
 
 @dataclass
@@ -22,8 +33,15 @@ class DataConfig:
     eval_file: str | None = None
     source_field: str = "source_text"
     target_field: str = "target_text"
-    source_lang_name: str = "English"
-    target_lang_name: str = "Korean"
+    source_lang_name: str = "auto"
+    target_lang_name: str = "auto"
+    source_lang_code: str = "en"
+    target_lang_code: str = "ko"
+    source_lang_name_field: str | None = None
+    target_lang_name_field: str | None = None
+    source_lang_code_field: str | None = None
+    target_lang_code_field: str | None = None
+    prompt_template: str = DEFAULT_TRANSLATION_PROMPT_TEMPLATE
     max_train_samples: int | None = None
     max_eval_samples: int | None = None
     preprocessing_num_workers: int = 4
@@ -109,6 +127,17 @@ def compute_gradient_accumulation_steps(cfg: SFTConfig) -> int:
     return cfg.train.global_batch_size // micro_global
 
 
+def _template_fields(template: str) -> set[str]:
+    fields: set[str] = set()
+    for _, field_name, _, _ in Formatter().parse(template):
+        if not field_name:
+            continue
+        normalized = field_name.split(".", 1)[0].split("[", 1)[0]
+        if normalized:
+            fields.add(normalized)
+    return fields
+
+
 def load_config(path: str | Path) -> SFTConfig:
     config_path = Path(path)
     payload = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
@@ -131,6 +160,20 @@ def load_config(path: str | Path) -> SFTConfig:
         raise ValueError("train.max_seq_length must be > 0")
     if cfg.data.preprocessing_num_workers < 0:
         raise ValueError("data.preprocessing_num_workers must be >= 0")
+    if not cfg.data.source_lang_code_field and not str(cfg.data.source_lang_code).strip():
+        raise ValueError("Set data.source_lang_code or data.source_lang_code_field.")
+    if not cfg.data.target_lang_code_field and not str(cfg.data.target_lang_code).strip():
+        raise ValueError("Set data.target_lang_code or data.target_lang_code_field.")
+    if not cfg.data.prompt_template.strip():
+        raise ValueError("data.prompt_template must not be empty.")
+    required_template_keys = {"source_lang", "src_lang_code", "target_lang", "tgt_lang_code", "text"}
+    found_keys = _template_fields(cfg.data.prompt_template)
+    missing_keys = sorted(required_template_keys - found_keys)
+    if missing_keys:
+        raise ValueError(
+            "data.prompt_template is missing required placeholders: "
+            + ", ".join(missing_keys)
+        )
 
     compute_gradient_accumulation_steps(cfg)
     return cfg

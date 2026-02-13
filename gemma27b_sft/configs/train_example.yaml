@@ -9,8 +9,24 @@ data:
   eval_file:
   source_field: source_text
   target_field: target_text
-  source_lang_name: English
-  target_lang_name: Korean
+  source_lang_name: auto
+  target_lang_name: auto
+  source_lang_code: en
+  target_lang_code: ko
+  source_lang_name_field:
+  target_lang_name_field:
+  source_lang_code_field:
+  target_lang_code_field:
+  prompt_template: |
+    You are a professional {source_lang} ({src_lang_code}) to {target_lang}
+    ({tgt_lang_code}) translator. Your goal is to accurately convey the meaning and
+    nuances of the original {source_lang} text while adhering to {target_lang} grammar,
+    vocabulary, and cultural sensitivities. Produce only the {target_lang}
+    translation, without any additional explanations or commentary. Please translate
+    the following {source_lang} text into {target_lang}:
+
+
+    {text}
   max_train_samples:
   max_eval_samples:
   preprocessing_num_workers: 8
