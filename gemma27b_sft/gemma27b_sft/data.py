@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -74,6 +75,22 @@ _WMT_LANGUAGE_NAMES: dict[str, str] = {
 def _coerce_token_ids(value: Any, field_name: str) -> list[int]:
     if value is None:
         return []
+    if isinstance(value, Mapping):
+        # Handle dict-like containers such as transformers.BatchEncoding.
+        for key in (field_name, "input_ids", "ids", "labels", "attention_mask"):
+            if key in value:
+                return _coerce_token_ids(value[key], field_name)
+        if len(value) == 1:
+            return _coerce_token_ids(next(iter(value.values())), field_name)
+        raise ValueError(f"{field_name} mapping has no token-id-like key: {list(value.keys())[:8]}")
+    data = getattr(value, "data", None)
+    if isinstance(data, Mapping):
+        return _coerce_token_ids(data, field_name)
+    if hasattr(value, "tolist") and not isinstance(value, (str, bytes)):
+        try:
+            return _coerce_token_ids(value.tolist(), field_name)
+        except Exception:  # pylint: disable=broad-except
+            pass
     if isinstance(value, torch.Tensor):
         value = value.detach().cpu().tolist()
     if isinstance(value, tuple):
