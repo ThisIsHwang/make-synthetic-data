@@ -339,14 +339,45 @@ def _load_json_dataset_resilient(path: str, cfg: DataConfig) -> Dataset:
     try:
         return _load_json_dataset(path)
     except Exception as exc:  # pylint: disable=broad-except
-        msg = str(exc).lower()
-        if "arrowtypeerror" in type(exc).__name__.lower() or "expected bytes" in msg:
+        logger.warning(
+            "Primary JSON loader failed (%s: %s). Falling back to safe JSON loader.",
+            type(exc).__name__,
+            exc,
+        )
+        return _safe_load_json_dataset(path, cfg)
+
+
+def _map_with_retry(ds: Dataset, fn, num_proc: int, desc: str) -> Dataset:
+    proc = num_proc or None
+    try:
+        return ds.map(fn, num_proc=proc, desc=desc)
+    except Exception as exc:  # pylint: disable=broad-except
+        if proc is not None and int(proc) > 1:
             logger.warning(
-                "Falling back to safe JSON loader due to Arrow type mismatch: %s: %s",
+                "%s failed with num_proc=%s (%s: %s). Retrying with single process.",
+                desc,
+                proc,
                 type(exc).__name__,
                 exc,
             )
-            return _safe_load_json_dataset(path, cfg)
+            return ds.map(fn, num_proc=None, desc=desc)
+        raise
+
+
+def _filter_with_retry(ds: Dataset, fn, num_proc: int, desc: str) -> Dataset:
+    proc = num_proc or None
+    try:
+        return ds.filter(fn, num_proc=proc, desc=desc)
+    except Exception as exc:  # pylint: disable=broad-except
+        if proc is not None and int(proc) > 1:
+            logger.warning(
+                "%s failed with num_proc=%s (%s: %s). Retrying with single process.",
+                desc,
+                proc,
+                type(exc).__name__,
+                exc,
+            )
+            return ds.filter(fn, num_proc=None, desc=desc)
         raise
 
 
@@ -442,10 +473,11 @@ def build_datasets(cfg: SFTConfig, tokenizer: PreTrainedTokenizerBase) -> tuple[
         cfg.data.target_lang_code_field,
     )
     tokenize_fn = _build_tokenize_fn(cfg, tokenizer)
-    train_mapped = train_ds.map(
+    train_mapped = _map_with_retry(
+        train_ds,
         tokenize_fn,
-        num_proc=data_cfg.preprocessing_num_workers or None,
-        desc="Tokenizing train dataset",
+        data_cfg.preprocessing_num_workers,
+        "Tokenizing train dataset",
     )
     train_stats = _summarize_tokenization(train_mapped, cfg.train.max_seq_length)
     logger.info(
@@ -460,10 +492,11 @@ def build_datasets(cfg: SFTConfig, tokenizer: PreTrainedTokenizerBase) -> tuple[
         train_stats["max_full_tokens"],
         train_stats["mean_target_tokens"],
     )
-    train_filtered = train_mapped.filter(
+    train_filtered = _filter_with_retry(
+        train_mapped,
         lambda ex: ex["num_target_tokens"] > 0,
-        num_proc=data_cfg.preprocessing_num_workers or None,
-        desc="Filtering empty-train labels",
+        data_cfg.preprocessing_num_workers,
+        "Filtering empty-train labels",
     )
     train_kept = len(train_filtered)
     logger.info("Train filtering kept=%s dropped=%s", train_kept, len(train_mapped) - train_kept)
@@ -474,10 +507,11 @@ def build_datasets(cfg: SFTConfig, tokenizer: PreTrainedTokenizerBase) -> tuple[
     )
 
     if eval_ds is not None:
-        eval_mapped = eval_ds.map(
+        eval_mapped = _map_with_retry(
+            eval_ds,
             tokenize_fn,
-            num_proc=data_cfg.preprocessing_num_workers or None,
-            desc="Tokenizing eval dataset",
+            data_cfg.preprocessing_num_workers,
+            "Tokenizing eval dataset",
         )
         eval_stats = _summarize_tokenization(eval_mapped, cfg.train.max_seq_length)
         logger.info(
@@ -492,10 +526,11 @@ def build_datasets(cfg: SFTConfig, tokenizer: PreTrainedTokenizerBase) -> tuple[
             eval_stats["max_full_tokens"],
             eval_stats["mean_target_tokens"],
         )
-        eval_filtered = eval_mapped.filter(
+        eval_filtered = _filter_with_retry(
+            eval_mapped,
             lambda ex: ex["num_target_tokens"] > 0,
-            num_proc=data_cfg.preprocessing_num_workers or None,
-            desc="Filtering empty-eval labels",
+            data_cfg.preprocessing_num_workers,
+            "Filtering empty-eval labels",
         )
         eval_kept = len(eval_filtered)
         logger.info("Eval filtering kept=%s dropped=%s", eval_kept, len(eval_mapped) - eval_kept)
