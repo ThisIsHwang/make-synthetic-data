@@ -201,6 +201,8 @@ def run(cfg: SFTConfig) -> None:
         tokenizer.pad_token = tokenizer.eos_token
 
     train_ds, eval_ds = build_datasets(cfg, tokenizer)
+    if len(train_ds) == 0:
+        raise ValueError("Prepared train dataset is empty. Check data fields/prompt length/max_seq_length.")
     logger.info("Dataset ready train=%s eval=%s", len(train_ds), len(eval_ds) if eval_ds is not None else 0)
 
     model = _load_model(cfg)

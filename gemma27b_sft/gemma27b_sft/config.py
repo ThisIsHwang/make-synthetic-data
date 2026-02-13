@@ -160,6 +160,10 @@ def load_config(path: str | Path) -> SFTConfig:
         raise ValueError("train.max_seq_length must be > 0")
     if cfg.data.preprocessing_num_workers < 0:
         raise ValueError("data.preprocessing_num_workers must be >= 0")
+    if cfg.data.max_train_samples is not None and cfg.data.max_train_samples <= 0:
+        raise ValueError("data.max_train_samples must be > 0 when set.")
+    if cfg.data.max_eval_samples is not None and cfg.data.max_eval_samples <= 0:
+        raise ValueError("data.max_eval_samples must be > 0 when set.")
     if not cfg.data.source_lang_code_field and not str(cfg.data.source_lang_code).strip():
         raise ValueError("Set data.source_lang_code or data.source_lang_code_field.")
     if not cfg.data.target_lang_code_field and not str(cfg.data.target_lang_code).strip():
