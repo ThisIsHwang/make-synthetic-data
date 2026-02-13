@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gemma27b-sft"
+version = "0.1.0"
+description = "Full SFT pipeline for Gemma 27B IT with frozen embeddings and Adafactor."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "accelerate>=0.33.0",
+  "datasets>=2.21.0,<3.0.0",
+  "PyYAML>=6.0.1",
+  "sentencepiece>=0.2.0",
+  "torch>=2.2.0",
+  "transformers>=4.44.0",
+]
+
+[project.scripts]
+gemma27b_sft = "gemma27b_sft.cli:main"
+
+[tool.setuptools]
+packages = ["gemma27b_sft"]

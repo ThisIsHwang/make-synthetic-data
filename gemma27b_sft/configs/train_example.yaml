@@ -1,0 +1,41 @@
+model:
+  name_or_path: google/gemma-2-27b-it
+  trust_remote_code: false
+  attn_implementation: flash_attention_2
+  freeze_output_embeddings: true
+
+data:
+  train_file: ../../runs/exp001/final_dataset.jsonl
+  eval_file:
+  source_field: source_text
+  target_field: target_text
+  source_lang_name: English
+  target_lang_name: Korean
+  max_train_samples:
+  max_eval_samples:
+  preprocessing_num_workers: 8
+
+train:
+  output_dir: ../outputs/gemma2-27b-it-sft
+  seed: 42
+  num_train_epochs: 1.0
+  max_steps: -1
+  global_batch_size: 64
+  per_device_train_batch_size: 1
+  per_device_eval_batch_size: 1
+  learning_rate: 0.0001
+  warmup_ratio: 0.03
+  lr_scheduler_type: cosine
+  weight_decay: 0.0
+  max_seq_length: 2048
+  bf16: true
+  tf32: true
+  gradient_checkpointing: true
+  dataloader_num_workers: 8
+  logging_steps: 10
+  save_steps: 500
+  eval_steps: 500
+  save_total_limit: 3
+  report_to: []
+  resume_from_checkpoint:
+  ddp_find_unused_parameters: false
