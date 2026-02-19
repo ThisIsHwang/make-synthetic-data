@@ -477,7 +477,13 @@ class MetricXScorer:
         device = (self.cfg.device or "").strip().lower()
         if device.startswith("cuda:"):
             gpu_id = device.split(":", maxsplit=1)[1]
-            if gpu_id:
+            if "CUDA_VISIBLE_DEVICES" in env:
+                self.logger.info(
+                    "Preserving existing CUDA_VISIBLE_DEVICES=%s for MetricX worker (metricx.device=%s).",
+                    env.get("CUDA_VISIBLE_DEVICES", ""),
+                    self.cfg.device,
+                )
+            elif gpu_id:
                 env["CUDA_VISIBLE_DEVICES"] = gpu_id
         elif device == "cpu":
             env["CUDA_VISIBLE_DEVICES"] = ""

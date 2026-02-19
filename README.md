@@ -153,6 +153,7 @@ source .venv/bin/activate
 - worker 시작/응답 타임아웃(초)
 - `metricx.device`
 - `cuda:0` 권장 (H100 1장 고정)
+- 멀티프로세스에서 `CUDA_VISIBLE_DEVICES`로 GPU를 프로세스별로 분리할 때도 `metricx.device`는 보통 `cuda:0`로 두고, 런처의 `CUDA_VISIBLE_DEVICES`를 우선 사용
 - `metricx.python_bin`
 - MetricX 전용 env의 Python 경로
 - 예: `../.venv-metricx/bin/python` (`config/example.yaml` 기준)
