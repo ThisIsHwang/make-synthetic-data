@@ -23,8 +23,10 @@ class _FakeCompletions:
     def __init__(self, responses):
         self.responses = responses
         self.calls = 0
+        self.last_kwargs = None
 
     def create(self, **kwargs):
+        self.last_kwargs = kwargs
         response = self.responses[min(self.calls, len(self.responses) - 1)]
         self.calls += 1
         return response
@@ -96,5 +98,24 @@ def test_teacher_raises_on_empty_completion(tmp_path):
 
         cache_key = client._cache_key(client.cfg.model, messages, 0.0, 1.0, 64)
         assert client.cache.get(cache_key) is None
+    finally:
+        client.close()
+
+
+def test_teacher_uses_generation_extra_body_from_config(tmp_path):
+    client = _build_client(tmp_path, [_response(message_content="ok")])
+    client.cfg.generation.extra_body = {"chat_template_kwargs": {"enable_thinking": False}}
+    try:
+        text = client.complete(
+            messages=[{"role": "user", "content": "hello"}],
+            temperature=0.0,
+            top_p=1.0,
+            max_tokens=64,
+        )
+        assert text == "ok"
+        assert client.client.completions.last_kwargs is not None
+        assert client.client.completions.last_kwargs.get("extra_body") == {
+            "chat_template_kwargs": {"enable_thinking": False}
+        }
     finally:
         client.close()

@@ -74,6 +74,7 @@ class TeacherGenerationConfig:
     sample_temperature: float = 1.0
     final_temperature: float = 1.0
     seed: int | None = None
+    extra_body: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

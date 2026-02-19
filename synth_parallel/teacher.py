@@ -64,6 +64,15 @@ class TeacherClient:
         self.cache = SQLiteKVCache(cache_db_path, table_name="teacher_cache")
         self.random = random.Random()
 
+    def _request_extra_body(self) -> dict[str, Any]:
+        raw = self.cfg.generation.extra_body
+        if not raw:
+            return {}
+        if isinstance(raw, dict):
+            return raw
+        self.logger.warning("Ignoring teacher.generation.extra_body because it is not a dict: %s", type(raw).__name__)
+        return {}
+
     @staticmethod
     def _content_to_text(content: Any) -> str:
         if content is None:
@@ -127,12 +136,14 @@ class TeacherClient:
         top_p: float,
         max_tokens: int,
     ) -> str:
+        extra_body = self._request_extra_body()
         payload = {
             "model": model,
             "messages": messages,
             "temperature": temperature,
             "top_p": top_p,
             "max_tokens": max_tokens,
+            "extra_body": extra_body,
         }
         return stable_hash(payload)
 
@@ -146,6 +157,7 @@ class TeacherClient:
     ) -> str:
         chosen_model = model or self.cfg.model
         cache_key = self._cache_key(chosen_model, messages, temperature, top_p, max_tokens)
+        extra_body = self._request_extra_body()
         cached = self.cache.get(cache_key)
         if cached is not None:
             cached_text = str(cached.get("text", "")).strip()
@@ -162,13 +174,18 @@ class TeacherClient:
         for attempt in range(max_attempts):
             try:
                 with self.stats.time_block("teacher.request"):
+                    request_kwargs: dict[str, Any] = {
+                        "model": chosen_model,
+                        "messages": messages,
+                        "temperature": temperature,
+                        "top_p": top_p,
+                        "max_tokens": max_tokens,
+                        "extra_headers": {"Idempotency-Key": cache_key},
+                    }
+                    if extra_body:
+                        request_kwargs["extra_body"] = extra_body
                     response = self.client.chat.completions.create(
-                        model=chosen_model,
-                        messages=messages,
-                        temperature=temperature,
-                        top_p=top_p,
-                        max_tokens=max_tokens,
-                        extra_headers={"Idempotency-Key": cache_key},
+                        **request_kwargs,
                     )
                 text = self._extract_response_text(response)
                 if not text:

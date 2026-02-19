@@ -56,6 +56,9 @@ teacher:
     greedy_temperature: 0.0
     sample_temperature: 1.0
     final_temperature: 1.0
+    extra_body:
+      chat_template_kwargs:
+        enable_thinking: false
 
 final_generation:
   num_candidates: 128
