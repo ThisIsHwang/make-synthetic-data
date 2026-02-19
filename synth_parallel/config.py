@@ -11,6 +11,7 @@ import yaml
 class RunConfig:
     out_dir: str = "./runs/exp001"
     seed: int = 1234
+    randomize_seed_each_run: bool = True
     log_level: str = "INFO"
 
 

@@ -47,6 +47,14 @@ class PipelineRunner:
         self.shard_id = shard_id
         self.num_shards = num_shards
 
+        if self.cfg.run.randomize_seed_each_run:
+            runtime_seed = random.SystemRandom().randint(0, 2_147_483_647)
+            logger.info(
+                "Using randomized run seed=%s (run.randomize_seed_each_run=true).",
+                runtime_seed,
+            )
+            self.cfg.run.seed = runtime_seed
+
         self.out_dir = ensure_dir(cfg.run.out_dir)
         dump_config(cfg, self.out_dir / "resolved_config.yaml")
 
