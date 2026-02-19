@@ -119,3 +119,32 @@ def test_teacher_uses_generation_extra_body_from_config(tmp_path):
         }
     finally:
         client.close()
+
+
+def test_teacher_merges_call_level_sampling_kwargs(tmp_path):
+    client = _build_client(tmp_path, [_response(message_content="ok")])
+    client.cfg.generation.extra_body = {"chat_template_kwargs": {"enable_thinking": False}}
+    try:
+        text = client.complete(
+            messages=[{"role": "user", "content": "hello"}],
+            temperature=0.7,
+            top_p=0.8,
+            max_tokens=64,
+            presence_penalty=1.5,
+            extra_body={
+                "top_k": 20,
+                "min_p": 0.0,
+                "repetition_penalty": 1.0,
+            },
+        )
+        assert text == "ok"
+        assert client.client.completions.last_kwargs is not None
+        assert client.client.completions.last_kwargs.get("presence_penalty") == 1.5
+        assert client.client.completions.last_kwargs.get("extra_body") == {
+            "chat_template_kwargs": {"enable_thinking": False},
+            "top_k": 20,
+            "min_p": 0.0,
+            "repetition_penalty": 1.0,
+        }
+    finally:
+        client.close()

@@ -56,6 +56,12 @@ teacher:
     greedy_temperature: 0.0
     sample_temperature: 1.0
     final_temperature: 1.0
+    sampling_temperature: 0.7
+    sampling_top_p: 0.8
+    sampling_top_k: 20
+    sampling_min_p: 0.0
+    sampling_presence_penalty: 1.5
+    sampling_repetition_penalty: 1.0
     extra_body:
       chat_template_kwargs:
         enable_thinking: false

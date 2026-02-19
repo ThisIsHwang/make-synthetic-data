@@ -25,6 +25,8 @@ class CompletionTask:
     top_p: float
     max_tokens: int
     model: str | None = None
+    presence_penalty: float | None = None
+    extra_body: dict[str, Any] | None = None
 
 
 class TeacherClient:
@@ -72,6 +74,16 @@ class TeacherClient:
             return raw
         self.logger.warning("Ignoring teacher.generation.extra_body because it is not a dict: %s", type(raw).__name__)
         return {}
+
+    def _merge_extra_body(self, call_extra_body: dict[str, Any] | None) -> dict[str, Any]:
+        merged = dict(self._request_extra_body())
+        if not call_extra_body:
+            return merged
+        if not isinstance(call_extra_body, dict):
+            self.logger.warning("Ignoring call extra_body because it is not a dict: %s", type(call_extra_body).__name__)
+            return merged
+        merged.update(call_extra_body)
+        return merged
 
     @staticmethod
     def _content_to_text(content: Any) -> str:
@@ -135,15 +147,18 @@ class TeacherClient:
         temperature: float,
         top_p: float,
         max_tokens: int,
+        presence_penalty: float | None = None,
+        extra_body: dict[str, Any] | None = None,
     ) -> str:
-        extra_body = self._request_extra_body()
+        merged_extra_body = self._merge_extra_body(extra_body)
         payload = {
             "model": model,
             "messages": messages,
             "temperature": temperature,
             "top_p": top_p,
             "max_tokens": max_tokens,
-            "extra_body": extra_body,
+            "presence_penalty": presence_penalty,
+            "extra_body": merged_extra_body,
         }
         return stable_hash(payload)
 
@@ -154,10 +169,20 @@ class TeacherClient:
         top_p: float,
         max_tokens: int,
         model: str | None = None,
+        presence_penalty: float | None = None,
+        extra_body: dict[str, Any] | None = None,
     ) -> str:
         chosen_model = model or self.cfg.model
-        cache_key = self._cache_key(chosen_model, messages, temperature, top_p, max_tokens)
-        extra_body = self._request_extra_body()
+        merged_extra_body = self._merge_extra_body(extra_body)
+        cache_key = self._cache_key(
+            chosen_model,
+            messages,
+            temperature,
+            top_p,
+            max_tokens,
+            presence_penalty=presence_penalty,
+            extra_body=merged_extra_body,
+        )
         cached = self.cache.get(cache_key)
         if cached is not None:
             cached_text = str(cached.get("text", "")).strip()
@@ -182,8 +207,10 @@ class TeacherClient:
                         "max_tokens": max_tokens,
                         "extra_headers": {"Idempotency-Key": cache_key},
                     }
-                    if extra_body:
-                        request_kwargs["extra_body"] = extra_body
+                    if presence_penalty is not None:
+                        request_kwargs["presence_penalty"] = presence_penalty
+                    if merged_extra_body:
+                        request_kwargs["extra_body"] = merged_extra_body
                     response = self.client.chat.completions.create(
                         **request_kwargs,
                     )
@@ -298,6 +325,8 @@ class TeacherClient:
             top_p=task.top_p,
             max_tokens=task.max_tokens,
             model=task.model,
+            presence_penalty=task.presence_penalty,
+            extra_body=task.extra_body,
         )
         return worker_fn(task, text)
 

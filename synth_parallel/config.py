@@ -74,6 +74,12 @@ class TeacherGenerationConfig:
     sample_temperature: float = 1.0
     final_temperature: float = 1.0
     seed: int | None = None
+    sampling_temperature: float | None = None
+    sampling_top_p: float | None = None
+    sampling_top_k: int | None = None
+    sampling_min_p: float | None = None
+    sampling_presence_penalty: float | None = None
+    sampling_repetition_penalty: float | None = None
     extra_body: dict[str, Any] = field(default_factory=dict)
 
 

@@ -151,6 +151,32 @@ class PipelineRunner:
         if path.exists() and self.overwrite:
             path.unlink()
 
+    def _sampling_temperature(self, default_temperature: float) -> float:
+        override = self.cfg.teacher.generation.sampling_temperature
+        if override is None:
+            return default_temperature
+        return float(override)
+
+    def _sampling_top_p(self) -> float:
+        override = self.cfg.teacher.generation.sampling_top_p
+        if override is None:
+            return float(self.cfg.teacher.generation.top_p)
+        return float(override)
+
+    def _sampling_presence_penalty(self) -> float | None:
+        return self.cfg.teacher.generation.sampling_presence_penalty
+
+    def _sampling_extra_body(self) -> dict[str, Any]:
+        generation_cfg = self.cfg.teacher.generation
+        payload: dict[str, Any] = {}
+        if generation_cfg.sampling_top_k is not None:
+            payload["top_k"] = int(generation_cfg.sampling_top_k)
+        if generation_cfg.sampling_min_p is not None:
+            payload["min_p"] = float(generation_cfg.sampling_min_p)
+        if generation_cfg.sampling_repetition_penalty is not None:
+            payload["repetition_penalty"] = float(generation_cfg.sampling_repetition_penalty)
+        return payload
+
     def stage_sample_sources(self) -> None:
         out_path = self.paths["sampled_sources"]
         self._maybe_reset_file(out_path)
@@ -414,6 +440,10 @@ class PipelineRunner:
             return 0
 
         t0 = time.perf_counter()
+        sample_temperature = self._sampling_temperature(self.cfg.teacher.generation.sample_temperature)
+        sample_top_p = self._sampling_top_p()
+        sample_presence_penalty = self._sampling_presence_penalty()
+        sample_extra_body = self._sampling_extra_body()
         tasks: list[CompletionTask] = []
         for row in chunk_rows:
             messages = build_translation_messages(
@@ -436,9 +466,11 @@ class PipelineRunner:
                 CompletionTask(
                     item_id=f"{row['source_id']}::sample",
                     messages=messages,
-                    temperature=self.cfg.teacher.generation.sample_temperature,
-                    top_p=self.cfg.teacher.generation.top_p,
+                    temperature=sample_temperature,
+                    top_p=sample_top_p,
                     max_tokens=self.cfg.teacher.generation.max_tokens,
+                    presence_penalty=sample_presence_penalty,
+                    extra_body=sample_extra_body,
                 )
             )
 
@@ -498,11 +530,13 @@ class PipelineRunner:
             for task in tasks:
                 future = executor.submit(
                     self.teacher.complete,
-                    task.messages,
-                    task.temperature,
-                    task.top_p,
-                    task.max_tokens,
-                    task.model,
+                    messages=task.messages,
+                    temperature=task.temperature,
+                    top_p=task.top_p,
+                    max_tokens=task.max_tokens,
+                    model=task.model,
+                    presence_penalty=task.presence_penalty,
+                    extra_body=task.extra_body,
                 )
                 future_map[future] = task.item_id
 
@@ -558,9 +592,11 @@ class PipelineRunner:
                             "max_tokens": self.cfg.teacher.generation.max_tokens,
                         },
                         "prefilter_sample": {
-                            "temperature": self.cfg.teacher.generation.sample_temperature,
-                            "top_p": self.cfg.teacher.generation.top_p,
+                            "temperature": sample_temperature,
+                            "top_p": sample_top_p,
                             "max_tokens": self.cfg.teacher.generation.max_tokens,
+                            "presence_penalty": sample_presence_penalty,
+                            "extra_body": sample_extra_body,
                         },
                     },
                 },
@@ -645,6 +681,10 @@ class PipelineRunner:
 
         stage_name = "generate_128"
         total_written = 0
+        final_temperature = self._sampling_temperature(self.cfg.teacher.generation.final_temperature)
+        final_top_p = self._sampling_top_p()
+        final_presence_penalty = self._sampling_presence_penalty()
+        final_extra_body = self._sampling_extra_body()
 
         for source_idx, row in enumerate(read_jsonl(in_path)):
             source_id = row["source_id"]
@@ -674,9 +714,11 @@ class PipelineRunner:
                     CompletionTask(
                         item_id=f"{source_id}::{candidate_idx}",
                         messages=messages,
-                        temperature=self.cfg.teacher.generation.final_temperature,
-                        top_p=self.cfg.teacher.generation.top_p,
+                        temperature=final_temperature,
+                        top_p=final_top_p,
                         max_tokens=self.cfg.teacher.generation.max_tokens,
+                        presence_penalty=final_presence_penalty,
+                        extra_body=final_extra_body,
                     )
                     for candidate_idx in candidate_chunk
                 ]
@@ -708,9 +750,11 @@ class PipelineRunner:
                             "model": self.cfg.teacher.model,
                             "sampling_params": {
                                 "final_128": {
-                                    "temperature": self.cfg.teacher.generation.final_temperature,
-                                    "top_p": self.cfg.teacher.generation.top_p,
+                                    "temperature": final_temperature,
+                                    "top_p": final_top_p,
                                     "max_tokens": self.cfg.teacher.generation.max_tokens,
+                                    "presence_penalty": final_presence_penalty,
+                                    "extra_body": final_extra_body,
                                 }
                             },
                         },
