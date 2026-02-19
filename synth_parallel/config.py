@@ -23,6 +23,8 @@ class DataConfig:
     tgt_lang: str = "ko"
     src_lang_name: str = "English"
     tgt_lang_name: str = "Korean"
+    tgt_langs: list[str] = field(default_factory=list)
+    tgt_lang_names: dict[str, str] = field(default_factory=dict)
     hf_token_env: str = "HF_TOKEN"
     madlad_revision: str | None = None
     trust_remote_code: bool = True
@@ -179,6 +181,79 @@ _ALLOWED_STAGES = {
 }
 
 
+_DEFAULT_LANGUAGE_NAMES = {
+    "ar": "Arabic",
+    "bg": "Bulgarian",
+    "bn": "Bengali",
+    "cs": "Czech",
+    "da": "Danish",
+    "de": "German",
+    "el": "Greek",
+    "en": "English",
+    "es": "Spanish",
+    "et": "Estonian",
+    "fa": "Persian",
+    "fi": "Finnish",
+    "fr": "French",
+    "gu": "Gujarati",
+    "ha": "Hausa",
+    "he": "Hebrew",
+    "hi": "Hindi",
+    "hr": "Croatian",
+    "hu": "Hungarian",
+    "id": "Indonesian",
+    "is": "Icelandic",
+    "it": "Italian",
+    "ja": "Japanese",
+    "kk": "Kazakh",
+    "km": "Khmer",
+    "ko": "Korean",
+    "lt": "Lithuanian",
+    "lv": "Latvian",
+    "mr": "Marathi",
+    "ms": "Malay",
+    "mt": "Maltese",
+    "ne": "Nepali",
+    "nl": "Dutch",
+    "no": "Norwegian",
+    "pl": "Polish",
+    "ps": "Pashto",
+    "pt": "Portuguese",
+    "ro": "Romanian",
+    "ru": "Russian",
+    "si": "Sinhala",
+    "sk": "Slovak",
+    "sl": "Slovenian",
+    "sr": "Serbian",
+    "sv": "Swedish",
+    "ta": "Tamil",
+    "te": "Telugu",
+    "th": "Thai",
+    "tr": "Turkish",
+    "uk": "Ukrainian",
+    "vi": "Vietnamese",
+    "zh": "Chinese",
+}
+
+
+def _normalize_lang_code(code: str) -> str:
+    return str(code).strip().replace("_", "-").lower()
+
+
+def _canonical_lang_code(code: str, alias: dict[str, str]) -> str:
+    return alias.get(_normalize_lang_code(code), _normalize_lang_code(code))
+
+
+def _default_language_name(code: str) -> str:
+    normalized = _normalize_lang_code(code)
+    if normalized in _DEFAULT_LANGUAGE_NAMES:
+        return _DEFAULT_LANGUAGE_NAMES[normalized]
+    base = normalized.split("-", 1)[0]
+    if base in _DEFAULT_LANGUAGE_NAMES:
+        return _DEFAULT_LANGUAGE_NAMES[base]
+    return normalized
+
+
 def _coerce_dataclass(cls: type[Any], data: dict[str, Any]) -> Any:
     kwargs: dict[str, Any] = {}
     for field_info in cls.__dataclass_fields__.values():  # type: ignore[attr-defined]
@@ -217,9 +292,42 @@ def load_config(path: str | Path) -> PipelineConfig:
     lang_alias = {
         "eng": "en",
         "kor": "ko",
+        "zho": "zh",
+        "jpn": "ja",
+        "vie": "vi",
     }
-    cfg.data.src_lang = lang_alias.get(cfg.data.src_lang, cfg.data.src_lang)
-    cfg.data.tgt_lang = lang_alias.get(cfg.data.tgt_lang, cfg.data.tgt_lang)
+    cfg.data.src_lang = _canonical_lang_code(cfg.data.src_lang, lang_alias)
+
+    raw_targets = list(cfg.data.tgt_langs) if cfg.data.tgt_langs else [cfg.data.tgt_lang]
+    normalized_targets: list[str] = []
+    for raw in raw_targets:
+        code = _canonical_lang_code(raw, lang_alias)
+        if not code:
+            continue
+        if code not in normalized_targets:
+            normalized_targets.append(code)
+    if not normalized_targets:
+        raise ValueError("Configure at least one target language via data.tgt_lang or data.tgt_langs.")
+
+    cfg.data.tgt_langs = normalized_targets
+    cfg.data.tgt_lang = normalized_targets[0]
+
+    normalized_target_names: dict[str, str] = {}
+    for raw_code, raw_name in cfg.data.tgt_lang_names.items():
+        code = _canonical_lang_code(raw_code, lang_alias)
+        name = str(raw_name).strip()
+        if code and name:
+            normalized_target_names[code] = name
+
+    legacy_primary_name = str(cfg.data.tgt_lang_name).strip()
+    if legacy_primary_name and cfg.data.tgt_lang not in normalized_target_names:
+        normalized_target_names[cfg.data.tgt_lang] = legacy_primary_name
+
+    for code in cfg.data.tgt_langs:
+        normalized_target_names.setdefault(code, _default_language_name(code))
+
+    cfg.data.tgt_lang_names = normalized_target_names
+    cfg.data.tgt_lang_name = normalized_target_names[cfg.data.tgt_lang]
 
     # Resolve file paths relative to config file location.
     cfg.metricx.python_bin = _resolve_optional_path(cfg.metricx.python_bin, config_dir) or ""
