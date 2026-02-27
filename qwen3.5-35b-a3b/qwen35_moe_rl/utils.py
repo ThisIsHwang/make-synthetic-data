@@ -150,7 +150,7 @@ def is_main_process() -> bool:
     return get_rank() == 0
 
 
-def init_distributed(backend: str = "nccl") -> None:
+def init_distributed(backend: str = "nccl", timeout_minutes: int = 60) -> None:
     if torch is None:
         raise RuntimeError("torch is required for distributed training")
     if torch.distributed.is_initialized():
@@ -159,13 +159,18 @@ def init_distributed(backend: str = "nccl") -> None:
     local_rank = get_local_rank()
     if torch.cuda.is_available():
         torch.cuda.set_device(local_rank)
-    torch.distributed.init_process_group(backend=backend)
+    from datetime import timedelta
+    torch.distributed.init_process_group(
+        backend=backend,
+        timeout=timedelta(minutes=timeout_minutes),
+    )
     logger.info(
-        "Initialized distributed: rank=%s local_rank=%s world_size=%s backend=%s",
+        "Initialized distributed: rank=%s local_rank=%s world_size=%s backend=%s timeout=%sm",
         torch.distributed.get_rank(),
         local_rank,
         torch.distributed.get_world_size(),
         backend,
+        timeout_minutes,
     )
 
 

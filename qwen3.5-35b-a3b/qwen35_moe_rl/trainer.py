@@ -1120,7 +1120,10 @@ def _run_training_loop(
     best_eval_update: int | None = None
 
     # ---- Pre-training evaluation ----
-    if cfg.eval.run_before_train and eval_examples and is_main_process():
+    # All ranks must call evaluate_on_dataset so FSDP forward passes work
+    # (FSDP FULL_SHARD requires all ranks to participate in parameter all-gather).
+    # Scorers are None on non-rank-0 → only rank 0 actually scores.
+    if cfg.eval.run_before_train and eval_examples:
         report = evaluate_on_dataset(
             examples=eval_examples,
             policy_model=policy_model,
@@ -1129,24 +1132,33 @@ def _run_training_loop(
             device=device,
             metricx_scorer=metricx_scorer,
             xcomet_scorer=xcomet_scorer,
-            collect_outputs=cfg.logging.save_eval_outputs,
+            collect_outputs=cfg.logging.save_eval_outputs if rank0 else False,
         )
-        eval_select_score = _compute_eval_selection_score(report, cfg)
-        report["model_select_score"] = eval_select_score
-        eval_rows = report.pop("eval_rows", [])
-        _append_jsonl(log_path, {"type": "eval", "update": 0, **report})
-        if cfg.logging.save_eval_outputs:
-            _append_eval_output_jsonl(eval_output_path, update_idx=0, eval_rows=eval_rows)
-        if math.isfinite(eval_select_score) and eval_select_score > best_eval_score:
+        _should_save_best = False
+        if rank0:
+            eval_select_score = _compute_eval_selection_score(report, cfg)
+            report["model_select_score"] = eval_select_score
+            eval_rows = report.pop("eval_rows", [])
+            _append_jsonl(log_path, {"type": "eval", "update": 0, **report})
+            if cfg.logging.save_eval_outputs:
+                _append_eval_output_jsonl(eval_output_path, update_idx=0, eval_rows=eval_rows)
+            if math.isfinite(eval_select_score) and eval_select_score > best_eval_score:
+                best_eval_score = eval_select_score
+                best_eval_update = 0
+                logger.info("new best eval at update=%s score=%.6f", 0, eval_select_score)
+                _should_save_best = True
+        # Broadcast save decision so all ranks can participate in _save_model_only_distributed
+        if use_distributed:
+            _flags: list[Any] = [_should_save_best]
+            torch.distributed.broadcast_object_list(_flags, src=0)
+            _should_save_best = _flags[0]
+        if _should_save_best:
             if use_distributed:
                 _save_model_only_distributed(best_dir, policy_model, tokenizer, dist_ctx)
             else:
                 _save_model_only(best_dir, policy_model, tokenizer)
-            best_eval_score = eval_select_score
-            best_eval_update = 0
-            logger.info("new best eval at update=%s score=%.6f", 0, eval_select_score)
-    if use_distributed:
-        barrier()
+        elif use_distributed:
+            barrier()
 
     metricx_cache: dict[tuple[str, str, str], float] = {}
     xcomet_cache: dict[tuple[str, str, str], tuple[float, list[dict[str, Any]]]] = {}
@@ -1341,6 +1353,7 @@ def _run_training_loop(
             artifacts["checkpoints"].append(str(ckpt))
 
         # ---- Periodic evaluation ----
+        # All ranks must participate in generation for FSDP forward passes.
         if (
             cfg.eval.eval_every_n_updates > 0
             and eval_examples
@@ -1350,17 +1363,18 @@ def _run_training_loop(
             if dist_ctx is not None and dist_ctx.deepspeed_engine is not None:
                 eval_model = dist_ctx.deepspeed_engine.module
 
-            if is_main_process():
-                report = evaluate_on_dataset(
-                    examples=eval_examples,
-                    policy_model=eval_model,
-                    tokenizer=tokenizer,
-                    cfg=cfg,
-                    device=device,
-                    metricx_scorer=metricx_scorer,
-                    xcomet_scorer=xcomet_scorer,
-                    collect_outputs=cfg.logging.save_eval_outputs,
-                )
+            report = evaluate_on_dataset(
+                examples=eval_examples,
+                policy_model=eval_model,
+                tokenizer=tokenizer,
+                cfg=cfg,
+                device=device,
+                metricx_scorer=metricx_scorer,
+                xcomet_scorer=xcomet_scorer,
+                collect_outputs=cfg.logging.save_eval_outputs if rank0 else False,
+            )
+            _should_save_best = False
+            if rank0:
                 eval_select_score = _compute_eval_selection_score(report, cfg)
                 report["model_select_score"] = eval_select_score
                 eval_rows = report.pop("eval_rows", [])
@@ -1368,14 +1382,20 @@ def _run_training_loop(
                 if cfg.logging.save_eval_outputs:
                     _append_eval_output_jsonl(eval_output_path, update_idx=update_idx, eval_rows=eval_rows)
                 if math.isfinite(eval_select_score) and eval_select_score > best_eval_score:
-                    if use_distributed:
-                        _save_model_only_distributed(best_dir, policy_model, tokenizer, dist_ctx)
-                    else:
-                        _save_model_only(best_dir, policy_model, tokenizer)
                     best_eval_score = eval_select_score
                     best_eval_update = update_idx
                     logger.info("new best eval at update=%s score=%.6f", update_idx, eval_select_score)
+                    _should_save_best = True
             if use_distributed:
+                _flags = [_should_save_best]
+                torch.distributed.broadcast_object_list(_flags, src=0)
+                _should_save_best = _flags[0]
+            if _should_save_best:
+                if use_distributed:
+                    _save_model_only_distributed(best_dir, policy_model, tokenizer, dist_ctx)
+                else:
+                    _save_model_only(best_dir, policy_model, tokenizer)
+            elif use_distributed:
                 barrier()
 
         # Early-stop guard for divergence.

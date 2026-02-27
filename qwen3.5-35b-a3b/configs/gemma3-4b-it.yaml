@@ -75,6 +75,7 @@ reward:
 
   metricx:
     enabled: true
+    python_bin: ../../.venv-metrics/bin/python
     model_name: google/metricx-24-hybrid-xxl-v2p6
     tokenizer_name: google/mt5-xl
     use_reference: false
@@ -119,7 +120,7 @@ eval:
   run_before_train: true
 
 logging:
-  output_dir: ../outputs/grpo-wmt24pp-enko-gemma3-4b-it-8gpu
+  output_dir: ../../outputs/grpo-wmt24pp-enko-gemma3-4b-it-8gpu
   jsonl_name: train_log.jsonl
   rollout_jsonl_name: train_rollouts.jsonl
   save_rollouts: true
@@ -131,7 +132,7 @@ misc:
   seed: 42
   device: cuda
   dtype: bfloat16
-  huggingface_cache_dir: ../../../.cache/huggingface
+  huggingface_cache_dir: ../../../../huggingface
   huggingface_token: null
   huggingface_token_env: HF_TOKEN
 
