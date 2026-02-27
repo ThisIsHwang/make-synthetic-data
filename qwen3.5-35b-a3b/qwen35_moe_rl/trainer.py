@@ -1094,8 +1094,10 @@ def _run_training_loop(
     eval_limit = cfg.eval.eval_limit if cfg.eval.eval_limit is not None else cfg.data.eval_limit
     eval_examples = load_examples(cfg.data, split="eval", limit=eval_limit)
 
-    metricx_scorer = MetricXQEScorer(cfg.reward.metricx) if cfg.reward.metricx.enabled else None
-    xcomet_scorer = XCometXLScorer(cfg.reward.xcomet) if cfg.reward.xcomet.enabled else None
+    # Scorers load heavyweight models on dedicated GPUs — only rank 0 creates them.
+    rank0 = is_main_process()
+    metricx_scorer = MetricXQEScorer(cfg.reward.metricx) if cfg.reward.metricx.enabled and rank0 else None
+    xcomet_scorer = XCometXLScorer(cfg.reward.xcomet) if cfg.reward.xcomet.enabled and rank0 else None
 
     log_path = output_dir / cfg.logging.jsonl_name
     rollout_log_path = output_dir / cfg.logging.rollout_jsonl_name
@@ -1202,18 +1204,63 @@ def _run_training_loop(
             ref_device=ref_device,
             prompt_template=cfg.prompt.template,
         )
+
+        # ---- Gather→Score→Scatter for reward computation ----
+        # Each rank generates rollouts in parallel, but scorers (MetricX/xCOMET)
+        # live only on rank 0's dedicated GPUs.  Gather all rollouts to rank 0,
+        # compute rewards & advantages there, then broadcast results back.
+        if use_distributed:
+            all_rollouts_per_rank: list[Any] = [None] * get_world_size()
+            torch.distributed.all_gather_object(all_rollouts_per_rank, rollouts)
+            if rank0:
+                merged_rollouts: list[Rollout] = []
+                for rank_rollouts in all_rollouts_per_rank:
+                    if rank_rollouts:
+                        merged_rollouts.extend(rank_rollouts)
+                if merged_rollouts:
+                    merged_adv, reward_stats, adv_stats = _prepare_rewards_and_advantages(
+                        rollouts=merged_rollouts,
+                        cfg=cfg,
+                        metricx_scorer=metricx_scorer,
+                        xcomet_scorer=xcomet_scorer,
+                        metricx_cache=metricx_cache,
+                        xcomet_cache=xcomet_cache,
+                    )
+                else:
+                    merged_adv, reward_stats, adv_stats = [], {}, {}
+                # Split advantages back by rank (same order as all_gather_object)
+                adv_splits: list[Any] = []
+                cursor = 0
+                for rank_rollouts in all_rollouts_per_rank:
+                    n = len(rank_rollouts) if rank_rollouts else 0
+                    adv_splits.append(merged_adv[cursor:cursor + n])
+                    cursor += n
+                broadcast_payload: list[Any] = [adv_splits, reward_stats, adv_stats]
+            else:
+                broadcast_payload = [None, None, None]
+            torch.distributed.broadcast_object_list(broadcast_payload, src=0)
+            my_rank = get_rank()
+            advantages = broadcast_payload[0][my_rank] if broadcast_payload[0] else []
+            reward_stats = broadcast_payload[1] or {}
+            adv_stats = broadcast_payload[2] or {}
+        else:
+            if not rollouts:
+                logger.warning("No rollouts generated at update=%s; skipping step.", update_idx)
+                continue
+            advantages, reward_stats, adv_stats = _prepare_rewards_and_advantages(
+                rollouts=rollouts,
+                cfg=cfg,
+                metricx_scorer=metricx_scorer,
+                xcomet_scorer=xcomet_scorer,
+                metricx_cache=metricx_cache,
+                xcomet_cache=xcomet_cache,
+            )
+
         if not rollouts:
             logger.warning("No rollouts generated at update=%s; skipping step.", update_idx)
+            if use_distributed:
+                barrier()
             continue
-
-        advantages, reward_stats, adv_stats = _prepare_rewards_and_advantages(
-            rollouts=rollouts,
-            cfg=cfg,
-            metricx_scorer=metricx_scorer,
-            xcomet_scorer=xcomet_scorer,
-            metricx_cache=metricx_cache,
-            xcomet_cache=xcomet_cache,
-        )
 
         step_stats = []
         for _ in range(max(1, cfg.rl.ppo_epochs)):
