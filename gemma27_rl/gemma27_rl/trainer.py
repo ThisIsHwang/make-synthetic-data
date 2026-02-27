@@ -488,11 +488,28 @@ def _assign_disjoint_gpu_devices(cfg: RLPostTrainConfig) -> None:
     explicit_reference_ids = _normalize_gpu_id_list(cfg.model.reference_gpu_ids)
 
     if explicit_policy_ids or explicit_reference_ids:
-        for idx in explicit_policy_ids + explicit_reference_ids:
-            if idx >= device_count:
-                raise ValueError(
-                    f"Configured GPU index out of range: {idx} (cuda_count={device_count})"
-                )
+        # In DeepSpeed launcher mode, CUDA_VISIBLE_DEVICES may expose only policy GPUs
+        # while reference/reward workers are pinned with absolute physical GPU ids.
+        # In that case, skip local visible-range checks here and let strict mapping
+        # validation enforce policy rank placement.
+        visible_ids = _parse_cuda_visible_devices_env()
+        skip_local_range_check = bool(
+            cfg.rl.backend == "deepspeed"
+            and visible_ids is not None
+            and len(visible_ids) < max(explicit_policy_ids + explicit_reference_ids + [0]) + 1
+        )
+        if not skip_local_range_check:
+            for idx in explicit_policy_ids + explicit_reference_ids:
+                if idx >= device_count:
+                    raise ValueError(
+                        f"Configured GPU index out of range: {idx} (cuda_count={device_count})"
+                    )
+        else:
+            logger.info(
+                "DeepSpeed explicit partition detected with restricted CUDA_VISIBLE_DEVICES=%s; "
+                "treating policy/reference/reward GPU ids as physical indices.",
+                os.environ.get("CUDA_VISIBLE_DEVICES"),
+            )
 
         used: set[int] = set(explicit_policy_ids) | set(explicit_reference_ids)
 
@@ -507,23 +524,26 @@ def _assign_disjoint_gpu_devices(cfg: RLPostTrainConfig) -> None:
             cfg.model.reference_device = f"cuda:{explicit_reference_ids[0]}"
         cfg.model.reference_gpu_ids = explicit_reference_ids
 
-        if cfg.reward.metricx.enabled and _is_cuda_text(cfg.reward.metricx.device):
-            metricx_idx = _pick_free_gpu(
-                preferred=_parse_cuda_index(cfg.reward.metricx.device),
-                used=used,
-                device_count=device_count,
-            )
-            used.add(metricx_idx)
-            cfg.reward.metricx.device = f"cuda:{metricx_idx}"
+        # For explicit DeepSpeed partition, keep reward device ids exactly as configured
+        # (physical GPU indices) and do not remap against local visible GPUs.
+        if cfg.rl.backend != "deepspeed":
+            if cfg.reward.metricx.enabled and _is_cuda_text(cfg.reward.metricx.device):
+                metricx_idx = _pick_free_gpu(
+                    preferred=_parse_cuda_index(cfg.reward.metricx.device),
+                    used=used,
+                    device_count=device_count,
+                )
+                used.add(metricx_idx)
+                cfg.reward.metricx.device = f"cuda:{metricx_idx}"
 
-        if cfg.reward.xcomet.enabled and _is_cuda_text(cfg.reward.xcomet.device):
-            xcomet_idx = _pick_free_gpu(
-                preferred=_parse_cuda_index(cfg.reward.xcomet.device),
-                used=used,
-                device_count=device_count,
-            )
-            used.add(xcomet_idx)
-            cfg.reward.xcomet.device = f"cuda:{xcomet_idx}"
+            if cfg.reward.xcomet.enabled and _is_cuda_text(cfg.reward.xcomet.device):
+                xcomet_idx = _pick_free_gpu(
+                    preferred=_parse_cuda_index(cfg.reward.xcomet.device),
+                    used=used,
+                    device_count=device_count,
+                )
+                used.add(xcomet_idx)
+                cfg.reward.xcomet.device = f"cuda:{xcomet_idx}"
 
         logger.info(
             "Applied explicit GPU partition: policy_gpu_ids=%s reference_gpu_ids=%s metricx=%s xcomet=%s",
