@@ -25,21 +25,35 @@ if [[ ! -x "${PY}" ]]; then
   echo "        Set VENV_BIN to your training venv bin directory."
   exit 1
 fi
-if [[ ! -x "${PIP}" ]]; then
-  echo "[error] pip not found at ${PIP}"
-  exit 1
+
+declare -a PIP_CMD
+if [[ -x "${PIP}" ]]; then
+  PIP_CMD=("${PIP}")
+else
+  PIP_CMD=("${PY}" -m pip)
+fi
+
+if ! "${PIP_CMD[@]}" --version >/dev/null 2>&1; then
+  echo "[warn] pip entrypoint not ready in this venv. trying ensurepip..."
+  if "${PY}" -m ensurepip --upgrade >/dev/null 2>&1; then
+    :
+  else
+    echo "[error] pip is unavailable and ensurepip failed."
+    echo "        Try: uv pip install --python ${PY} pip"
+    exit 1
+  fi
 fi
 
 echo "[info] ROOT_DIR=${ROOT_DIR}"
 echo "[info] VENV_BIN=${VENV_BIN}"
 echo "[info] python=${PY}"
-echo "[info] pip=${PIP}"
+echo "[info] pip=${PIP_CMD[*]}"
 echo "[info] deepspeed=${DS}"
 echo
 
 echo "[step] binary versions"
 "${PY}" -V
-"${PIP}" -V
+"${PIP_CMD[@]}" --version
 if [[ -x "${DS}" ]]; then
   "${DS}" --version || true
 else
@@ -70,12 +84,12 @@ rm -rf "${HOME}/.cache/torch_extensions"
 echo
 
 echo "[step] uninstall old flash-attn artifacts (if any)"
-"${PIP}" uninstall -y flash-attn flash_attn || true
+"${PIP_CMD[@]}" uninstall -y flash-attn flash_attn || true
 echo
 
 echo "[step] reinstall flash-attn for current torch ABI"
-"${PIP}" install --upgrade pip setuptools wheel packaging ninja
-"${PIP}" install --no-cache-dir --no-build-isolation "flash-attn==2.7.4.post1"
+"${PIP_CMD[@]}" install --upgrade pip setuptools wheel packaging ninja
+"${PIP_CMD[@]}" install --no-cache-dir --no-build-isolation "flash-attn==2.7.4.post1"
 echo
 
 echo "[step] after-state import probe"
