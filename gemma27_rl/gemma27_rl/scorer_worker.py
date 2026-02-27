@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 import sys
 import traceback
@@ -42,6 +43,21 @@ def _to_samples(rows: list[dict[str, Any]]) -> list[SampleForScoring]:
     return out
 
 
+def _runtime_info() -> dict[str, Any]:
+    return {
+        "executable": sys.executable,
+        "version": sys.version.split()[0],
+        "prefix": sys.prefix,
+        "base_prefix": getattr(sys, "base_prefix", None),
+        "cwd": os.getcwd(),
+        "env": {
+            "VIRTUAL_ENV": os.environ.get("VIRTUAL_ENV"),
+            "PYTHONHOME": os.environ.get("PYTHONHOME"),
+            "PYTHONPATH": os.environ.get("PYTHONPATH"),
+        },
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="External scorer worker")
     parser.add_argument("--backend", required=True, choices=["metricx", "xcomet"])
@@ -76,7 +92,7 @@ def main(argv: list[str] | None = None) -> int:
                     cfg_payload["python_executable"] = None
                     cfg = XCometConfig(**cfg_payload)
                     scorer = XCometXLScorer(cfg=cfg)
-                _reply({"ok": True})
+                _reply({"ok": True, "runtime": _runtime_info()})
                 continue
 
             if scorer is None:
@@ -108,6 +124,7 @@ def main(argv: list[str] | None = None) -> int:
                     "ok": False,
                     "error": f"{type(exc).__name__}: {exc}",
                     "traceback": traceback.format_exc(limit=4),
+                    "runtime": _runtime_info(),
                 }
             )
 
@@ -116,4 +133,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

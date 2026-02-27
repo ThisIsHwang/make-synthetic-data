@@ -56,6 +56,8 @@ class _ScorerSubprocessClient:
         worker_env = dict(os.environ)
         for key in ("LOCAL_RANK", "RANK", "WORLD_SIZE", "MASTER_ADDR", "MASTER_PORT"):
             worker_env.pop(key, None)
+        # PYTHONHOME can break venv resolution and make installed packages invisible.
+        worker_env.pop("PYTHONHOME", None)
         if env_overrides:
             for key, value in env_overrides.items():
                 worker_env[str(key)] = str(value)
@@ -82,9 +84,11 @@ class _ScorerSubprocessClient:
             self.close()
             err = init_resp.get("error", "unknown error")
             worker_tb = init_resp.get("traceback")
+            worker_runtime = init_resp.get("runtime")
             tb_text = f"\nworker_traceback:\n{worker_tb}" if worker_tb else ""
+            runtime_text = f"\nworker_runtime:\n{worker_runtime}" if worker_runtime else ""
             raise RuntimeError(
-                f"{backend} scorer worker init failed: {err}{tb_text}"
+                f"{backend} scorer worker init failed: {err}{tb_text}{runtime_text}"
             )
 
     def _assert_alive(self) -> None:
@@ -766,8 +770,10 @@ class MetricXQEScorer:
             if not bool(resp.get("ok", False)):
                 err = resp.get("error", "unknown error")
                 worker_tb = resp.get("traceback")
+                worker_runtime = resp.get("runtime")
                 tb_text = f"\nworker_traceback:\n{worker_tb}" if worker_tb else ""
-                raise RuntimeError(f"MetricX worker scoring failed: {err}{tb_text}")
+                runtime_text = f"\nworker_runtime:\n{worker_runtime}" if worker_runtime else ""
+                raise RuntimeError(f"MetricX worker scoring failed: {err}{tb_text}{runtime_text}")
             scores = [float(v) for v in list(resp.get("scores", []))]
             if len(scores) != len(samples):
                 raise RuntimeError(
@@ -961,8 +967,10 @@ class XCometXLScorer:
             if not bool(resp.get("ok", False)):
                 err = resp.get("error", "unknown error")
                 worker_tb = resp.get("traceback")
+                worker_runtime = resp.get("runtime")
                 tb_text = f"\nworker_traceback:\n{worker_tb}" if worker_tb else ""
-                raise RuntimeError(f"xCOMET worker scoring failed: {err}{tb_text}")
+                runtime_text = f"\nworker_runtime:\n{worker_runtime}" if worker_runtime else ""
+                raise RuntimeError(f"xCOMET worker scoring failed: {err}{tb_text}{runtime_text}")
             scores = [float(v) for v in list(resp.get("scores", []))]
             spans = resp.get("error_spans", [[] for _ in scores])
             if len(scores) != len(samples):
