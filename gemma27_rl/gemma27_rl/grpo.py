@@ -57,7 +57,7 @@ def update_policy(
     rollouts: list[Rollout],
     advantages: list[list[float]],
     policy_model: nn.Module,
-    optimizer: torch.optim.Optimizer,
+    optimizer: torch.optim.Optimizer | None,
     rl_cfg: RLConfig,
     device: str,
 ) -> TrainStats:
@@ -67,7 +67,26 @@ def update_policy(
         raise ValueError("rollouts are empty")
 
     policy_model.train()
-    optimizer.zero_grad(set_to_none=True)
+
+    # DeepSpeed engines expose backward/step on the model object.
+    use_engine_step = bool(
+        optimizer is None
+        and callable(getattr(policy_model, "backward", None))
+        and callable(getattr(policy_model, "step", None))
+    )
+    if optimizer is None and not use_engine_step:
+        raise ValueError("optimizer is required unless policy_model is a DeepSpeed-like engine.")
+
+    if use_engine_step:
+        zero_grad_fn = getattr(policy_model, "zero_grad", None)
+        if callable(zero_grad_fn):
+            try:
+                zero_grad_fn(set_to_none=True)
+            except TypeError:
+                zero_grad_fn()
+    else:
+        assert optimizer is not None  # for static type checkers
+        optimizer.zero_grad(set_to_none=True)
 
     total_tokens = 0
     total_loss_value = 0.0
@@ -133,21 +152,32 @@ def update_policy(
         total_approx_kl += float(approx_kl.detach().sum().item())
 
         micro_loss = per_token_loss.mean() / max(1, rl_cfg.grad_accum)
-        micro_loss.backward()
+        if use_engine_step:
+            policy_model.backward(micro_loss)  # type: ignore[attr-defined]
+        else:
+            micro_loss.backward()
         pending_backward += 1
         if pending_backward % max(1, rl_cfg.grad_accum) == 0:
-            if rl_cfg.max_grad_norm > 0:
+            if (not use_engine_step) and rl_cfg.max_grad_norm > 0:
                 torch.nn.utils.clip_grad_norm_(policy_model.parameters(), rl_cfg.max_grad_norm)
-            optimizer.step()
-            optimizer.zero_grad(set_to_none=True)
+            if use_engine_step:
+                policy_model.step()  # type: ignore[attr-defined]
+            else:
+                assert optimizer is not None
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
 
     if total_tokens == 0:
         raise RuntimeError("No valid tokens found for update.")
     if pending_backward % max(1, rl_cfg.grad_accum) != 0:
-        if rl_cfg.max_grad_norm > 0:
+        if (not use_engine_step) and rl_cfg.max_grad_norm > 0:
             torch.nn.utils.clip_grad_norm_(policy_model.parameters(), rl_cfg.max_grad_norm)
-        optimizer.step()
-        optimizer.zero_grad(set_to_none=True)
+        if use_engine_step:
+            policy_model.step()  # type: ignore[attr-defined]
+        else:
+            assert optimizer is not None
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
 
     mean_loss = float(total_loss_value / total_tokens)
     if not math.isfinite(mean_loss):

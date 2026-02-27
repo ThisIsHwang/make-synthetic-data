@@ -1,11 +1,13 @@
 model:
-  policy_name_or_path: google/gemma-3-4b-it
-  reference_name_or_path: google/gemma-3-4b-it
+  policy_name_or_path: Qwen/Qwen3.5-27B-Instruct
+  reference_name_or_path: Qwen/Qwen3.5-27B-Instruct
   tokenizer_name_or_path: null
-  trust_remote_code: false
+  trust_remote_code: true
   attn_implementation: flash_attention_2
   use_fast_tokenizer: true
-  reference_device: cuda:3
+  reference_device: cpu
+  policy_gpu_ids: [0, 1, 2]
+  reference_gpu_ids: []
 
 data:
   train_file: null
@@ -20,7 +22,7 @@ data:
   train_split: null
   eval_split: null
   limit: null
-  eval_limit: 32
+  eval_limit: 64
   eval_sampling_count: null
   eval_sampling_ratio: null
   eval_sampling_seed: 42
@@ -57,6 +59,8 @@ reward:
   w_metricx: 1.0
   w_xcomet_seq: 0.0
   xcomet_seq_scale: 1.0
+  w_mqm_seq: 0.2
+  mqm_seq_scale: 1.0
   severity_weights:
     MINOR: -1.0
     MAJOR: -5.0
@@ -73,49 +77,82 @@ reward:
     tokenizer_name: google/mt5-xl
     use_reference: false
     batch_size: 1
-    device: cuda:1
+    device: cuda:3
     dtype: float16
     max_input_length: 2048
     overflow_policy: truncate
     offset: 5.0
+    python_executable: ../../.venv_metricx/bin/python
+    subprocess_timeout_sec: 1800.0
 
   xcomet:
-    enabled: true
+    enabled: false
     model_name: Unbabel/XCOMET-XL
     batch_size: 1
     device: cuda:2
     use_reference: false
+    python_executable: ../../.venv_xcomet/bin/python
+    subprocess_timeout_sec: 1800.0
+
+  mqm:
+    enabled: true
+    base_url: http://localhost:8000/v1
+    model_name: qwen3.5-397b-instruct
+    api_key: null
+    api_key_env: OPENAI_API_KEY
+    source_lang: English
+    target_lang: Korean
+    timeout_sec: 120.0
+    timeout_s: 120.0
+    max_retries: 3
+    batch_size: 1
+    use_reference: false
+    temperature: 0.0
+    top_p: 1.0
+    max_tokens: 1024
+    stop: []
+    chat_template_kwargs:
+      enable_thinking: false
+    score_min: -25.0
+    score_max: 0.0
+    scale_to_unit_interval: false
+    error_policy: raise
 
 rl:
+  backend: deepspeed
   algorithm: grpo
   lr: 1.0e-6
   weight_decay: 0.0
-  batch_size: 8
+  batch_size: 4
   grad_accum: 16
   clip_eps: 0.2
   kl_coef: 0.01
   entropy_coef: 0.0
   max_grad_norm: 1.0
   ppo_epochs: 1
-  updates: 720
+  updates: 400
   normalize_advantage: true
   group_normalize: true
   group_advantage_coef: 1.0
   eps: 1.0e-8
+  deepspeed_config_path: null
+  deepspeed_zero_stage: 2
+  deepspeed_offload_optimizer: false
+  deepspeed_offload_param: false
 
 eval:
   eval_every_n_updates: 5
-  eval_limit: 32
+  eval_limit: 64
   run_before_train: true
 
 logging:
-  output_dir: /media/sdd3/gemma27_rl_outputs/grpo-wmt24pp-enko-gemma3-4b-it-toy2-all
+  output_dir: /media/sdd3/gemma27_rl_outputs/grpo-wmt24pp-enko-qwen35-27b-mqm-dev4gpu
   jsonl_name: train_log.jsonl
   rollout_jsonl_name: train_rollouts.jsonl
   save_rollouts: true
   eval_output_jsonl_name: eval_outputs.jsonl
   save_eval_outputs: true
-  save_every_n_updates: 200
+  save_every_n_updates: 100
   save_only_best: true
   auto_resume: true
   resume_from_checkpoint: null

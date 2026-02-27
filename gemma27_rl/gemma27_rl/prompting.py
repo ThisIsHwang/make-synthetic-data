@@ -12,7 +12,6 @@ DEFAULT_TRANSLATION_PROMPT_TEMPLATE = (
     "{target_lang}:\\n\\n{text}"
 )
 
-
 def format_translation_prompt(example: Example, template: str = DEFAULT_TRANSLATION_PROMPT_TEMPLATE) -> str:
     src_code = (example.src_lang_code or example.src_lang or "").strip()
     tgt_code = (example.tgt_lang_code or example.tgt_lang or "").strip()

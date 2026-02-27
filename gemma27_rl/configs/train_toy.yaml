@@ -21,6 +21,10 @@ data:
   eval_split: null
   limit: 64
   eval_limit: 32
+  eval_sampling_count: null
+  eval_sampling_ratio: 0.1
+  eval_sampling_seed: 42
+  eval_sampling_min_samples: 1
 
   id_field: id
   src_text_field: source_text
@@ -112,6 +116,9 @@ logging:
   eval_output_jsonl_name: eval_outputs.jsonl
   save_eval_outputs: true
   save_every_n_updates: 10
+  save_only_best: false
+  auto_resume: true
+  resume_from_checkpoint: null
 
 misc:
   seed: 42

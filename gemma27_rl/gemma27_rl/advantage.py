@@ -11,11 +11,23 @@ def build_sequence_rewards(
     w_metricx: float,
     w_xcomet_seq: float,
     xcomet_seq_scale: float,
+    mqm_scores: list[float] | None = None,
+    w_mqm_seq: float = 0.0,
+    mqm_seq_scale: float = 1.0,
 ) -> list[float]:
+    if mqm_scores is None:
+        mqm_scores = [0.0 for _ in metricx_scores]
+
     out: list[float] = []
-    for mx, xc in zip(metricx_scores, xcomet_scores):
+    for idx, mx in enumerate(metricx_scores):
+        xc = xcomet_scores[idx] if idx < len(xcomet_scores) else 0.0
+        mq = mqm_scores[idx] if idx < len(mqm_scores) else 0.0
         metricx_reward = metricx_offset - mx
-        seq_reward = (w_metricx * metricx_reward) + (w_xcomet_seq * (xc * xcomet_seq_scale))
+        seq_reward = (
+            (w_metricx * metricx_reward)
+            + (w_xcomet_seq * (xc * xcomet_seq_scale))
+            + (w_mqm_seq * (mq * mqm_seq_scale))
+        )
         out.append(float(seq_reward))
     return out
 

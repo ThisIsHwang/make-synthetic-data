@@ -235,12 +235,18 @@ def generate_rollouts(
         if use_chat_template:
             try:
                 chats = [[{"role": "user", "content": prompt}] for prompt in prompt_texts]
+                chat_kwargs = (
+                    dict(gen_cfg.chat_template_kwargs)
+                    if getattr(gen_cfg, "chat_template_kwargs", None) is not None
+                    else {}
+                )
                 tokenized = tokenizer.apply_chat_template(
                     chats,
                     tokenize=True,
                     add_generation_prompt=True,
                     return_tensors="pt",
                     padding=True,
+                    **chat_kwargs,
                 )
             except Exception as exc:
                 logger.warning("Chat template encode failed; falling back to plain prompt encode: %s", exc)
@@ -256,19 +262,33 @@ def generate_rollouts(
     finally:
         tokenizer.padding_side = original_padding_side
 
-    if isinstance(tokenized, dict):
-        input_ids = tokenized["input_ids"].to(device)
+    # `tokenizer(...)` usually returns BatchEncoding (mapping-like), while
+    # `apply_chat_template(..., return_tensors="pt")` can return Tensor.
+    if hasattr(tokenized, "keys") and ("input_ids" in tokenized):
+        input_ids = tokenized["input_ids"]
         attention_mask = tokenized.get("attention_mask")
-        if attention_mask is None:
-            attention_mask = torch.ones_like(input_ids)
-        else:
-            attention_mask = attention_mask.to(device)
+    elif torch.is_tensor(tokenized):
+        input_ids = tokenized
+        attention_mask = None
     else:
-        input_ids = tokenized.to(device)
+        raise TypeError(
+            f"Unsupported tokenized output type: {type(tokenized)!r}. "
+            "Expected mapping with `input_ids` or torch.Tensor."
+        )
+
+    if not torch.is_tensor(input_ids):
+        input_ids = torch.as_tensor(input_ids, dtype=torch.long)
+    input_ids = input_ids.to(device)
+
+    if attention_mask is None:
         if pad_token_id is None:
             attention_mask = torch.ones_like(input_ids)
         else:
             attention_mask = (input_ids != int(pad_token_id)).long()
+    else:
+        if not torch.is_tensor(attention_mask):
+            attention_mask = torch.as_tensor(attention_mask, dtype=torch.long)
+        attention_mask = attention_mask.to(device)
 
     input_width = int(input_ids.shape[1])
     input_ids_cpu = input_ids.detach().cpu()

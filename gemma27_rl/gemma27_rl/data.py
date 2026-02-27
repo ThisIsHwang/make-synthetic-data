@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 from pathlib import Path
 from typing import Any
@@ -115,9 +116,90 @@ def _resolve_split(records: list[dict[str, Any]], split_field: str | None, split
     return [row for row in records if str(row.get(split_field, "")).strip() == split_name]
 
 
+def _build_split_key(row: dict[str, Any], id_field: str) -> str:
+    raw = row.get(id_field)
+    if raw is not None:
+        text = str(raw).strip()
+        if text:
+            return text
+    # Fallback for rows without stable IDs.
+    return json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _stable_split_hash(seed: int, key: str) -> int:
+    digest = hashlib.sha1(f"{seed}:{key}".encode("utf-8")).hexdigest()
+    return int(digest, 16)
+
+
+def _apply_eval_sampling_split(
+    records: list[dict[str, Any]],
+    split: str,
+    id_field: str,
+    eval_ratio: float | None,
+    eval_count: int | None,
+    seed: int,
+    min_eval_samples: int,
+) -> list[dict[str, Any]]:
+    if split not in {"train", "eval"}:
+        return records
+
+    total = len(records)
+    if total <= 1:
+        return records if split == "train" else []
+
+    if eval_count is not None:
+        eval_size = int(eval_count)
+    else:
+        # Ratio-based split fallback.
+        ratio = float(eval_ratio or 0.0)
+        eval_size = int(round(total * ratio))
+        eval_size = max(min_eval_samples, eval_size)
+    eval_size = min(eval_size, total - 1)
+    eval_size = max(1, eval_size)
+
+    scored: list[tuple[int, int]] = []
+    for idx, row in enumerate(records):
+        key = _build_split_key(row, id_field=id_field)
+        score = _stable_split_hash(seed=seed, key=key)
+        scored.append((idx, score))
+
+    scored.sort(key=lambda item: (item[1], item[0]))
+    eval_idx = {idx for idx, _score in scored[:eval_size]}
+
+    if split == "eval":
+        sampled = [row for idx, row in enumerate(records) if idx in eval_idx]
+    else:
+        sampled = [row for idx, row in enumerate(records) if idx not in eval_idx]
+
+    logger.info(
+        "Applied eval_sampling split=%s total=%s eval_size=%s train_size=%s seed=%s mode=%s ratio=%s count=%s",
+        split,
+        total,
+        eval_size,
+        total - eval_size,
+        seed,
+        "count" if eval_count is not None else "ratio",
+        eval_ratio,
+        eval_count,
+    )
+    return sampled
+
+
 def load_examples(cfg: DataConfig, split: str, limit: int | None = None) -> list[Example]:
     use_hf_dataset = bool(cfg.hf_dataset_name and str(cfg.hf_dataset_name).strip())
-    if use_hf_dataset:
+
+    # Allow file-based eval override even when train uses HF datasets.
+    file_override: str | None = None
+    if split == "train" and cfg.train_file:
+        file_override = cfg.train_file
+    if split == "eval" and cfg.eval_file:
+        file_override = cfg.eval_file
+
+    if file_override:
+        records = _load_records(file_override)
+        split_name = cfg.train_split if split == "train" else cfg.eval_split
+        records = _resolve_split(records, cfg.split_field, split_name)
+    elif use_hf_dataset:
         if split == "train":
             hf_split = cfg.hf_train_split
         else:
@@ -131,23 +213,40 @@ def load_examples(cfg: DataConfig, split: str, limit: int | None = None) -> list
             limit=limit,
         )
     else:
-        if split == "train":
-            data_file = cfg.train_file
-        else:
-            data_file = cfg.eval_file or cfg.train_file
+        data_file = cfg.train_file if split == "train" else (cfg.eval_file or cfg.train_file)
         if not data_file:
             raise ValueError(f"No data file configured for split={split}")
         records = _load_records(data_file)
         split_name = cfg.train_split if split == "train" else cfg.eval_split
         records = _resolve_split(records, cfg.split_field, split_name)
 
+    if (
+        not use_hf_dataset
+        and cfg.eval_file is None
+        and (cfg.eval_sampling_count is not None or cfg.eval_sampling_ratio is not None)
+        and not (cfg.split_field and (cfg.train_split or cfg.eval_split))
+    ):
+        records = _apply_eval_sampling_split(
+            records=records,
+            split=split,
+            id_field=cfg.id_field,
+            eval_ratio=float(cfg.eval_sampling_ratio) if cfg.eval_sampling_ratio is not None else None,
+            eval_count=int(cfg.eval_sampling_count) if cfg.eval_sampling_count is not None else None,
+            seed=int(cfg.eval_sampling_seed),
+            min_eval_samples=int(cfg.eval_sampling_min_samples),
+        )
+
     examples: list[Example] = []
+    skipped_bad_source = 0
+    skipped_empty_source = 0
     for idx, row in enumerate(records):
         if cfg.skip_bad_source and bool(row.get(cfg.is_bad_source_field, False)):
+            skipped_bad_source += 1
             continue
 
         src = _pick_text(row, cfg.src_text_field)
         if not src:
+            skipped_empty_source += 1
             continue
 
         src_lang = _pick_text(row, cfg.src_lang_field, cfg.default_src_lang) or cfg.default_src_lang
@@ -171,5 +270,12 @@ def load_examples(cfg: DataConfig, split: str, limit: int | None = None) -> list
         if limit is not None and len(examples) >= limit:
             break
 
-    logger.info("Loaded %s examples for split=%s", len(examples), split)
+    logger.info(
+        "Loaded %s examples for split=%s (records=%s skipped_bad_source=%s skipped_empty_source=%s)",
+        len(examples),
+        split,
+        len(records),
+        skipped_bad_source,
+        skipped_empty_source,
+    )
     return examples

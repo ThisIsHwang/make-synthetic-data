@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import inspect
 from typing import Optional, Tuple, Union
 import warnings
 
@@ -39,13 +40,13 @@ class MT5ForRegression(MT5PreTrainedModel):
         encoder_config.is_decoder = False
         encoder_config.use_cache = False
         encoder_config.is_encoder_decoder = False
-        self.encoder = MT5Stack(encoder_config, self.shared)
+        self.encoder = self._build_mt5_stack(encoder_config, self.shared)
 
         decoder_config = copy.deepcopy(config)
         decoder_config.is_decoder = True
         decoder_config.is_encoder_decoder = False
         decoder_config.num_layers = config.num_decoder_layers
-        self.decoder = MT5Stack(decoder_config, self.shared)
+        self.decoder = self._build_mt5_stack(decoder_config, self.shared)
 
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
 
@@ -53,6 +54,33 @@ class MT5ForRegression(MT5PreTrainedModel):
 
         self.model_parallel = False
         self.device_map = None
+
+    @staticmethod
+    def _build_mt5_stack(config: MT5Config, shared: nn.Embedding) -> MT5Stack:
+        """Build MT5Stack across transformers API variants.
+
+        Some versions accept (config, embed_tokens), while others accept only
+        (config) and require embeddings to be set separately.
+        """
+        try:
+            params = inspect.signature(MT5Stack.__init__).parameters
+            if "embed_tokens" in params:
+                return MT5Stack(config, shared)
+        except Exception:
+            # Fallback to runtime probing below.
+            pass
+
+        try:
+            stack = MT5Stack(config)
+        except TypeError:
+            # Older-style signature fallback.
+            return MT5Stack(config, shared)
+
+        if hasattr(stack, "set_input_embeddings"):
+            stack.set_input_embeddings(shared)
+        elif hasattr(stack, "embed_tokens"):
+            stack.embed_tokens = shared
+        return stack
 
     def forward(
         self,

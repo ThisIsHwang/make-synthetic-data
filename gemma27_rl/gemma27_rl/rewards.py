@@ -1,11 +1,18 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 import logging
 import math
 import os
 from pathlib import Path
+import re
+import select
+import subprocess
+from textwrap import dedent
 from typing import Any, Callable
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 
 try:
     import torch
@@ -17,12 +24,396 @@ try:
 except Exception:  # pragma: no cover - optional during lightweight tests
     AutoTokenizer = None  # type: ignore[assignment]
 
-from .config import MetricXConfig, XCometConfig
+from .config import MQMConfig, MetricXConfig, XCometConfig
 from .types import RewardOutput, SampleForScoring
 from .utils import resolve_device, resolve_torch_dtype
 
 
 logger = logging.getLogger(__name__)
+
+
+class _ScorerSubprocessClient:
+    def __init__(
+        self,
+        *,
+        backend: str,
+        python_executable: str,
+        timeout_sec: float,
+        config_payload: dict[str, Any],
+    ) -> None:
+        self._backend = backend
+        self._timeout_sec = float(timeout_sec)
+        worker_script = Path(__file__).resolve().with_name("scorer_worker.py")
+        if not worker_script.exists():
+            raise FileNotFoundError(f"scorer worker script not found: {worker_script}")
+
+        cmd = [python_executable, str(worker_script), "--backend", backend]
+        try:
+            self._proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=None,
+                text=True,
+                bufsize=1,
+            )
+        except Exception as exc:
+            raise RuntimeError(f"Failed to start {backend} scorer worker: cmd={cmd}") from exc
+
+        try:
+            init_resp = self.request({"type": "init", "config": config_payload})
+        except Exception:
+            self.close()
+            raise
+        if not bool(init_resp.get("ok", False)):
+            self.close()
+            raise RuntimeError(
+                f"{backend} scorer worker init failed: {init_resp.get('error', 'unknown error')}"
+            )
+
+    def _assert_alive(self) -> None:
+        if self._proc.poll() is not None:
+            raise RuntimeError(f"{self._backend} scorer worker exited unexpectedly with code={self._proc.returncode}")
+
+    def request(self, payload: dict[str, Any]) -> dict[str, Any]:
+        self._assert_alive()
+        assert self._proc.stdin is not None
+        assert self._proc.stdout is not None
+
+        try:
+            self._proc.stdin.write(json.dumps(payload, ensure_ascii=False) + "\n")
+            self._proc.stdin.flush()
+        except Exception as exc:
+            raise RuntimeError(f"Failed to send request to {self._backend} scorer worker.") from exc
+
+        ready, _, _ = select.select([self._proc.stdout], [], [], self._timeout_sec)
+        if not ready:
+            raise TimeoutError(f"{self._backend} scorer worker timed out after {self._timeout_sec}s")
+        try:
+            line = self._proc.stdout.readline()
+        except Exception as exc:
+            raise RuntimeError(f"Failed to read response from {self._backend} scorer worker.") from exc
+
+        if not line:
+            self._assert_alive()
+            raise RuntimeError(f"{self._backend} scorer worker returned empty response.")
+
+        try:
+            resp = json.loads(line)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Invalid JSON response from {self._backend} scorer worker: {line[:200]!r}"
+            ) from exc
+
+        if not isinstance(resp, dict):
+            raise RuntimeError(f"Unexpected response type from {self._backend} scorer worker: {type(resp)!r}")
+        return resp
+
+    def close(self) -> None:
+        if getattr(self, "_proc", None) is None:
+            return
+        proc = self._proc
+        if proc.poll() is None:
+            try:
+                self.request({"type": "close"})
+            except Exception:
+                pass
+            try:
+                proc.terminate()
+                proc.wait(timeout=2)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        self._proc = None  # type: ignore[assignment]
+
+    def __del__(self) -> None:  # pragma: no cover - best effort cleanup
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+# NOTE: GEMBA-MQM prompts and few-shots below are copied from:
+# /home/seungyoonee/initial_translation/evalmt/metrics/gemba_mqm_metric.py
+GEMBA_SYSTEM_PROMPT = (
+    "You are an annotator for the quality of machine translation. "
+    "Your task is to identify errors and assess the quality of the translation."
+)
+
+GEMBA_USER_TASK_PROMPT = (
+    "Based on the source segment and machine translation surrounded with triple backticks, "
+    "identify error types in the translation and classify them. The categories of errors are: "
+    "accuracy (addition, mistranslation, omission, untranslated text), fluency (character encoding, "
+    "grammar, inconsistency, punctuation, register, spelling), style (awkward), terminology "
+    "(inappropriate for context, inconsistent use), non-translation, other, or no-error.\n"
+    "Each error is classified as one of three categories: critical, major, and minor. "
+    "Critical errors inhibit comprehension of the text. Major errors disrupt the flow, but what "
+    "the text is trying to say is still understandable. Minor errors are technically errors, "
+    "but do not disrupt the flow or hinder comprehension."
+)
+
+GEMBA_FEWSHOT_USER_1 = dedent(
+    """\
+    English source:
+    ```I do apologise about this, we must gain permission from the account holder to discuss an order with another person, I apologise if this was done previously, however, I would not be able to discuss this with yourself without the account holders permission.```
+    German translation:
+    ```Ich entschuldige mich dafür, wir müssen die Erlaubnis einholen, um eine Bestellung mit einer anderen Person zu besprechen. Ich entschuldige mich, falls dies zuvor geschehen wäre, aber ohne die Erlaubnis des Kontoinhabers wäre ich nicht in der Lage, dies mit dir involvement.```
+
+    Based on the source segment and machine translation surrounded with triple backticks, identify error types in the translation and classify them. The categories of errors are: accuracy (addition, mistranslation, omission, untranslated text), fluency (character encoding, grammar, inconsistency, punctuation, register, spelling), style (awkward), terminology (inappropriate for context, inconsistent use), non-translation, other, or no-error.
+    Each error is classified as one of three categories: critical, major, and minor. Critical errors inhibit comprehension of the text. Major errors disrupt the flow, but what the text is trying to say is still understandable. Minor errors are technically errors, but do not disrupt the flow or hinder comprehension.
+    """
+).strip()
+
+GEMBA_FEWSHOT_ASSISTANT_1 = dedent(
+    """\
+    Critical:
+    no-error
+    Major:
+    accuracy/mistranslation - "involvement"
+    accuracy/omission - "the account holder"
+    Minor:
+    fluency/grammar - "wäre"
+    fluency/register - "dir"
+    """
+).strip()
+
+GEMBA_FEWSHOT_USER_2 = dedent(
+    """\
+    English source:
+    ```Talks have resumed in Vienna to try to revive the nuclear pact, with both sides trying to gauge the prospects of success after the latest exchanges in the stop-start negotiations.```
+    Czech translation:
+    ```Ve Vídni se ve Vídni obnovily rozhovory o oživení jaderného paktu, přičemž obě partaje se snaží posoudit vyhlídky na úspěch po posledních výměnách v jednáních.```
+
+    Based on the source segment and machine translation surrounded with triple backticks, identify error types in the translation and classify them. The categories of errors are: accuracy (addition, mistranslation, omission, untranslated text), fluency (character encoding, grammar, inconsistency, punctuation, register, spelling), style (awkward), terminology (inappropriate for context, inconsistent use), non-translation, other, or no-error.
+    Each error is classified as one of three categories: critical, major, and minor. Critical errors inhibit comprehension of the text. Major errors disrupt the flow, but what the text is trying to say is still understandable. Minor errors are technically errors, but do not disrupt the flow or hinder comprehension.
+    """
+).strip()
+
+GEMBA_FEWSHOT_ASSISTANT_2 = dedent(
+    """\
+    Critical:
+    no-error
+    Major:
+    accuracy/addition - "ve Vídni"
+    accuracy/omission - "the stop-start"
+    Minor:
+    terminology/inappropriate for context - "partaje"
+    """
+).strip()
+
+GEMBA_FEWSHOT_USER_3 = dedent(
+    """\
+    Chinese source:
+    ```大众点评乌鲁木齐家居卖场频道为您提供高铁居然之家地址，电话，营业时间等最新商户信息，找装修公司，就上大众点评```
+    English translation:
+    ```Urumqi Home Furnishing Store Channel provides you with the latest business information such as the address, telephone number, business hours, etc., of high-speed rail, and find a decoration company, and go to the reviews.```
+
+    Based on the source segment and machine translation surrounded with triple backticks, identify error types in the translation and classify them. The categories of errors are: accuracy (addition, mistranslation, omission, untranslated text), fluency (character encoding, grammar, inconsistency, punctuation, register, spelling), style (awkward), terminology (inappropriate for context, inconsistent use), non-translation, other, or no-error.
+    Each error is classified as one of three categories: critical, major, and minor. Critical errors inhibit comprehension of the text. Major errors disrupt the flow, but what the text is trying to say is still understandable. Minor errors are technically errors, but do not disrupt the flow or hinder comprehension.
+    """
+).strip()
+
+GEMBA_FEWSHOT_ASSISTANT_3 = dedent(
+    """\
+    Critical:
+    accuracy/addition - "of high-speed rail"
+    Major:
+    accuracy/mistranslation - "go to the reviews"
+    Minor:
+    style/awkward - "etc.,"
+    """
+).strip()
+
+
+def gemba_mqm_parse_errors(model_output: str) -> dict[str, list[str]]:
+    errors: dict[str, list[str]] = {"critical": [], "major": [], "minor": []}
+    level: str | None = None
+
+    for raw_line in str(model_output).splitlines():
+        line = raw_line.strip()
+        line_l = line.lower()
+        if (not line) or ("no-error" in line_l) or ("no error" in line_l):
+            continue
+        if line_l == "critical:":
+            level = "critical"
+            continue
+        if line_l == "major:":
+            level = "major"
+            continue
+        if line_l == "minor:":
+            level = "minor"
+            continue
+        if level is None:
+            continue
+        if "non-translation" in line_l:
+            errors["critical"].append(line)
+        else:
+            errors[level].append(line)
+
+    return errors
+
+
+def gemba_mqm_score(model_output: str | None) -> int | None:
+    if model_output is None:
+        return None
+    errors = gemba_mqm_parse_errors(model_output)
+
+    penalty = 0
+    count = 0
+    for lvl in ["critical", "major", "minor"]:
+        for _err in errors.get(lvl, []):
+            if count >= 5:
+                break
+            penalty += 25 if lvl == "critical" else 5 if lvl == "major" else 1
+            count += 1
+    if penalty > 25:
+        penalty = 25
+    return -penalty
+
+
+_MQM_QUOTED_TEXT_PATTERNS: tuple[str, ...] = (
+    r'"([^"\n]+)"',
+    r"“([^”\n]+)”",
+    r"'([^'\n]+)'",
+    r"`([^`\n]+)`",
+)
+
+
+def _extract_mqm_quoted_text(line: str) -> str | None:
+    matches: list[str] = []
+    for pattern in _MQM_QUOTED_TEXT_PATTERNS:
+        for found in re.findall(pattern, line):
+            value = str(found).strip()
+            if not value:
+                continue
+            if value.lower() in {"no-error", "no error"}:
+                continue
+            matches.append(value)
+    if not matches:
+        return None
+    return max(matches, key=len)
+
+
+def _find_text_span(
+    text: str,
+    needle: str,
+    used_spans: list[tuple[int, int]],
+) -> tuple[int, int] | None:
+    if not text or not needle:
+        return None
+
+    candidates: list[tuple[int, int]] = []
+
+    start = 0
+    while True:
+        idx = text.find(needle, start)
+        if idx < 0:
+            break
+        candidates.append((idx, idx + len(needle)))
+        start = idx + 1
+
+    if not candidates:
+        text_l = text.lower()
+        needle_l = needle.lower()
+        start = 0
+        while True:
+            idx = text_l.find(needle_l, start)
+            if idx < 0:
+                break
+            candidates.append((idx, idx + len(needle)))
+            start = idx + 1
+
+    if not candidates:
+        return None
+
+    def _overlap(span: tuple[int, int], other: tuple[int, int]) -> bool:
+        return span[0] < other[1] and other[0] < span[1]
+
+    for span in candidates:
+        if all(not _overlap(span, used) for used in used_spans):
+            return span
+    return candidates[0]
+
+
+def gemba_mqm_extract_error_spans(model_output: str | None, mt_text: str) -> list[dict[str, Any]]:
+    if model_output is None or not mt_text:
+        return []
+
+    parsed = gemba_mqm_parse_errors(model_output)
+    out: list[dict[str, Any]] = []
+    used_spans: list[tuple[int, int]] = []
+    max_items = 5
+
+    for severity in ("critical", "major", "minor"):
+        for line in parsed.get(severity, []):
+            if len(out) >= max_items:
+                return out
+            quoted = _extract_mqm_quoted_text(line)
+            if quoted is None:
+                continue
+            span = _find_text_span(mt_text, quoted, used_spans)
+            if span is None:
+                continue
+            start, end = span
+            used_spans.append(span)
+            out.append(
+                {
+                    "text": mt_text[start:end],
+                    "start": int(start),
+                    "end": int(end),
+                    "severity": severity.upper(),
+                    "confidence": 1.0,
+                    "source": "mqm",
+                    "label": line,
+                }
+            )
+
+    return out
+
+
+def _gemba_eval_user_message(
+    *,
+    source_lang: str,
+    target_lang: str,
+    source_seg: str,
+    target_seg: str,
+) -> str:
+    return (
+        f"{source_lang} source:\n"
+        f"```{source_seg}```\n"
+        f"{target_lang} translation:\n"
+        f"```{target_seg}```\n\n"
+        f"{GEMBA_USER_TASK_PROMPT}"
+    )
+
+
+def build_gemba_mqm_messages(
+    *,
+    source_lang: str,
+    target_lang: str,
+    source_seg: str,
+    target_seg: str,
+) -> list[dict[str, str]]:
+    return [
+        {"role": "system", "content": GEMBA_SYSTEM_PROMPT},
+        {"role": "user", "content": GEMBA_FEWSHOT_USER_1},
+        {"role": "assistant", "content": GEMBA_FEWSHOT_ASSISTANT_1},
+        {"role": "user", "content": GEMBA_FEWSHOT_USER_2},
+        {"role": "assistant", "content": GEMBA_FEWSHOT_ASSISTANT_2},
+        {"role": "user", "content": GEMBA_FEWSHOT_USER_3},
+        {"role": "assistant", "content": GEMBA_FEWSHOT_ASSISTANT_3},
+        {
+            "role": "user",
+            "content": _gemba_eval_user_message(
+                source_lang=source_lang,
+                target_lang=target_lang,
+                source_seg=source_seg,
+                target_seg=target_seg,
+            ),
+        },
+    ]
 
 
 def metricx_qe_input(src: str, mt: str) -> str:
@@ -43,6 +434,7 @@ class MetricXQEScorer:
     predict_fn: Callable[[list[str]], list[float]] | None = None
 
     def __post_init__(self) -> None:
+        self._worker: _ScorerSubprocessClient | None = None
         self._model = None
         self._tokenizer = None
         self._device = resolve_device(self.cfg.device)
@@ -56,6 +448,30 @@ class MetricXQEScorer:
             return
 
         if not self.cfg.enabled:
+            return
+
+        if self.cfg.python_executable:
+            cfg_payload = {
+                "model_name": self.cfg.model_name,
+                "tokenizer_name": self.cfg.tokenizer_name,
+                "use_reference": bool(self.cfg.use_reference),
+                "batch_size": int(self.cfg.batch_size),
+                "device": self.cfg.device,
+                "dtype": self.cfg.dtype,
+                "max_input_length": int(self.cfg.max_input_length),
+                "overflow_policy": self.cfg.overflow_policy,
+            }
+            self._worker = _ScorerSubprocessClient(
+                backend="metricx",
+                python_executable=self.cfg.python_executable,
+                timeout_sec=float(self.cfg.subprocess_timeout_sec),
+                config_payload=cfg_payload,
+            )
+            logger.info(
+                "MetricX scorer will run in external python=%s (device=%s).",
+                self.cfg.python_executable,
+                self.cfg.device,
+            )
             return
 
         if torch is None or AutoTokenizer is None:
@@ -107,7 +523,8 @@ class MetricXQEScorer:
         if self._model is None:
             raise RuntimeError(
                 "Failed to load MetricX model after trying multiple dtypes. "
-                f"model={model_name} device={self._device} tried_dtypes={candidate_dtypes}."
+                f"model={model_name} device={self._device} tried_dtypes={candidate_dtypes}. "
+                f"last_error={last_error!r}"
             ) from last_error
 
     def _build_candidate_dtypes(self, model_name: str) -> list[Any]:
@@ -257,6 +674,16 @@ class MetricXQEScorer:
             if "dtype" in kwargs:
                 kwargs["torch_dtype"] = kwargs.pop("dtype")
             return model_cls.from_pretrained(model_name, **kwargs)
+        except Exception as exc:
+            # Some environments don't have accelerate installed, which makes
+            # `low_cpu_mem_usage=True` unavailable. Retry without it.
+            msg = str(exc).lower()
+            if "low_cpu_mem_usage" in msg or "accelerate" in msg:
+                kwargs.pop("low_cpu_mem_usage", None)
+                if "dtype" in kwargs:
+                    kwargs["torch_dtype"] = kwargs.pop("dtype")
+                return model_cls.from_pretrained(model_name, **kwargs)
+            raise
 
     def _load_tokenizer(self):
         candidates: list[str] = []
@@ -289,6 +716,18 @@ class MetricXQEScorer:
     def score_batch(self, samples: list[SampleForScoring]) -> RewardOutput:
         if not samples:
             return RewardOutput(sequence_scores=[])
+        if self._worker is not None:
+            worker_samples = [{"src": s.src, "mt": s.mt, "ref": s.ref} for s in samples]
+            resp = self._worker.request({"type": "score", "samples": worker_samples})
+            if not bool(resp.get("ok", False)):
+                raise RuntimeError(f"MetricX worker scoring failed: {resp.get('error', 'unknown error')}")
+            scores = [float(v) for v in list(resp.get("scores", []))]
+            if len(scores) != len(samples):
+                raise RuntimeError(
+                    f"MetricX worker returned mismatched score length: expected={len(samples)} got={len(scores)}"
+                )
+            metadata = resp.get("metadata")
+            return RewardOutput(sequence_scores=scores, metadata=metadata)
 
         inputs: list[str] = []
         for sample in samples:
@@ -398,6 +837,13 @@ class MetricXQEScorer:
                 ids[row_idx, last_idx] = int(pad_token_id)
         return ids, mask
 
+    def __del__(self) -> None:  # pragma: no cover - best effort cleanup
+        try:
+            if getattr(self, "_worker", None) is not None:
+                self._worker.close()
+        except Exception:
+            pass
+
 
 @dataclass
 class XCometXLScorer:
@@ -405,9 +851,30 @@ class XCometXLScorer:
     predict_fn: Callable[[list[dict[str, str]]], Any] | None = None
 
     def __post_init__(self) -> None:
+        self._worker: _ScorerSubprocessClient | None = None
         self._model = None
         self._device = resolve_device(self.cfg.device)
         if self.predict_fn is not None or not self.cfg.enabled:
+            return
+
+        if self.cfg.python_executable:
+            cfg_payload = {
+                "model_name": self.cfg.model_name,
+                "batch_size": int(self.cfg.batch_size),
+                "device": self.cfg.device,
+                "use_reference": bool(self.cfg.use_reference),
+            }
+            self._worker = _ScorerSubprocessClient(
+                backend="xcomet",
+                python_executable=self.cfg.python_executable,
+                timeout_sec=float(self.cfg.subprocess_timeout_sec),
+                config_payload=cfg_payload,
+            )
+            logger.info(
+                "xCOMET scorer will run in external python=%s (device=%s).",
+                self.cfg.python_executable,
+                self.cfg.device,
+            )
             return
 
         try:
@@ -433,6 +900,20 @@ class XCometXLScorer:
             if self.cfg.use_reference and sample.ref:
                 record["ref"] = sample.ref
             payload.append(record)
+
+        if self._worker is not None:
+            resp = self._worker.request({"type": "score", "payload": payload})
+            if not bool(resp.get("ok", False)):
+                raise RuntimeError(f"xCOMET worker scoring failed: {resp.get('error', 'unknown error')}")
+            scores = [float(v) for v in list(resp.get("scores", []))]
+            spans = resp.get("error_spans", [[] for _ in scores])
+            if len(scores) != len(samples):
+                raise RuntimeError(
+                    f"xCOMET worker returned mismatched score length: expected={len(samples)} got={len(scores)}"
+                )
+            if not isinstance(spans, list) or len(spans) != len(samples):
+                spans = [[] for _ in scores]
+            return RewardOutput(sequence_scores=scores, metadata={"error_spans": spans})
 
         if self.predict_fn is not None:
             result = self.predict_fn(payload)
@@ -516,6 +997,187 @@ class XCometXLScorer:
         if len(scores) != expected:
             raise ValueError(f"xCOMET score length mismatch expected={expected} got={len(scores)}")
         return scores, spans
+
+    def __del__(self) -> None:  # pragma: no cover - best effort cleanup
+        try:
+            if getattr(self, "_worker", None) is not None:
+                self._worker.close()
+        except Exception:
+            pass
+
+
+@dataclass
+class OpenAICompatibleMQMScorer:
+    cfg: MQMConfig
+    predict_fn: Callable[[list[list[dict[str, str]]]], list[float]] | None = None
+
+    def __post_init__(self) -> None:
+        self._chat_url: str | None = None
+        self._api_key: str | None = None
+        if self.predict_fn is not None or not self.cfg.enabled:
+            return
+
+        if not self.cfg.base_url or not str(self.cfg.base_url).strip():
+            raise ValueError("MQM scorer requires cfg.base_url when enabled.")
+        self._chat_url = self._resolve_chat_url(self.cfg.base_url)
+
+        if self.cfg.api_key and str(self.cfg.api_key).strip():
+            self._api_key = str(self.cfg.api_key).strip()
+        else:
+            env_name = (self.cfg.api_key_env or "OPENAI_API_KEY").strip()
+            self._api_key = os.environ.get(env_name) or os.environ.get("OPENAI_API_KEY")
+            if self._api_key and self._api_key.strip():
+                self._api_key = self._api_key.strip()
+            else:
+                self._api_key = None
+
+    @staticmethod
+    def _resolve_chat_url(base_url: str) -> str:
+        url = str(base_url).strip().rstrip("/")
+        if not url:
+            raise ValueError("MQM base_url must not be empty.")
+        if url.endswith("/chat/completions"):
+            return url
+        if url.endswith("/v1"):
+            return f"{url}/chat/completions"
+        return f"{url}/v1/chat/completions"
+
+    def score_batch(self, samples: list[SampleForScoring]) -> RewardOutput:
+        if not samples:
+            return RewardOutput(sequence_scores=[], metadata={"raw_outputs": [], "error_spans": []})
+
+        message_rows = [
+            build_gemba_mqm_messages(
+                source_lang=self.cfg.source_lang,
+                target_lang=self.cfg.target_lang,
+                source_seg=sample.src,
+                target_seg=sample.mt,
+            )
+            for sample in samples
+        ]
+        if self.predict_fn is not None:
+            scores = [float(v) for v in self.predict_fn(message_rows)]
+            return RewardOutput(
+                sequence_scores=scores,
+                metadata={"raw_outputs": [], "error_spans": [[] for _ in samples]},
+            )
+
+        if self._chat_url is None:
+            raise RuntimeError("OpenAICompatibleMQMScorer is not initialized.")
+
+        sequence_scores: list[float] = []
+        raw_outputs: list[str] = []
+        error_spans: list[list[dict[str, Any]]] = []
+        for i in range(0, len(message_rows), max(1, int(self.cfg.batch_size))):
+            batch_messages = message_rows[i : i + max(1, int(self.cfg.batch_size))]
+            batch_samples = samples[i : i + max(1, int(self.cfg.batch_size))]
+            for sample, messages in zip(batch_samples, batch_messages):
+                score, raw_text = self._score_one_messages(messages)
+                sequence_scores.append(score)
+                raw_outputs.append(raw_text)
+                error_spans.append(gemba_mqm_extract_error_spans(raw_text, sample.mt))
+
+        return RewardOutput(
+            sequence_scores=sequence_scores,
+            metadata={"raw_outputs": raw_outputs, "error_spans": error_spans},
+        )
+
+    def _score_one_messages(self, messages: list[dict[str, str]]) -> tuple[float, str]:
+        retries = max(0, int(self.cfg.max_retries))
+        last_exc: Exception | None = None
+        for attempt in range(retries + 1):
+            try:
+                raw_text = self._call_openai_compatible_api(messages)
+                raw_score = gemba_mqm_score(raw_text)
+                if raw_score is None:
+                    raise RuntimeError("GEMBA-MQM score parse returned None.")
+                scaled = self._scale_score(float(raw_score))
+                return float(scaled), raw_text
+            except Exception as exc:
+                last_exc = exc
+                if attempt < retries:
+                    continue
+                break
+
+        try:
+            raise RuntimeError("MQM API scoring failed.") from last_exc
+        except Exception as exc:
+            if self.cfg.error_policy == "zero":
+                logger.warning("MQM API scoring failed; fallback score=0.0 due to error_policy=zero: %s", exc)
+                return 0.0, ""
+            raise
+
+    def _call_openai_compatible_api(self, messages: list[dict[str, str]]) -> str:
+        if self._chat_url is None:
+            raise RuntimeError("MQM scorer chat URL is not set.")
+
+        payload = {
+            "model": self.cfg.model_name,
+            "messages": messages,
+            "temperature": float(self.cfg.temperature),
+            "top_p": float(self.cfg.top_p),
+            "max_tokens": int(self.cfg.max_tokens),
+        }
+        if self.cfg.stop:
+            payload["stop"] = list(self.cfg.stop)
+        if self.cfg.chat_template_kwargs:
+            payload["chat_template_kwargs"] = dict(self.cfg.chat_template_kwargs)
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+        req = urllib_request.Request(
+            self._chat_url,
+            data=body,
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        if self._api_key:
+            req.add_header("Authorization", f"Bearer {self._api_key}")
+
+        try:
+            timeout = float(self.cfg.timeout_s or self.cfg.timeout_sec)
+            with urllib_request.urlopen(req, timeout=timeout) as resp:
+                resp_body = resp.read().decode("utf-8")
+        except urllib_error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"MQM API HTTPError status={exc.code} body={detail}") from exc
+        except urllib_error.URLError as exc:
+            raise RuntimeError(f"MQM API URLError: {exc}") from exc
+
+        try:
+            parsed = json.loads(resp_body)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("MQM API response is not valid JSON.") from exc
+
+        choices = parsed.get("choices")
+        if not isinstance(choices, list) or not choices:
+            raise RuntimeError("MQM API response has no choices.")
+        first = choices[0]
+        if isinstance(first, dict):
+            msg = first.get("message")
+            if isinstance(msg, dict):
+                content = msg.get("content")
+                if isinstance(content, str):
+                    return content
+                if isinstance(content, list):
+                    text_parts = []
+                    for item in content:
+                        if isinstance(item, dict) and isinstance(item.get("text"), str):
+                            text_parts.append(item["text"])
+                    if text_parts:
+                        return "\n".join(text_parts)
+            text = first.get("text")
+            if isinstance(text, str):
+                return text
+
+        raise RuntimeError("MQM API response format is unsupported.")
+
+    def _scale_score(self, score: float) -> float:
+        lo = float(self.cfg.score_min)
+        hi = float(self.cfg.score_max)
+        clipped = min(max(float(score), lo), hi)
+        if not self.cfg.scale_to_unit_interval:
+            return clipped
+        return (clipped - lo) / max(1e-8, hi - lo)
 
 
 def extract_error_spans(metadata: Any, expected: int) -> list[list[dict[str, Any]]]:
