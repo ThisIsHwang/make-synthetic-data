@@ -80,8 +80,11 @@ class _ScorerSubprocessClient:
             raise
         if not bool(init_resp.get("ok", False)):
             self.close()
+            err = init_resp.get("error", "unknown error")
+            worker_tb = init_resp.get("traceback")
+            tb_text = f"\nworker_traceback:\n{worker_tb}" if worker_tb else ""
             raise RuntimeError(
-                f"{backend} scorer worker init failed: {init_resp.get('error', 'unknown error')}"
+                f"{backend} scorer worker init failed: {err}{tb_text}"
             )
 
     def _assert_alive(self) -> None:
@@ -761,7 +764,10 @@ class MetricXQEScorer:
             worker_samples = [{"src": s.src, "mt": s.mt, "ref": s.ref} for s in samples]
             resp = self._worker.request({"type": "score", "samples": worker_samples})
             if not bool(resp.get("ok", False)):
-                raise RuntimeError(f"MetricX worker scoring failed: {resp.get('error', 'unknown error')}")
+                err = resp.get("error", "unknown error")
+                worker_tb = resp.get("traceback")
+                tb_text = f"\nworker_traceback:\n{worker_tb}" if worker_tb else ""
+                raise RuntimeError(f"MetricX worker scoring failed: {err}{tb_text}")
             scores = [float(v) for v in list(resp.get("scores", []))]
             if len(scores) != len(samples):
                 raise RuntimeError(
@@ -953,7 +959,10 @@ class XCometXLScorer:
         if self._worker is not None:
             resp = self._worker.request({"type": "score", "payload": payload})
             if not bool(resp.get("ok", False)):
-                raise RuntimeError(f"xCOMET worker scoring failed: {resp.get('error', 'unknown error')}")
+                err = resp.get("error", "unknown error")
+                worker_tb = resp.get("traceback")
+                tb_text = f"\nworker_traceback:\n{worker_tb}" if worker_tb else ""
+                raise RuntimeError(f"xCOMET worker scoring failed: {err}{tb_text}")
             scores = [float(v) for v in list(resp.get("scores", []))]
             spans = resp.get("error_spans", [[] for _ in scores])
             if len(scores) != len(samples):
