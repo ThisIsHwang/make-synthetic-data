@@ -413,6 +413,11 @@ def _validate_deepspeed_partition_strict(cfg: RLPostTrainConfig) -> None:
     local_entry = _get_rank_gpu_mapping_entry(policy_gpu_ids)
     gathered: list[Any] = [local_entry]
     if _is_distributed_initialized() and world_size > 1:
+        # NCCL collectives used by all_gather_object require the current CUDA device
+        # to match this process local rank.
+        local_rank_raw = os.environ.get("LOCAL_RANK")
+        if torch.cuda.is_available() and local_rank_raw and local_rank_raw.isdigit():
+            torch.cuda.set_device(int(local_rank_raw))
         gathered = [None for _ in range(world_size)]
         torch.distributed.all_gather_object(gathered, local_entry)
 
@@ -1489,12 +1494,11 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
                 "rl.backend=deepspeed but deepspeed is not installed. Install it first."
             )
         deepspeed.init_distributed()
-    if use_deepspeed:
-        _validate_deepspeed_partition_strict(cfg)
 
     base_device = resolve_device(cfg.misc.device)
     if use_deepspeed:
         base_device = _local_rank_device(base_device)
+        _validate_deepspeed_partition_strict(cfg)
     device = base_device
     rank0 = _is_rank0()
 
