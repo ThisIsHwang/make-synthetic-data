@@ -136,8 +136,8 @@ rl:
   group_advantage_coef: 1.0
   eps: 1.0e-8
   deepspeed_config_path: null
-  deepspeed_zero_stage: 2
-  deepspeed_offload_optimizer: false
+  deepspeed_zero_stage: 3
+  deepspeed_offload_optimizer: true
   deepspeed_offload_param: false
 
 eval:
