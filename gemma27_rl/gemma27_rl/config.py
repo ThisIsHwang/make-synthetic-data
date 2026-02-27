@@ -4,9 +4,18 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-import yaml
-
 from .prompting import DEFAULT_TRANSLATION_PROMPT_TEMPLATE
+
+
+def _require_yaml():
+    try:
+        import yaml  # type: ignore[import-not-found]
+    except Exception as exc:
+        raise RuntimeError(
+            "PyYAML is required to load or dump YAML configs. "
+            "Install with: pip install pyyaml"
+        ) from exc
+    return yaml
 
 
 @dataclass
@@ -434,6 +443,7 @@ def _validate_config(cfg: RLPostTrainConfig) -> None:
 
 def load_config(path: str | Path) -> RLPostTrainConfig:
     cfg_path = Path(path)
+    yaml = _require_yaml()
     payload = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
     cfg = _coerce_dataclass(RLPostTrainConfig, payload)
 
@@ -459,4 +469,5 @@ def load_config(path: str | Path) -> RLPostTrainConfig:
 
 
 def dump_config(cfg: RLPostTrainConfig, path: str | Path) -> None:
+    yaml = _require_yaml()
     Path(path).write_text(yaml.safe_dump(asdict(cfg), sort_keys=False), encoding="utf-8")
