@@ -41,7 +41,7 @@ from .rewards import (
     spans_to_token_rewards,
 )
 from .rollout import generate_rollouts
-from .types import Rollout, SampleForScoring
+from .rl_types import Rollout, SampleForScoring
 from .utils import (
     configure_huggingface_cache,
     resolve_device,

@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from .config import RLConfig
-from .types import Rollout, TrainStats
+from .rl_types import Rollout, TrainStats
 
 
 def _token_logprobs_and_entropy(

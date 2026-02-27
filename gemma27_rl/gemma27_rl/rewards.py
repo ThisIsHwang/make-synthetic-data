@@ -25,7 +25,7 @@ except Exception:  # pragma: no cover - optional during lightweight tests
     AutoTokenizer = None  # type: ignore[assignment]
 
 from .config import MQMConfig, MetricXConfig, XCometConfig
-from .types import RewardOutput, SampleForScoring
+from .rl_types import RewardOutput, SampleForScoring
 from .utils import resolve_device, resolve_torch_dtype
 
 

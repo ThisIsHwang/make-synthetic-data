@@ -11,7 +11,7 @@ from gemma27_rl.advantage import normalize_advantages
 from gemma27_rl.config import RLConfig
 from gemma27_rl.grpo import update_policy
 from gemma27_rl.rollout import compute_completion_logprobs
-from gemma27_rl.types import Rollout
+from gemma27_rl.rl_types import Rollout
 
 
 class TinyCausalLM(nn.Module):

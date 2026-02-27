@@ -12,7 +12,7 @@ from transformers import PreTrainedModel, PreTrainedTokenizerBase
 from .config import GenerationConfig, RLPostTrainConfig
 from .rewards import OpenAICompatibleMQMScorer, MetricXQEScorer, XCometXLScorer, metricx_score_to_reward
 from .rollout import generate_rollouts
-from .types import Example, SampleForScoring
+from .rl_types import Example, SampleForScoring
 
 logger = logging.getLogger(__name__)
 

@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import DataConfig
-from .types import Example
+from .rl_types import Example
 
 
 logger = logging.getLogger(__name__)

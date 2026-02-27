@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from .types import Example
+from .rl_types import Example
 
 
 DEFAULT_TRANSLATION_PROMPT_TEMPLATE = (

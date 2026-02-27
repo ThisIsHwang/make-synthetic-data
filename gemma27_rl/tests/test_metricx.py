@@ -4,7 +4,7 @@ import pytest
 
 from gemma27_rl.config import MetricXConfig
 from gemma27_rl.rewards import MetricXQEScorer, metricx_qe_input, metricx_score_to_reward
-from gemma27_rl.types import SampleForScoring
+from gemma27_rl.rl_types import SampleForScoring
 
 
 def test_metricx_qe_input_format() -> None:

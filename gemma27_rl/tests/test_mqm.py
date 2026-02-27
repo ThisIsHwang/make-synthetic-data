@@ -7,7 +7,7 @@ from gemma27_rl.rewards import (
     gemba_mqm_parse_errors,
     gemba_mqm_score,
 )
-from gemma27_rl.types import SampleForScoring
+from gemma27_rl.rl_types import SampleForScoring
 
 
 def test_gemba_mqm_parse_and_score() -> None:

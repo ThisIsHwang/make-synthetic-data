@@ -23,7 +23,7 @@ from .prompting import (
     format_translation_prompt,
     postprocess_translation,
 )
-from .types import Example, Rollout
+from .rl_types import Example, Rollout
 
 
 logger = logging.getLogger(__name__)

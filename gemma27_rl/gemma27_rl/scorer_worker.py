@@ -21,7 +21,7 @@ _ensure_repo_import_path()
 
 from gemma27_rl.config import MetricXConfig, XCometConfig  # noqa: E402
 from gemma27_rl.rewards import MetricXQEScorer, XCometXLScorer  # noqa: E402
-from gemma27_rl.types import SampleForScoring  # noqa: E402
+from gemma27_rl.rl_types import SampleForScoring  # noqa: E402
 
 
 def _reply(payload: dict[str, Any]) -> None:
