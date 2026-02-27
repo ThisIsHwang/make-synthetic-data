@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 import logging
 from typing import Any
@@ -255,7 +256,7 @@ def generate_rollouts(
     finally:
         tokenizer.padding_side = original_padding_side
 
-    if isinstance(tokenized, dict):
+    if isinstance(tokenized, (dict, Mapping)):
         input_ids = tokenized["input_ids"].to(device)
         attention_mask = tokenized.get("attention_mask")
         if attention_mask is None:
