@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 import logging
 import math
 import os
 from pathlib import Path
+import select
+import subprocess
 from typing import Any, Callable
 
 try:
@@ -25,6 +28,109 @@ from .utils import resolve_device, resolve_torch_dtype
 logger = logging.getLogger(__name__)
 
 
+class _ScorerSubprocessClient:
+    def __init__(
+        self,
+        *,
+        backend: str,
+        python_executable: str,
+        timeout_sec: float,
+        config_payload: dict[str, Any],
+    ) -> None:
+        self._backend = backend
+        self._timeout_sec = float(timeout_sec)
+        worker_script = Path(__file__).resolve().with_name("scorer_worker.py")
+        if not worker_script.exists():
+            raise FileNotFoundError(f"scorer worker script not found: {worker_script}")
+
+        cmd = [python_executable, str(worker_script), "--backend", backend]
+        try:
+            self._proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=None,
+                text=True,
+                bufsize=1,
+            )
+        except Exception as exc:
+            raise RuntimeError(f"Failed to start {backend} scorer worker: cmd={cmd}") from exc
+
+        try:
+            init_resp = self.request({"type": "init", "config": config_payload})
+        except Exception:
+            self.close()
+            raise
+        if not bool(init_resp.get("ok", False)):
+            self.close()
+            raise RuntimeError(
+                f"{backend} scorer worker init failed: {init_resp.get('error', 'unknown error')}"
+            )
+
+    def _assert_alive(self) -> None:
+        if self._proc.poll() is not None:
+            raise RuntimeError(f"{self._backend} scorer worker exited unexpectedly with code={self._proc.returncode}")
+
+    def request(self, payload: dict[str, Any]) -> dict[str, Any]:
+        self._assert_alive()
+        assert self._proc.stdin is not None
+        assert self._proc.stdout is not None
+
+        try:
+            self._proc.stdin.write(json.dumps(payload, ensure_ascii=False) + "\n")
+            self._proc.stdin.flush()
+        except Exception as exc:
+            raise RuntimeError(f"Failed to send request to {self._backend} scorer worker.") from exc
+
+        ready, _, _ = select.select([self._proc.stdout], [], [], self._timeout_sec)
+        if not ready:
+            raise TimeoutError(f"{self._backend} scorer worker timed out after {self._timeout_sec}s")
+        try:
+            line = self._proc.stdout.readline()
+        except Exception as exc:
+            raise RuntimeError(f"Failed to read response from {self._backend} scorer worker.") from exc
+
+        if not line:
+            self._assert_alive()
+            raise RuntimeError(f"{self._backend} scorer worker returned empty response.")
+
+        try:
+            resp = json.loads(line)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Invalid JSON response from {self._backend} scorer worker: {line[:200]!r}"
+            ) from exc
+
+        if not isinstance(resp, dict):
+            raise RuntimeError(f"Unexpected response type from {self._backend} scorer worker: {type(resp)!r}")
+        return resp
+
+    def close(self) -> None:
+        if getattr(self, "_proc", None) is None:
+            return
+        proc = self._proc
+        if proc.poll() is None:
+            try:
+                self.request({"type": "close"})
+            except Exception:
+                pass
+            try:
+                proc.terminate()
+                proc.wait(timeout=2)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        self._proc = None  # type: ignore[assignment]
+
+    def __del__(self) -> None:  # pragma: no cover - best effort cleanup
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
 def metricx_qe_input(src: str, mt: str) -> str:
     return f"source: {src} candidate: {mt}"
 
@@ -43,6 +149,7 @@ class MetricXQEScorer:
     predict_fn: Callable[[list[str]], list[float]] | None = None
 
     def __post_init__(self) -> None:
+        self._worker: _ScorerSubprocessClient | None = None
         self._model = None
         self._tokenizer = None
         self._device = resolve_device(self.cfg.device)
@@ -56,6 +163,30 @@ class MetricXQEScorer:
             return
 
         if not self.cfg.enabled:
+            return
+
+        if self.cfg.python_executable:
+            cfg_payload = {
+                "model_name": self.cfg.model_name,
+                "tokenizer_name": self.cfg.tokenizer_name,
+                "use_reference": bool(self.cfg.use_reference),
+                "batch_size": int(self.cfg.batch_size),
+                "device": self.cfg.device,
+                "dtype": self.cfg.dtype,
+                "max_input_length": int(self.cfg.max_input_length),
+                "overflow_policy": self.cfg.overflow_policy,
+            }
+            self._worker = _ScorerSubprocessClient(
+                backend="metricx",
+                python_executable=self.cfg.python_executable,
+                timeout_sec=float(self.cfg.subprocess_timeout_sec),
+                config_payload=cfg_payload,
+            )
+            logger.info(
+                "MetricX scorer will run in external python=%s (device=%s).",
+                self.cfg.python_executable,
+                self.cfg.device,
+            )
             return
 
         if torch is None or AutoTokenizer is None:
@@ -287,6 +418,16 @@ class MetricXQEScorer:
         if not samples:
             return RewardOutput(sequence_scores=[])
 
+        if self._worker is not None:
+            rows = [{"src": s.src, "mt": s.mt, "ref": s.ref} for s in samples]
+            resp = self._worker.request({"type": "score", "samples": rows})
+            if not resp.get("ok", False):
+                raise RuntimeError(f"MetricX subprocess error: {resp.get('error', 'unknown')}")
+            return RewardOutput(
+                sequence_scores=[float(v) for v in resp["scores"]],
+                metadata=resp.get("metadata"),
+            )
+
         inputs: list[str] = []
         for sample in samples:
             ref_text = (sample.ref or "").strip()
@@ -402,9 +543,30 @@ class XCometXLScorer:
     predict_fn: Callable[[list[dict[str, str]]], Any] | None = None
 
     def __post_init__(self) -> None:
+        self._worker: _ScorerSubprocessClient | None = None
         self._model = None
         self._device = resolve_device(self.cfg.device)
         if self.predict_fn is not None or not self.cfg.enabled:
+            return
+
+        if self.cfg.python_executable:
+            cfg_payload = {
+                "model_name": self.cfg.model_name,
+                "batch_size": int(self.cfg.batch_size),
+                "device": self.cfg.device,
+                "use_reference": bool(self.cfg.use_reference),
+            }
+            self._worker = _ScorerSubprocessClient(
+                backend="xcomet",
+                python_executable=self.cfg.python_executable,
+                timeout_sec=float(self.cfg.subprocess_timeout_sec),
+                config_payload=cfg_payload,
+            )
+            logger.info(
+                "xCOMET scorer will run in external python=%s (device=%s).",
+                self.cfg.python_executable,
+                self.cfg.device,
+            )
             return
 
         try:
@@ -423,6 +585,16 @@ class XCometXLScorer:
     def score_batch(self, samples: list[SampleForScoring]) -> RewardOutput:
         if not samples:
             return RewardOutput(sequence_scores=[], metadata={"error_spans": []})
+
+        if self._worker is not None:
+            rows = [{"src": s.src, "mt": s.mt, "ref": s.ref} for s in samples]
+            resp = self._worker.request({"type": "score", "payload": rows})
+            if not resp.get("ok", False):
+                raise RuntimeError(f"xCOMET subprocess error: {resp.get('error', 'unknown')}")
+            return RewardOutput(
+                sequence_scores=[float(v) for v in resp["scores"]],
+                metadata={"error_spans": resp.get("error_spans", [[] for _ in samples])},
+            )
 
         payload: list[dict[str, str]] = []
         for sample in samples:

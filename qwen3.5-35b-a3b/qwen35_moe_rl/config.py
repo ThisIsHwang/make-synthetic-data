@@ -88,6 +88,8 @@ class MetricXConfig:
     max_input_length: int = 2048
     overflow_policy: str = "truncate"  # truncate|skip
     offset: float = 5.0
+    python_executable: str | None = None
+    subprocess_timeout_sec: float = 600.0
 
 
 @dataclass
@@ -97,6 +99,8 @@ class XCometConfig:
     batch_size: int = 2
     device: str = "cuda"
     use_reference: bool = False
+    python_executable: str | None = None
+    subprocess_timeout_sec: float = 600.0
 
 
 @dataclass
@@ -211,6 +215,20 @@ def _coerce_dataclass(cls: type[Any], payload: dict[str, Any]) -> Any:
         else:
             kwargs[key] = raw
     return cls(**kwargs)
+
+
+def _resolve_command_or_path(value: str | None, base_dir: Path) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return value
+    if "/" not in text and "\\" not in text and not text.startswith(".") and not text.startswith("~"):
+        return text
+    path = Path(text).expanduser()
+    if path.is_absolute():
+        return str(path)
+    return str((base_dir / path).resolve())
 
 
 def _resolve_optional_path(value: str | None, base_dir: Path) -> str | None:
@@ -364,6 +382,8 @@ def load_config(path: str | Path) -> RLPostTrainConfig:
     cfg.distributed.deepspeed_config_path = _resolve_optional_path(
         cfg.distributed.deepspeed_config_path, base_dir
     )
+    cfg.reward.metricx.python_executable = _resolve_command_or_path(cfg.reward.metricx.python_executable, base_dir)
+    cfg.reward.xcomet.python_executable = _resolve_command_or_path(cfg.reward.xcomet.python_executable, base_dir)
 
     _validate_config(cfg)
     return cfg
