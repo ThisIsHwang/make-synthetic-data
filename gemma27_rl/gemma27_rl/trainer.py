@@ -1695,6 +1695,13 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
 
     if cfg.eval.run_before_train and eval_examples and start_update <= 1:
         if (not use_deepspeed) or rank0:
+            logger.info(
+                "starting eval (run_before_train): examples=%s metricx=%s xcomet=%s mqm=%s",
+                len(eval_examples),
+                bool(metricx_scorer is not None and cfg.reward.metricx.enabled),
+                bool(xcomet_scorer is not None and cfg.reward.xcomet.enabled),
+                bool(mqm_scorer is not None and cfg.reward.mqm.enabled),
+            )
             report = evaluate_on_dataset(
                 examples=eval_examples,
                 policy_model=policy_eval_model,
@@ -1712,6 +1719,13 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
             _append_jsonl(log_path, {"type": "eval", "update": 0, **report})
             if cfg.logging.save_eval_outputs:
                 _append_eval_output_jsonl(eval_output_path, update_idx=0, eval_rows=eval_rows)
+            logger.info(
+                "finished eval (run_before_train): update=0 model_select_score=%.6f metricx=%.4f xcomet=%.4f mqm=%.4f",
+                float(eval_select_score),
+                float(report.get("metricx_score_mean", 0.0)),
+                float(report.get("xcomet_score_mean", 0.0)),
+                float(report.get("mqm_score_mean", 0.0)),
+            )
             if math.isfinite(eval_select_score) and eval_select_score > best_eval_score:
                 _save_model_only(best_dir, policy_eval_model, tokenizer)
                 best_eval_score = eval_select_score
@@ -1919,6 +1933,14 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
             and update_idx % cfg.eval.eval_every_n_updates == 0
         ):
             if (not use_deepspeed) or rank0:
+                logger.info(
+                    "starting eval: update=%s examples=%s metricx=%s xcomet=%s mqm=%s",
+                    update_idx,
+                    len(eval_examples),
+                    bool(metricx_scorer is not None and cfg.reward.metricx.enabled),
+                    bool(xcomet_scorer is not None and cfg.reward.xcomet.enabled),
+                    bool(mqm_scorer is not None and cfg.reward.mqm.enabled),
+                )
                 report = evaluate_on_dataset(
                     examples=eval_examples,
                     policy_model=policy_eval_model,
@@ -1936,6 +1958,14 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
                 _append_jsonl(log_path, {"type": "eval", "update": update_idx, **report})
                 if cfg.logging.save_eval_outputs:
                     _append_eval_output_jsonl(eval_output_path, update_idx=update_idx, eval_rows=eval_rows)
+                logger.info(
+                    "finished eval: update=%s model_select_score=%.6f metricx=%.4f xcomet=%.4f mqm=%.4f",
+                    update_idx,
+                    float(eval_select_score),
+                    float(report.get("metricx_score_mean", 0.0)),
+                    float(report.get("xcomet_score_mean", 0.0)),
+                    float(report.get("mqm_score_mean", 0.0)),
+                )
                 if math.isfinite(eval_select_score) and eval_select_score > best_eval_score:
                     _save_model_only(best_dir, policy_eval_model, tokenizer)
                     best_eval_score = eval_select_score

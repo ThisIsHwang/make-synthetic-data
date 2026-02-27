@@ -50,6 +50,11 @@ def evaluate_on_dataset(
             empty["eval_rows"] = []
         return empty
 
+    logger.info(
+        "evaluate_on_dataset: start examples=%s collect_outputs=%s",
+        len(examples),
+        bool(collect_outputs),
+    )
     gen_cfg = deepcopy(cfg.generation)
     gen_cfg.num_samples_per_prompt = 1
     gen_cfg.do_sample = False
@@ -64,12 +69,14 @@ def evaluate_on_dataset(
         ref_model=None,
         prompt_template=cfg.prompt.template,
     )
+    logger.info("evaluate_on_dataset: rollout complete rollouts=%s", len(rollouts))
 
     samples = [SampleForScoring(src=r.src_text, mt=r.completion_text, ref=r.ref_text) for r in rollouts]
 
     metricx_scores = [0.0 for _ in rollouts]
     metricx_rewards = [0.0 for _ in rollouts]
     if metricx_scorer is not None and cfg.reward.metricx.enabled:
+        logger.info("evaluate_on_dataset: scoring metricx...")
         metricx_scores = metricx_scorer.score_batch(samples).sequence_scores
         non_finite_idx = [idx for idx, value in enumerate(metricx_scores) if not math.isfinite(float(value))]
         if non_finite_idx:
@@ -95,6 +102,7 @@ def evaluate_on_dataset(
     xcomet_scores = [0.0 for _ in rollouts]
     spans: list[list[dict[str, Any]]] = [[] for _ in rollouts]
     if xcomet_scorer is not None and cfg.reward.xcomet.enabled:
+        logger.info("evaluate_on_dataset: scoring xcomet...")
         xcomet_out = xcomet_scorer.score_batch(samples)
         xcomet_scores = xcomet_out.sequence_scores
         non_finite_idx = [idx for idx, value in enumerate(xcomet_scores) if not math.isfinite(float(value))]
@@ -111,6 +119,7 @@ def evaluate_on_dataset(
     mqm_scores = [0.0 for _ in rollouts]
     mqm_spans: list[list[dict[str, Any]]] = [[] for _ in rollouts]
     if mqm_scorer is not None and cfg.reward.mqm.enabled:
+        logger.info("evaluate_on_dataset: scoring mqm...")
         mqm_out = mqm_scorer.score_batch(samples)
         mqm_scores = mqm_out.sequence_scores
         mqm_meta = mqm_out.metadata or {}
@@ -180,4 +189,10 @@ def evaluate_on_dataset(
             )
         report["eval_rows"] = rows
 
+    logger.info(
+        "evaluate_on_dataset: done metricx=%.4f xcomet=%.4f mqm=%.4f",
+        float(report.get("metricx_score_mean", 0.0)),
+        float(report.get("xcomet_score_mean", 0.0)),
+        float(report.get("mqm_score_mean", 0.0)),
+    )
     return report
