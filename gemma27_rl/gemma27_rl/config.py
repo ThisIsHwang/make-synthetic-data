@@ -198,6 +198,13 @@ class EvalConfig:
     eval_every_n_updates: int = 5
     eval_limit: int = 64
     run_before_train: bool = True
+    # Optional eval-only generation overrides.
+    # Example:
+    # generation_overrides:
+    #   max_new_tokens: 128
+    #   do_sample: true
+    #   temperature: 0.7
+    generation_overrides: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -368,6 +375,8 @@ def _validate_config(cfg: RLPostTrainConfig) -> None:
         raise ValueError("rl.deepspeed_zero_stage must be one of 0,1,2,3")
     if cfg.generation.chat_template_kwargs is not None and not isinstance(cfg.generation.chat_template_kwargs, dict):
         raise ValueError("generation.chat_template_kwargs must be a dict")
+    if cfg.eval.generation_overrides is not None and not isinstance(cfg.eval.generation_overrides, dict):
+        raise ValueError("eval.generation_overrides must be a dict")
     if cfg.reward.overlap_policy not in {"any_overlap", "majority_overlap"}:
         raise ValueError("reward.overlap_policy must be any_overlap or majority_overlap")
     if cfg.reward.span_combine_policy not in {"sum", "min", "max"}:

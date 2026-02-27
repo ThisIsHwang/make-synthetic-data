@@ -59,6 +59,14 @@ def evaluate_on_dataset(
     gen_cfg.num_samples_per_prompt = 1
     gen_cfg.do_sample = False
     gen_cfg.temperature = 0.0
+    eval_overrides = dict(getattr(cfg.eval, "generation_overrides", {}) or {})
+    if eval_overrides:
+        for key, value in eval_overrides.items():
+            if hasattr(gen_cfg, key):
+                setattr(gen_cfg, key, value)
+            else:
+                logger.warning("Ignoring unknown eval.generation_overrides key: %s", key)
+        logger.info("evaluate_on_dataset: applied eval generation overrides: %s", eval_overrides)
 
     rollouts = generate_rollouts(
         examples=examples,
