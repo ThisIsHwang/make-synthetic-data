@@ -13,9 +13,16 @@ except Exception:  # pragma: no cover - optional during lightweight tests
 
 try:
     from transformers import PreTrainedModel, PreTrainedTokenizerBase
+    from transformers.generation.logits_process import LogitsProcessor, LogitsProcessorList
 except Exception:  # pragma: no cover - optional during lightweight tests
     PreTrainedModel = Any  # type: ignore[assignment,misc]
     PreTrainedTokenizerBase = Any  # type: ignore[assignment,misc]
+
+    class LogitsProcessor:  # type: ignore[no-redef]
+        pass
+
+    class LogitsProcessorList(list):  # type: ignore[no-redef]
+        pass
 
 from .config import GenerationConfig
 from .prompting import (
@@ -137,6 +144,56 @@ def _trim_completion_ids(ids: list[int], eos_token_ids: list[int], pad_token_id:
             break
         out.append(int(token_id))
     return out
+
+
+class _PresenceFrequencyPenaltyLogitsProcessor(LogitsProcessor):
+    def __init__(self, *, start_index: int, presence_penalty: float, frequency_penalty: float) -> None:
+        self.start_index = max(0, int(start_index))
+        self.presence_penalty = float(presence_penalty)
+        self.frequency_penalty = float(frequency_penalty)
+
+    def __call__(self, input_ids: Any, scores: Any) -> Any:  # transformers runtime signature
+        if self.presence_penalty == 0.0 and self.frequency_penalty == 0.0:
+            return scores
+        if not torch.is_tensor(input_ids) or not torch.is_tensor(scores):  # pragma: no cover - defensive
+            return scores
+        if input_ids.dim() != 2 or scores.dim() != 2:  # pragma: no cover - defensive
+            return scores
+
+        seq_len = int(input_ids.shape[1])
+        if seq_len <= self.start_index:
+            return scores
+
+        for row_idx in range(int(input_ids.shape[0])):
+            generated_ids = input_ids[row_idx, self.start_index:]
+            if generated_ids.numel() == 0:
+                continue
+            unique_ids, counts = torch.unique(generated_ids, return_counts=True)
+            if unique_ids.numel() == 0:
+                continue
+            if self.presence_penalty != 0.0:
+                scores[row_idx, unique_ids] = scores[row_idx, unique_ids] - self.presence_penalty
+            if self.frequency_penalty != 0.0:
+                scores[row_idx, unique_ids] = (
+                    scores[row_idx, unique_ids] - self.frequency_penalty * counts.to(dtype=scores.dtype)
+                )
+        return scores
+
+
+def _build_custom_logits_processors(gen_cfg: GenerationConfig, *, start_index: int) -> LogitsProcessorList | None:
+    presence_penalty = float(getattr(gen_cfg, "presence_penalty", 0.0) or 0.0)
+    frequency_penalty = float(getattr(gen_cfg, "frequency_penalty", 0.0) or 0.0)
+    if presence_penalty == 0.0 and frequency_penalty == 0.0:
+        return None
+    processors = LogitsProcessorList()
+    processors.append(
+        _PresenceFrequencyPenaltyLogitsProcessor(
+            start_index=start_index,
+            presence_penalty=presence_penalty,
+            frequency_penalty=frequency_penalty,
+        )
+    )
+    return processors
 
 
 def compute_completion_logprobs(
@@ -300,6 +357,7 @@ def generate_rollouts(
         prompt_id_rows.append([int(tok) for tok in input_ids_cpu[i][keep].tolist()])
 
     do_sample = bool(gen_cfg.do_sample and gen_cfg.temperature > 0)
+    logits_processor = _build_custom_logits_processors(gen_cfg, start_index=input_width)
     with torch.no_grad():
         generated = policy_model.generate(
             input_ids=input_ids,
@@ -313,6 +371,7 @@ def generate_rollouts(
             num_return_sequences=gen_cfg.num_samples_per_prompt,
             pad_token_id=pad_token_id,
             eos_token_id=eos_for_generate,
+            logits_processor=logits_processor,
         )
 
     sequences = generated if isinstance(generated, torch.Tensor) else generated.sequences

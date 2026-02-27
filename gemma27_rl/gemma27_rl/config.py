@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+import math
 from pathlib import Path
 from typing import Any
 
@@ -85,6 +86,9 @@ class GenerationConfig:
     num_samples_per_prompt: int = 2
     do_sample: bool = True
     repetition_penalty: float = 1.0
+    # OpenAI-style repetition controls (applied via custom logits processor).
+    presence_penalty: float = 0.0
+    frequency_penalty: float = 0.0
     chat_template_kwargs: dict[str, Any] = field(default_factory=lambda: {"enable_thinking": False})
 
 
@@ -336,6 +340,16 @@ def _validate_config(cfg: RLPostTrainConfig) -> None:
             raise FileNotFoundError(f"data.eval_file not found: {cfg.data.eval_file}")
     if cfg.generation.num_samples_per_prompt <= 0:
         raise ValueError("generation.num_samples_per_prompt must be > 0")
+    for field_name, raw in (
+        ("generation.presence_penalty", cfg.generation.presence_penalty),
+        ("generation.frequency_penalty", cfg.generation.frequency_penalty),
+    ):
+        try:
+            value = float(raw)
+        except Exception as exc:
+            raise ValueError(f"{field_name} must be a float.") from exc
+        if not math.isfinite(value):
+            raise ValueError(f"{field_name} must be finite.")
     if cfg.rl.batch_size <= 0:
         raise ValueError("rl.batch_size must be > 0")
     if cfg.rl.grad_accum <= 0:
