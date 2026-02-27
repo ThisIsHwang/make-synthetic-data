@@ -6,8 +6,11 @@ import math
 import os
 from pathlib import Path
 import random
+import select
 import shutil
 from statistics import mean
+import subprocess
+import sys
 from typing import Any
 
 import torch
@@ -175,6 +178,131 @@ def _deepspeed_initialize(
     return engine, optimizer
 
 
+def _dtype_to_config_name(dtype: Any, fallback: str) -> str:
+    if dtype is None:
+        return fallback
+    if dtype == torch.float16:
+        return "float16"
+    if dtype == torch.bfloat16:
+        return "bfloat16"
+    if dtype == torch.float32:
+        return "float32"
+    return fallback
+
+
+class ReferenceLogprobClient:
+    def __init__(
+        self,
+        *,
+        python_executable: str,
+        timeout_sec: float,
+        config_payload: dict[str, Any],
+        env_overrides: dict[str, str] | None = None,
+    ) -> None:
+        self._timeout_sec = float(timeout_sec)
+        worker_script = Path(__file__).resolve().with_name("reference_worker.py")
+        if not worker_script.exists():
+            raise FileNotFoundError(f"reference worker script not found: {worker_script}")
+
+        env = dict(os.environ)
+        for key in ("LOCAL_RANK", "RANK", "WORLD_SIZE", "MASTER_ADDR", "MASTER_PORT"):
+            env.pop(key, None)
+        if env_overrides:
+            for key, value in env_overrides.items():
+                env[str(key)] = str(value)
+
+        cmd = [python_executable, str(worker_script)]
+        try:
+            self._proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=None,
+                text=True,
+                bufsize=1,
+                env=env,
+            )
+        except Exception as exc:
+            raise RuntimeError(f"Failed to start reference worker: cmd={cmd}") from exc
+
+        try:
+            init_resp = self.request({"type": "init", "config": config_payload})
+        except Exception:
+            self.close()
+            raise
+        if not bool(init_resp.get("ok", False)):
+            self.close()
+            raise RuntimeError(f"reference worker init failed: {init_resp.get('error', 'unknown error')}")
+
+    def _assert_alive(self) -> None:
+        if self._proc.poll() is not None:
+            raise RuntimeError(f"reference worker exited unexpectedly with code={self._proc.returncode}")
+
+    def request(self, payload: dict[str, Any]) -> dict[str, Any]:
+        self._assert_alive()
+        assert self._proc.stdin is not None
+        assert self._proc.stdout is not None
+
+        try:
+            self._proc.stdin.write(json.dumps(payload, ensure_ascii=False) + "\n")
+            self._proc.stdin.flush()
+        except Exception as exc:
+            raise RuntimeError("Failed to send request to reference worker.") from exc
+
+        ready, _, _ = select.select([self._proc.stdout], [], [], self._timeout_sec)
+        if not ready:
+            raise TimeoutError(f"reference worker timed out after {self._timeout_sec}s")
+
+        line = self._proc.stdout.readline()
+        if not line:
+            self._assert_alive()
+            raise RuntimeError("reference worker returned empty response")
+        try:
+            resp = json.loads(line)
+        except Exception as exc:
+            raise RuntimeError(f"Invalid JSON response from reference worker: {line[:200]!r}") from exc
+        if not isinstance(resp, dict):
+            raise RuntimeError(f"Unexpected reference worker response type: {type(resp)!r}")
+        return resp
+
+    def score_logprobs(self, prompt_ids: list[int], completion_ids: list[int]) -> list[float]:
+        resp = self.request(
+            {
+                "type": "score",
+                "prompt_ids": [int(v) for v in prompt_ids],
+                "completion_ids": [int(v) for v in completion_ids],
+            }
+        )
+        if not bool(resp.get("ok", False)):
+            raise RuntimeError(f"reference worker score failed: {resp.get('error', 'unknown error')}")
+        return [float(v) for v in list(resp.get("logprobs", []))]
+
+    def close(self) -> None:
+        if getattr(self, "_proc", None) is None:
+            return
+        proc = self._proc
+        if proc.poll() is None:
+            try:
+                self.request({"type": "close"})
+            except Exception:
+                pass
+            try:
+                proc.terminate()
+                proc.wait(timeout=2)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        self._proc = None  # type: ignore[assignment]
+
+    def __del__(self) -> None:  # pragma: no cover - best-effort cleanup
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
 def _unwrap_for_generation(model: Any) -> Any:
     module = getattr(model, "module", None)
     return module if module is not None else model
@@ -191,6 +319,129 @@ def _parse_cuda_index(device: str | None) -> int | None:
         if idx_text.isdigit():
             return int(idx_text)
     return None
+
+
+def _parse_cuda_visible_devices_env() -> list[int] | None:
+    raw = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if raw is None:
+        return None
+    text = raw.strip()
+    if not text:
+        return None
+    values: list[int] = []
+    for part in text.split(","):
+        token = part.strip()
+        if not token:
+            continue
+        if not token.isdigit():
+            return None
+        values.append(int(token))
+    return values if values else None
+
+
+def _get_rank_gpu_mapping_entry(policy_gpu_ids: list[int]) -> dict[str, Any]:
+    local_rank_raw = os.environ.get("LOCAL_RANK")
+    local_rank = int(local_rank_raw) if local_rank_raw and local_rank_raw.isdigit() else None
+    visible = _parse_cuda_visible_devices_env()
+
+    physical_gpu: int | None = None
+    if local_rank is not None:
+        if visible is not None and 0 <= local_rank < len(visible):
+            physical_gpu = int(visible[local_rank])
+        elif visible is None:
+            physical_gpu = int(local_rank)
+    elif len(policy_gpu_ids) == 1 and _distributed_world_size() == 1:
+        physical_gpu = int(policy_gpu_ids[0])
+
+    return {
+        "rank": _distributed_rank(),
+        "local_rank": local_rank,
+        "physical_gpu": physical_gpu,
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+    }
+
+
+def _deepspeed_launch_hint(policy_gpu_ids: list[int]) -> str:
+    csv = ",".join(str(i) for i in policy_gpu_ids)
+    return (
+        "deepspeed --include localhost:"
+        f"{csv} <python_or_entrypoint> --config <config_path>"
+    )
+
+
+def _validate_deepspeed_partition_strict(cfg: RLPostTrainConfig) -> None:
+    if cfg.rl.backend != "deepspeed":
+        return
+
+    policy_gpu_ids = _normalize_gpu_id_list(cfg.model.policy_gpu_ids)
+    if not policy_gpu_ids:
+        raise RuntimeError(
+            "DeepSpeed strict mode requires model.policy_gpu_ids. "
+            "Set explicit policy GPU ids and launch with matching --include. "
+            f"Example: {_deepspeed_launch_hint([0, 1, 2, 3])}"
+        )
+
+    world_size = _distributed_world_size()
+    if world_size != len(policy_gpu_ids):
+        raise RuntimeError(
+            "DeepSpeed strict mode requires WORLD_SIZE == len(model.policy_gpu_ids). "
+            f"world_size={world_size} policy_gpu_ids={policy_gpu_ids}. "
+            f"Example: {_deepspeed_launch_hint(policy_gpu_ids)}"
+        )
+
+    reference_gpu_ids = _normalize_gpu_id_list(cfg.model.reference_gpu_ids)
+    policy_set = set(policy_gpu_ids)
+    reserved_map: dict[str, int] = {}
+    if reference_gpu_ids:
+        reserved_map["reference"] = int(reference_gpu_ids[0])
+    if cfg.reward.metricx.enabled:
+        metricx_idx = _parse_cuda_index(cfg.reward.metricx.device)
+        if metricx_idx is not None:
+            reserved_map["metricx"] = metricx_idx
+    if cfg.reward.xcomet.enabled:
+        xcomet_idx = _parse_cuda_index(cfg.reward.xcomet.device)
+        if xcomet_idx is not None:
+            reserved_map["xcomet"] = xcomet_idx
+
+    overlap = sorted(policy_set & set(reserved_map.values()))
+    if overlap:
+        raise RuntimeError(
+            "policy_gpu_ids must not overlap reserved reward/reference GPUs. "
+            f"policy={sorted(policy_set)} reserved={reserved_map} overlap={overlap}"
+        )
+
+    local_entry = _get_rank_gpu_mapping_entry(policy_gpu_ids)
+    gathered: list[Any] = [local_entry]
+    if _is_distributed_initialized() and world_size > 1:
+        gathered = [None for _ in range(world_size)]
+        torch.distributed.all_gather_object(gathered, local_entry)
+
+    entries: list[dict[str, Any]] = [e for e in gathered if isinstance(e, dict)]
+    entries.sort(key=lambda x: int(x.get("rank", 0)))
+    unresolved = [e for e in entries if not isinstance(e.get("physical_gpu"), int)]
+    if unresolved:
+        raise RuntimeError(
+            "Could not resolve physical GPU id for one or more DeepSpeed ranks. "
+            f"entries={entries}. Ensure LOCAL_RANK and CUDA_VISIBLE_DEVICES are set correctly. "
+            f"Example: {_deepspeed_launch_hint(policy_gpu_ids)}"
+        )
+
+    actual_policy = sorted({int(e["physical_gpu"]) for e in entries})
+    expected_policy = sorted(policy_gpu_ids)
+    if actual_policy != expected_policy:
+        raise RuntimeError(
+            "DeepSpeed strict policy partition mismatch. "
+            f"expected_policy={expected_policy} actual_policy={actual_policy} entries={entries}. "
+            f"Launch with explicit include. Example: {_deepspeed_launch_hint(expected_policy)}"
+        )
+
+    if _is_rank0():
+        logger.info(
+            "DeepSpeed strict GPU mapping: policy=%s reserved=%s rank_mapping=%s",
+            expected_policy,
+            reserved_map,
+            [{k: v for k, v in e.items() if k in {'rank', 'local_rank', 'physical_gpu'}} for e in entries],
+        )
 
 
 def _normalize_gpu_id_list(raw_ids: list[int] | None) -> list[int]:
@@ -666,6 +917,55 @@ def _load_reference_model(cfg: RLPostTrainConfig, default_device: str) -> tuple[
     for p in model.parameters():
         p.requires_grad = False
     return model, ref_device
+
+
+def _create_reference_logprob_client(
+    cfg: RLPostTrainConfig,
+    default_device: str,
+) -> tuple[ReferenceLogprobClient | None, str | None]:
+    if cfg.rl.kl_coef <= 0:
+        return None, None
+
+    ref_name = cfg.model.reference_name_or_path or cfg.model.policy_name_or_path
+    if cfg.model.reference_runtime == "cpu":
+        requested_device = "cpu"
+    else:
+        reference_gpu_ids = _normalize_gpu_id_list(cfg.model.reference_gpu_ids)
+        if reference_gpu_ids:
+            requested_device = resolve_device(f"cuda:{reference_gpu_ids[0]}")
+        else:
+            requested_device = resolve_device(cfg.model.reference_device or default_device)
+
+    dtype, attn_impl = _resolve_model_dtype_and_attn(cfg, requested_device)
+    worker_device = requested_device
+    worker_env_overrides: dict[str, str] | None = None
+    reference_gpu_idx = _parse_cuda_index(requested_device)
+    if reference_gpu_idx is not None:
+        worker_env_overrides = {"CUDA_VISIBLE_DEVICES": str(reference_gpu_idx)}
+        worker_device = "cuda:0"
+
+    cfg_payload: dict[str, Any] = {
+        "model_name_or_path": ref_name,
+        "trust_remote_code": bool(cfg.model.trust_remote_code),
+        "dtype": _dtype_to_config_name(dtype, str(cfg.misc.dtype)),
+        "attn_implementation": attn_impl,
+        "device": worker_device,
+    }
+    python_executable = cfg.model.reference_python_executable or sys.executable
+    client = ReferenceLogprobClient(
+        python_executable=python_executable,
+        timeout_sec=float(cfg.model.reference_subprocess_timeout_sec),
+        config_payload=cfg_payload,
+        env_overrides=worker_env_overrides,
+    )
+    logger.info(
+        "Reference worker started with python=%s requested_device=%s worker_device=%s model=%s",
+        python_executable,
+        requested_device,
+        worker_device,
+        ref_name,
+    )
+    return client, requested_device
 
 
 def _sample_batch(examples: list, batch_size: int, rng: random.Random) -> list:
@@ -1169,6 +1469,8 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
                 "rl.backend=deepspeed but deepspeed is not installed. Install it first."
             )
         deepspeed.init_distributed()
+    if use_deepspeed:
+        _validate_deepspeed_partition_strict(cfg)
 
     base_device = resolve_device(cfg.misc.device)
     if use_deepspeed:
@@ -1235,8 +1537,15 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
 
     ref_model: AutoModelForCausalLM | None = None
     ref_device: str | None = None
+    ref_logprob_client: ReferenceLogprobClient | None = None
     if (not use_deepspeed) or rank0:
-        ref_model, ref_device = _load_reference_model(cfg, default_device=device)
+        reference_runtime = str(cfg.model.reference_runtime or "worker").strip().lower()
+        if reference_runtime == "worker":
+            ref_logprob_client, ref_device = _create_reference_logprob_client(cfg, default_device=device)
+        elif reference_runtime == "cpu":
+            ref_model, ref_device = _load_reference_model(cfg, default_device="cpu")
+        else:
+            ref_model, ref_device = _load_reference_model(cfg, default_device=device)
 
     train_examples = load_examples(cfg.data, split="train", limit=cfg.data.limit)
     if not train_examples:
@@ -1435,6 +1744,11 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
                 device=device,
                 ref_model=ref_model,
                 ref_device=ref_device,
+                ref_logprob_fn=(
+                    ref_logprob_client.score_logprobs
+                    if ref_logprob_client is not None
+                    else None
+                ),
                 prompt_template=cfg.prompt.template,
             )
             if rollouts:
@@ -1629,6 +1943,9 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
         if cfg.logging.save_eval_outputs:
             artifacts["eval_output_path"] = str(eval_output_path)
     _dist_barrier()
+
+    if ref_logprob_client is not None:
+        ref_logprob_client.close()
 
     if use_deepspeed and (not rank0):
         return {

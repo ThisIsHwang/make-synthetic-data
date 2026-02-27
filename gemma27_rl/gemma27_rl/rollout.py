@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import logging
-from typing import Any
+from typing import Any, Callable
 
 try:
     import torch
@@ -187,6 +187,7 @@ def generate_rollouts(
     device: str,
     ref_model: PreTrainedModel | None = None,
     ref_device: str | None = None,
+    ref_logprob_fn: Callable[[list[int], list[int]], list[float]] | None = None,
     prompt_template: str | None = None,
 ) -> list[Rollout]:
     _require_torch()
@@ -340,7 +341,9 @@ def generate_rollouts(
 
         old_lp = compute_completion_logprobs(policy_model, prompt_ids, completion_ids, device=device).tolist()
         ref_lp = None
-        if ref_model is not None:
+        if ref_logprob_fn is not None:
+            ref_lp = [float(v) for v in ref_logprob_fn(prompt_ids, completion_ids)]
+        elif ref_model is not None:
             ref_lp = compute_completion_logprobs(ref_model, prompt_ids, completion_ids, device=ref_dev).tolist()
 
         offsets = compute_token_char_offsets(

@@ -100,6 +100,22 @@ DeepSpeed 학습(예: 8 GPU):
 deepspeed --num_gpus 8 .venv_train/bin/gemma27_rl --config configs/qwen35_mqm/train_wmt24pp_enko_qwen35_27b_mqm_scale8gpu.yaml
 ```
 
+원격 서버에서 FlashAttention ABI 에러가 날 때(권장 복구):
+
+```bash
+# flash_attn_2_cuda.so undefined symbol 류 에러 복구
+VENV_BIN=/abs/path/to/.venv_train/bin ./scripts/fix_flash_attn_abi.sh
+```
+
+venv 일치 강제 실행(DeepSpeed launcher/entrypoint/python 모두 동일 venv):
+
+```bash
+VENV_BIN=/abs/path/to/.venv_train/bin \
+INCLUDE=localhost:0,1,2,3,4,5,6,7 \
+CONFIG=configs/qwen35_mqm/train_wmt24pp_enko_qwen35_27b_mqm_scale8gpu.yaml \
+./scripts/run_deepspeed_from_venv.sh
+```
+
 평가만:
 
 ```bash

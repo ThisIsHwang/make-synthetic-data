@@ -40,6 +40,7 @@ class _ScorerSubprocessClient:
         python_executable: str,
         timeout_sec: float,
         config_payload: dict[str, Any],
+        env_overrides: dict[str, str] | None = None,
     ) -> None:
         self._backend = backend
         self._timeout_sec = float(timeout_sec)
@@ -48,6 +49,13 @@ class _ScorerSubprocessClient:
             raise FileNotFoundError(f"scorer worker script not found: {worker_script}")
 
         cmd = [python_executable, str(worker_script), "--backend", backend]
+        worker_env = dict(os.environ)
+        for key in ("LOCAL_RANK", "RANK", "WORLD_SIZE", "MASTER_ADDR", "MASTER_PORT"):
+            worker_env.pop(key, None)
+        if env_overrides:
+            for key, value in env_overrides.items():
+                worker_env[str(key)] = str(value)
+
         try:
             self._proc = subprocess.Popen(
                 cmd,
@@ -56,6 +64,7 @@ class _ScorerSubprocessClient:
                 stderr=None,
                 text=True,
                 bufsize=1,
+                env=worker_env,
             )
         except Exception as exc:
             raise RuntimeError(f"Failed to start {backend} scorer worker: cmd={cmd}") from exc
@@ -133,6 +142,17 @@ class _ScorerSubprocessClient:
             self.close()
         except Exception:
             pass
+
+
+def _parse_cuda_device_index(device: str | None) -> int | None:
+    if device is None:
+        return None
+    text = str(device).strip().lower()
+    if text.startswith("cuda:"):
+        suffix = text.split(":", 1)[1].strip()
+        if suffix.isdigit():
+            return int(suffix)
+    return None
 
 
 # NOTE: GEMBA-MQM prompts and few-shots below are copied from:
@@ -451,12 +471,18 @@ class MetricXQEScorer:
             return
 
         if self.cfg.python_executable:
+            worker_cfg_device = self.cfg.device
+            worker_env_overrides: dict[str, str] | None = None
+            metricx_gpu_idx = _parse_cuda_device_index(self.cfg.device)
+            if metricx_gpu_idx is not None:
+                worker_env_overrides = {"CUDA_VISIBLE_DEVICES": str(metricx_gpu_idx)}
+                worker_cfg_device = "cuda:0"
             cfg_payload = {
                 "model_name": self.cfg.model_name,
                 "tokenizer_name": self.cfg.tokenizer_name,
                 "use_reference": bool(self.cfg.use_reference),
                 "batch_size": int(self.cfg.batch_size),
-                "device": self.cfg.device,
+                "device": worker_cfg_device,
                 "dtype": self.cfg.dtype,
                 "max_input_length": int(self.cfg.max_input_length),
                 "overflow_policy": self.cfg.overflow_policy,
@@ -466,11 +492,13 @@ class MetricXQEScorer:
                 python_executable=self.cfg.python_executable,
                 timeout_sec=float(self.cfg.subprocess_timeout_sec),
                 config_payload=cfg_payload,
+                env_overrides=worker_env_overrides,
             )
             logger.info(
-                "MetricX scorer will run in external python=%s (device=%s).",
+                "MetricX scorer will run in external python=%s (requested_device=%s worker_device=%s).",
                 self.cfg.python_executable,
                 self.cfg.device,
+                worker_cfg_device,
             )
             return
 
@@ -858,10 +886,16 @@ class XCometXLScorer:
             return
 
         if self.cfg.python_executable:
+            worker_cfg_device = self.cfg.device
+            worker_env_overrides: dict[str, str] | None = None
+            xcomet_gpu_idx = _parse_cuda_device_index(self.cfg.device)
+            if xcomet_gpu_idx is not None:
+                worker_env_overrides = {"CUDA_VISIBLE_DEVICES": str(xcomet_gpu_idx)}
+                worker_cfg_device = "cuda:0"
             cfg_payload = {
                 "model_name": self.cfg.model_name,
                 "batch_size": int(self.cfg.batch_size),
-                "device": self.cfg.device,
+                "device": worker_cfg_device,
                 "use_reference": bool(self.cfg.use_reference),
             }
             self._worker = _ScorerSubprocessClient(
@@ -869,11 +903,13 @@ class XCometXLScorer:
                 python_executable=self.cfg.python_executable,
                 timeout_sec=float(self.cfg.subprocess_timeout_sec),
                 config_payload=cfg_payload,
+                env_overrides=worker_env_overrides,
             )
             logger.info(
-                "xCOMET scorer will run in external python=%s (device=%s).",
+                "xCOMET scorer will run in external python=%s (requested_device=%s worker_device=%s).",
                 self.cfg.python_executable,
                 self.cfg.device,
+                worker_cfg_device,
             )
             return
 

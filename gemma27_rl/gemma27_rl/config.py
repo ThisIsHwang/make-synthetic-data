@@ -20,6 +20,9 @@ class ModelConfig:
     reference_device: str | None = None
     policy_gpu_ids: list[int] = field(default_factory=list)
     reference_gpu_ids: list[int] = field(default_factory=list)
+    reference_runtime: str = "worker"  # worker|in_process|cpu
+    reference_python_executable: str | None = None
+    reference_subprocess_timeout_sec: float = 600.0
 
 
 @dataclass
@@ -334,6 +337,10 @@ def _validate_config(cfg: RLPostTrainConfig) -> None:
         raise ValueError("rl.algorithm must be one of: grpo, reinforce")
     if cfg.rl.backend not in {"native", "deepspeed"}:
         raise ValueError("rl.backend must be native|deepspeed")
+    if cfg.model.reference_runtime not in {"worker", "in_process", "cpu"}:
+        raise ValueError("model.reference_runtime must be worker|in_process|cpu")
+    if float(cfg.model.reference_subprocess_timeout_sec) <= 0:
+        raise ValueError("model.reference_subprocess_timeout_sec must be > 0.")
     if int(cfg.rl.deepspeed_zero_stage) not in {0, 1, 2, 3}:
         raise ValueError("rl.deepspeed_zero_stage must be one of 0,1,2,3")
     if cfg.generation.chat_template_kwargs is not None and not isinstance(cfg.generation.chat_template_kwargs, dict):
@@ -349,6 +356,7 @@ def _validate_config(cfg: RLPostTrainConfig) -> None:
     for field_name, exe in (
         ("reward.metricx.python_executable", cfg.reward.metricx.python_executable),
         ("reward.xcomet.python_executable", cfg.reward.xcomet.python_executable),
+        ("model.reference_python_executable", cfg.model.reference_python_executable),
     ):
         if exe is None:
             continue
@@ -444,6 +452,7 @@ def load_config(path: str | Path) -> RLPostTrainConfig:
     cfg.rl.deepspeed_config_path = _resolve_optional_path(cfg.rl.deepspeed_config_path, base_dir)
     cfg.reward.metricx.python_executable = _resolve_command_or_path(cfg.reward.metricx.python_executable, base_dir)
     cfg.reward.xcomet.python_executable = _resolve_command_or_path(cfg.reward.xcomet.python_executable, base_dir)
+    cfg.model.reference_python_executable = _resolve_command_or_path(cfg.model.reference_python_executable, base_dir)
 
     _validate_config(cfg)
     return cfg
