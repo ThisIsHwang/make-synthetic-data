@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from qwen3_5_35b_a3b.config import (
+from qwen35_moe_rl.config import (
     DistributedConfig,
     RLConfig,
     RLPostTrainConfig,

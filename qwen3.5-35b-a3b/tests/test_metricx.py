@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import pytest
 
-from qwen3_5_35b_a3b.config import MetricXConfig
-from qwen3_5_35b_a3b.rewards import MetricXQEScorer, metricx_qe_input, metricx_score_to_reward
-from qwen3_5_35b_a3b.types import SampleForScoring
+from qwen35_moe_rl.config import MetricXConfig
+from qwen35_moe_rl.rewards import MetricXQEScorer, metricx_qe_input, metricx_score_to_reward
+from qwen35_moe_rl.types import SampleForScoring
 
 
 def test_metricx_qe_input_format() -> None:

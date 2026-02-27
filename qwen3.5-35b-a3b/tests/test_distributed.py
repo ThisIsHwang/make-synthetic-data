@@ -6,7 +6,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from qwen3_5_35b_a3b.types import DistributedContext
+from qwen35_moe_rl.types import DistributedContext
 
 
 def test_distributed_context_default_backward() -> None:

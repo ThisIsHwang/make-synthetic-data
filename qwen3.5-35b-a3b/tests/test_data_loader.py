@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from qwen3_5_35b_a3b.config import DataConfig
-from qwen3_5_35b_a3b.data import load_examples
+from qwen35_moe_rl.config import DataConfig
+from qwen35_moe_rl.data import load_examples
 
 
 def test_load_examples_from_hf_path(monkeypatch) -> None:
@@ -24,7 +24,7 @@ def test_load_examples_from_hf_path(monkeypatch) -> None:
         del kwargs
         return rows
 
-    monkeypatch.setattr("qwen3_5_35b_a3b.data._load_records_from_hf_dataset", fake_loader)
+    monkeypatch.setattr("qwen35_moe_rl.data._load_records_from_hf_dataset", fake_loader)
 
     cfg = DataConfig(
         train_file=None,

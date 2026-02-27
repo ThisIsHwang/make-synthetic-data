@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from qwen3_5_35b_a3b.rewards import spans_to_token_rewards
-from qwen3_5_35b_a3b.rollout import TokenDecodeConfig, compute_token_char_offsets
+from qwen35_moe_rl.rewards import spans_to_token_rewards
+from qwen35_moe_rl.rollout import TokenDecodeConfig, compute_token_char_offsets
 
 
 class FakeTokenizer:

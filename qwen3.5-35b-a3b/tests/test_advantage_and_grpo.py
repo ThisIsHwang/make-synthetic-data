@@ -8,14 +8,14 @@ import pytest
 torch = pytest.importorskip("torch")
 from torch import nn
 
-from qwen3_5_35b_a3b.advantage import (
+from qwen35_moe_rl.advantage import (
     build_sequence_level_advantages,
     normalize_advantages,
 )
-from qwen3_5_35b_a3b.config import RLConfig
-from qwen3_5_35b_a3b.grpo import update_policy
-from qwen3_5_35b_a3b.rollout import compute_completion_logprobs
-from qwen3_5_35b_a3b.types import Rollout
+from qwen35_moe_rl.config import RLConfig
+from qwen35_moe_rl.grpo import update_policy
+from qwen35_moe_rl.rollout import compute_completion_logprobs
+from qwen35_moe_rl.types import Rollout
 
 
 class TinyCausalLM(nn.Module):

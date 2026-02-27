@@ -24,7 +24,7 @@ test = [
 ]
 
 [project.scripts]
-qwen35_moe_rl = "qwen3.5-35b-a3b.cli:main"
+qwen35_moe_rl = "qwen35_moe_rl.cli:main"
 
 [tool.setuptools]
-packages = ["qwen3.5-35b-a3b"]
+packages = ["qwen35_moe_rl"]

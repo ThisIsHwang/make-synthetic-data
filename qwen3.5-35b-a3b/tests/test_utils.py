@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from qwen3_5_35b_a3b.utils import (
+from qwen35_moe_rl.utils import (
     all_reduce_scalar,
     get_rank,
     get_world_size,
