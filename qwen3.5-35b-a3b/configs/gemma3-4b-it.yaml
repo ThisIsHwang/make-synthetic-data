@@ -119,7 +119,7 @@ eval:
   run_before_train: true
 
 logging:
-  output_dir: /media/sdd3/grpo-wmt24pp-enko-gemma3-4b-it-8gpu
+  output_dir: ../outputs/grpo-wmt24pp-enko-gemma3-4b-it-8gpu
   jsonl_name: train_log.jsonl
   rollout_jsonl_name: train_rollouts.jsonl
   save_rollouts: true
@@ -131,7 +131,7 @@ misc:
   seed: 42
   device: cuda
   dtype: bfloat16
-  huggingface_cache_dir: /media/sdd3
+  huggingface_cache_dir: ../../../.cache/huggingface
   huggingface_token: null
   huggingface_token_env: HF_TOKEN
 
