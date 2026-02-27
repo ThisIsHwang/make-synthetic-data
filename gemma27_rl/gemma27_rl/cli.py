@@ -22,6 +22,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Gemma 27B GRPO post-training")
     parser.add_argument("--config", required=True, help="Path to YAML config")
     parser.add_argument("--eval-only", action="store_true", help="Run metric-only evaluation without training")
+    # Distributed launchers (deepspeed/torchrun) may inject this argument.
+    parser.add_argument("--local_rank", "--local-rank", type=int, default=-1, help=argparse.SUPPRESS)
     return parser
 
 
