@@ -14,14 +14,18 @@ from typing import Any, Callable
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 
+_TORCH_IMPORT_ERROR: Exception | None = None
 try:
     import torch
-except Exception:  # pragma: no cover - optional during lightweight tests
+except Exception as exc:  # pragma: no cover - optional during lightweight tests
+    _TORCH_IMPORT_ERROR = exc
     torch = None  # type: ignore[assignment]
 
+_TRANSFORMERS_IMPORT_ERROR: Exception | None = None
 try:
     from transformers import AutoTokenizer
-except Exception:  # pragma: no cover - optional during lightweight tests
+except Exception as exc:  # pragma: no cover - optional during lightweight tests
+    _TRANSFORMERS_IMPORT_ERROR = exc
     AutoTokenizer = None  # type: ignore[assignment]
 
 from .config import MQMConfig, MetricXConfig, XCometConfig
@@ -503,9 +507,18 @@ class MetricXQEScorer:
             return
 
         if torch is None or AutoTokenizer is None:
+            import_errors: list[str] = []
+            if _TORCH_IMPORT_ERROR is not None:
+                import_errors.append(f"torch import error: {type(_TORCH_IMPORT_ERROR).__name__}: {_TORCH_IMPORT_ERROR}")
+            if _TRANSFORMERS_IMPORT_ERROR is not None:
+                import_errors.append(
+                    "transformers import error: "
+                    f"{type(_TRANSFORMERS_IMPORT_ERROR).__name__}: {_TRANSFORMERS_IMPORT_ERROR}"
+                )
+            detail = f" ({'; '.join(import_errors)})" if import_errors else ""
             raise RuntimeError(
                 "MetricX model loading requires torch and transformers. "
-                "Use predict_fn for lightweight testing."
+                f"Use predict_fn for lightweight testing.{detail}"
             )
         try:
             from .metricx_model import MT5ForRegression
@@ -966,7 +979,10 @@ class XCometXLScorer:
         if self._model is None:
             raise RuntimeError("XCometXLScorer is not initialized with a model.")
         if torch is None:
-            raise RuntimeError("XCometXLScorer requires torch for model inference.")
+            detail = ""
+            if _TORCH_IMPORT_ERROR is not None:
+                detail = f" (torch import error: {type(_TORCH_IMPORT_ERROR).__name__}: {_TORCH_IMPORT_ERROR})"
+            raise RuntimeError(f"XCometXLScorer requires torch for model inference.{detail}")
 
         all_scores: list[float] = []
         all_spans: list[list[dict[str, Any]]] = []
