@@ -44,6 +44,11 @@ class _ScorerSubprocessClient:
             raise FileNotFoundError(f"scorer worker script not found: {worker_script}")
 
         cmd = [python_executable, str(worker_script), "--backend", backend]
+        # Remove CUDA_VISIBLE_DEVICES so the subprocess can see all GPUs.
+        # DeepSpeed/torchrun restricts visibility per worker, but scorer
+        # subprocesses need access to dedicated reward-model GPUs.
+        env = os.environ.copy()
+        env.pop("CUDA_VISIBLE_DEVICES", None)
         try:
             self._proc = subprocess.Popen(
                 cmd,
@@ -52,6 +57,7 @@ class _ScorerSubprocessClient:
                 stderr=None,
                 text=True,
                 bufsize=1,
+                env=env,
             )
         except Exception as exc:
             raise RuntimeError(f"Failed to start {backend} scorer worker: cmd={cmd}") from exc
