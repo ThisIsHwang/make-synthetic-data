@@ -1445,6 +1445,15 @@ def run_metric_only_eval(cfg: RLPostTrainConfig) -> dict[str, Any]:
 
     eval_limit = cfg.eval.eval_limit if cfg.eval.eval_limit is not None else cfg.data.eval_limit
     eval_examples = load_examples(cfg.data, split="eval", limit=eval_limit)
+    if eval_limit is not None and len(eval_examples) > int(eval_limit):
+        eval_examples = eval_examples[: int(eval_limit)]
+    logger.info(
+        "Prepared eval examples (metric-only): requested_limit=%s loaded=%s eval_file=%s hf_eval_split=%s",
+        eval_limit,
+        len(eval_examples),
+        cfg.data.eval_file,
+        cfg.data.hf_eval_split,
+    )
     if (
         cfg.data.hf_dataset_name
         and not cfg.data.eval_file
@@ -1588,6 +1597,15 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
 
     eval_limit = cfg.eval.eval_limit if cfg.eval.eval_limit is not None else cfg.data.eval_limit
     eval_examples = load_examples(cfg.data, split="eval", limit=eval_limit)
+    if eval_limit is not None and len(eval_examples) > int(eval_limit):
+        eval_examples = eval_examples[: int(eval_limit)]
+    logger.info(
+        "Prepared eval examples: requested_limit=%s loaded=%s eval_file=%s hf_eval_split=%s",
+        eval_limit,
+        len(eval_examples),
+        cfg.data.eval_file,
+        cfg.data.hf_eval_split,
+    )
     if (
         cfg.data.hf_dataset_name
         and not cfg.data.eval_file
