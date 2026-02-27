@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import math
@@ -491,6 +492,41 @@ def _init_ddp(
     return wrapped, dist_ctx
 
 
+def _fsdp_generation_context(
+    model: Any,
+    dist_ctx: DistributedContext | None,
+) -> contextlib.AbstractContextManager:
+    """Return a context manager that materializes FSDP params for generation.
+
+    ``model.generate()`` bypasses FSDP forward hooks (``__getattr__``
+    redirects to the underlying module, so ``self()`` inside generate()
+    calls the unwrapped forward directly).  ``summon_full_params`` forces
+    all parameters to be gathered before entering the block.
+
+    For non-FSDP backends (DDP, DeepSpeed) this is a no-op.
+    """
+    if dist_ctx is not None and dist_ctx.backend == "fsdp":
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+        return FSDP.summon_full_params(model, writeback=False)
+    return contextlib.nullcontext()
+
+
+def _fsdp_save_context(
+    model: Any,
+    dist_ctx: DistributedContext | None,
+) -> contextlib.AbstractContextManager:
+    """Return a context manager that materializes FSDP params for saving.
+
+    Uses ``rank0_only=True`` so only rank 0 gets the full parameters,
+    saving memory on other ranks.  All ranks must enter the context
+    (it is a collective operation).
+    """
+    if dist_ctx is not None and dist_ctx.backend == "fsdp":
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+        return FSDP.summon_full_params(model, writeback=False, rank0_only=True)
+    return contextlib.nullcontext()
+
+
 def _save_checkpoint_distributed(
     output_dir: Path,
     update_idx: int,
@@ -499,19 +535,26 @@ def _save_checkpoint_distributed(
     optimizer: torch.optim.Optimizer,
     dist_ctx: DistributedContext | None,
 ) -> Path:
-    """Save checkpoint with distributed awareness."""
+    """Save checkpoint with distributed awareness.
+
+    All ranks must call this function (FSDP/DeepSpeed require collective ops).
+    """
     ckpt_dir = output_dir / f"checkpoint-{update_idx}"
 
     if dist_ctx is not None and dist_ctx.deepspeed_engine is not None:
         dist_ctx.deepspeed_engine.save_checkpoint(str(output_dir), tag=f"checkpoint-{update_idx}")
         if is_main_process():
             tokenizer.save_pretrained(ckpt_dir)
-    elif is_main_process():
-        ckpt_dir.mkdir(parents=True, exist_ok=True)
-        unwrapped = model.module if hasattr(model, "module") else model
-        unwrapped.save_pretrained(ckpt_dir)
-        tokenizer.save_pretrained(ckpt_dir)
-        torch.save(optimizer.state_dict(), ckpt_dir / "optimizer.pt")
+    else:
+        # FSDP: summon_full_params gathers all sharded params (rank0_only saves memory).
+        # DDP/single: no-op context.
+        with _fsdp_save_context(model, dist_ctx):
+            if is_main_process():
+                ckpt_dir.mkdir(parents=True, exist_ok=True)
+                unwrapped = model.module if hasattr(model, "module") else model
+                unwrapped.save_pretrained(ckpt_dir)
+                tokenizer.save_pretrained(ckpt_dir)
+                torch.save(optimizer.state_dict(), ckpt_dir / "optimizer.pt")
 
     barrier()
     return ckpt_dir
@@ -523,7 +566,10 @@ def _save_model_only_distributed(
     tokenizer: Any,
     dist_ctx: DistributedContext | None,
 ) -> Path:
-    """Save model with distributed awareness (rank 0 only for DDP/FSDP)."""
+    """Save model with distributed awareness.
+
+    All ranks must call this function (FSDP/DeepSpeed require collective ops).
+    """
     if dist_ctx is not None and dist_ctx.deepspeed_engine is not None:
         if is_main_process():
             if save_dir.exists():
@@ -533,13 +579,15 @@ def _save_model_only_distributed(
         dist_ctx.deepspeed_engine.save_checkpoint(str(save_dir), tag="model")
         if is_main_process():
             tokenizer.save_pretrained(save_dir)
-    elif is_main_process():
-        if save_dir.exists():
-            shutil.rmtree(save_dir)
-        save_dir.mkdir(parents=True, exist_ok=True)
-        unwrapped = model.module if hasattr(model, "module") else model
-        unwrapped.save_pretrained(save_dir)
-        tokenizer.save_pretrained(save_dir)
+    else:
+        with _fsdp_save_context(model, dist_ctx):
+            if is_main_process():
+                if save_dir.exists():
+                    shutil.rmtree(save_dir)
+                save_dir.mkdir(parents=True, exist_ok=True)
+                unwrapped = model.module if hasattr(model, "module") else model
+                unwrapped.save_pretrained(save_dir)
+                tokenizer.save_pretrained(save_dir)
 
     barrier()
     return save_dir
@@ -1120,20 +1168,21 @@ def _run_training_loop(
     best_eval_update: int | None = None
 
     # ---- Pre-training evaluation ----
-    # All ranks must call evaluate_on_dataset so FSDP forward passes work
-    # (FSDP FULL_SHARD requires all ranks to participate in parameter all-gather).
+    # All ranks must call evaluate_on_dataset so FSDP collective ops work.
+    # summon_full_params materializes sharded params for generate().
     # Scorers are None on non-rank-0 → only rank 0 actually scores.
     if cfg.eval.run_before_train and eval_examples:
-        report = evaluate_on_dataset(
-            examples=eval_examples,
-            policy_model=policy_model,
-            tokenizer=tokenizer,
-            cfg=cfg,
-            device=device,
-            metricx_scorer=metricx_scorer,
-            xcomet_scorer=xcomet_scorer,
-            collect_outputs=cfg.logging.save_eval_outputs if rank0 else False,
-        )
+        with _fsdp_generation_context(policy_model, dist_ctx):
+            report = evaluate_on_dataset(
+                examples=eval_examples,
+                policy_model=policy_model,
+                tokenizer=tokenizer,
+                cfg=cfg,
+                device=device,
+                metricx_scorer=metricx_scorer,
+                xcomet_scorer=xcomet_scorer,
+                collect_outputs=cfg.logging.save_eval_outputs if rank0 else False,
+            )
         _should_save_best = False
         if rank0:
             eval_select_score = _compute_eval_selection_score(report, cfg)
@@ -1206,16 +1255,18 @@ def _run_training_loop(
         if dist_ctx is not None and dist_ctx.deepspeed_engine is not None:
             rollout_model = dist_ctx.deepspeed_engine.module
 
-        rollouts = generate_rollouts(
-            examples=batch_examples,
-            policy_model=rollout_model,
-            tokenizer=tokenizer,
-            gen_cfg=cfg.generation,
-            device=device,
-            ref_model=ref_model,
-            ref_device=ref_device,
-            prompt_template=cfg.prompt.template,
-        )
+        # summon_full_params materializes FSDP-sharded params for generate().
+        with _fsdp_generation_context(rollout_model, dist_ctx):
+            rollouts = generate_rollouts(
+                examples=batch_examples,
+                policy_model=rollout_model,
+                tokenizer=tokenizer,
+                gen_cfg=cfg.generation,
+                device=device,
+                ref_model=ref_model,
+                ref_device=ref_device,
+                prompt_template=cfg.prompt.template,
+            )
 
         # ---- Gather→Score→Scatter for reward computation ----
         # Each rank generates rollouts in parallel, but scorers (MetricX/xCOMET)
@@ -1363,16 +1414,17 @@ def _run_training_loop(
             if dist_ctx is not None and dist_ctx.deepspeed_engine is not None:
                 eval_model = dist_ctx.deepspeed_engine.module
 
-            report = evaluate_on_dataset(
-                examples=eval_examples,
-                policy_model=eval_model,
-                tokenizer=tokenizer,
-                cfg=cfg,
-                device=device,
-                metricx_scorer=metricx_scorer,
-                xcomet_scorer=xcomet_scorer,
-                collect_outputs=cfg.logging.save_eval_outputs if rank0 else False,
-            )
+            with _fsdp_generation_context(eval_model, dist_ctx):
+                report = evaluate_on_dataset(
+                    examples=eval_examples,
+                    policy_model=eval_model,
+                    tokenizer=tokenizer,
+                    cfg=cfg,
+                    device=device,
+                    metricx_scorer=metricx_scorer,
+                    xcomet_scorer=xcomet_scorer,
+                    collect_outputs=cfg.logging.save_eval_outputs if rank0 else False,
+                )
             _should_save_best = False
             if rank0:
                 eval_select_score = _compute_eval_selection_score(report, cfg)
@@ -1404,16 +1456,20 @@ def _run_training_loop(
 
     # ---- Save final model ----
     final_dir = output_dir / "final"
-    if is_main_process():
-        if final_dir.exists():
-            shutil.rmtree(final_dir)
-        if best_eval_update is not None and best_dir.exists():
-            shutil.copytree(best_dir, final_dir)
-        else:
-            final_dir.mkdir(parents=True, exist_ok=True)
-            unwrapped = policy_model.module if hasattr(policy_model, "module") else policy_model
-            unwrapped.save_pretrained(final_dir)
-            tokenizer.save_pretrained(final_dir)
+    # If best checkpoint exists, rank 0 copies it; otherwise save current model.
+    # FSDP needs summon_full_params for save_pretrained (params are sharded).
+    _need_save_final = best_eval_update is None or not best_dir.exists()
+    with _fsdp_save_context(policy_model, dist_ctx) if _need_save_final else contextlib.nullcontext():
+        if is_main_process():
+            if final_dir.exists():
+                shutil.rmtree(final_dir)
+            if not _need_save_final:
+                shutil.copytree(best_dir, final_dir)
+            else:
+                final_dir.mkdir(parents=True, exist_ok=True)
+                unwrapped = policy_model.module if hasattr(policy_model, "module") else policy_model
+                unwrapped.save_pretrained(final_dir)
+                tokenizer.save_pretrained(final_dir)
     if use_distributed:
         barrier()
 
