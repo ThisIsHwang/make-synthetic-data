@@ -154,6 +154,59 @@ class StabilityMonitorCallback(TrainerCallback):
             earlier = list(self.state.kl_history)[-10:-5]
             logs["stability/kl_trend"] = sum(recent) / 5 - sum(earlier) / 5
 
+        # --- Inject comprehensive stability metrics for W&B / TensorBoard ---
+        self._inject_metrics(logs, entropy, kl, reward_mean)
+
+    def _inject_metrics(
+        self,
+        logs: dict[str, Any],
+        entropy: float | None,
+        kl: float | None,
+        reward_mean: float | None,
+    ) -> None:
+        """Inject comprehensive stability metrics into the logs dict.
+
+        These metrics are picked up by TRL's logging pipeline and forwarded
+        to whatever ``report_to`` backends are configured (W&B, TensorBoard).
+
+        All keys use the ``stability/`` prefix for clean dashboard grouping.
+        """
+        # --- Current values (re-emit under stability/ prefix) ---
+        if entropy is not None:
+            logs["stability/entropy"] = float(entropy)
+        if kl is not None:
+            logs["stability/kl"] = float(kl)
+        if reward_mean is not None:
+            logs["stability/reward_mean"] = float(reward_mean)
+
+        # --- Rolling statistics from deque histories ---
+        if self.state.entropy_history:
+            vals = list(self.state.entropy_history)
+            logs["stability/entropy_rolling_mean"] = sum(vals) / len(vals)
+
+        if self.state.kl_history:
+            vals = list(self.state.kl_history)
+            logs["stability/kl_rolling_mean"] = sum(vals) / len(vals)
+
+        if self.state.reward_history:
+            vals = list(self.state.reward_history)
+            n = len(vals)
+            mean = sum(vals) / n
+            logs["stability/reward_rolling_mean"] = mean
+            if n >= 2:
+                variance = sum((v - mean) ** 2 for v in vals) / (n - 1)
+                logs["stability/reward_rolling_std"] = variance ** 0.5
+            else:
+                logs["stability/reward_rolling_std"] = 0.0
+
+        # --- Collapse indicators (int -> float for W&B compatibility) ---
+        logs["stability/consecutive_below_entropy_floor"] = float(
+            self.state.consecutive_below_entropy_floor
+        )
+        logs["stability/consecutive_above_kl_ceiling"] = float(
+            self.state.consecutive_above_kl_ceiling
+        )
+
     def on_step_end(
         self,
         args: TrainingArguments,

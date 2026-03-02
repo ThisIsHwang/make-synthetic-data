@@ -238,6 +238,130 @@ class TestStabilityMonitorCallback:
         # Should not raise.
         cb.on_log(args, state, control, logs=None)
 
+    # --- Comprehensive stability metric injection tests ---
+
+    def test_current_values_in_logs(self):
+        """Current entropy/kl/reward are re-emitted under stability/ prefix."""
+        cb = self._make_callback()
+        args, state, control = self._mock_args_state_control()
+
+        logs: dict = {"entropy": 2.5, "kl": 0.8, "reward": 3.0}
+        cb.on_log(args, state, control, logs=logs)
+
+        assert logs["stability/entropy"] == pytest.approx(2.5)
+        assert logs["stability/kl"] == pytest.approx(0.8)
+        assert logs["stability/reward_mean"] == pytest.approx(3.0)
+
+    def test_partial_metrics_no_keyerror(self):
+        """Only available metrics are emitted; missing ones don't cause KeyError."""
+        cb = self._make_callback()
+        args, state, control = self._mock_args_state_control()
+
+        logs: dict = {"entropy": 1.0}
+        cb.on_log(args, state, control, logs=logs)
+
+        assert "stability/entropy" in logs
+        assert "stability/kl" not in logs
+        assert "stability/reward_mean" not in logs
+
+    def test_rolling_statistics(self):
+        """Rolling mean and std are computed from deque histories."""
+        cb = self._make_callback()
+        args, state, control = self._mock_args_state_control()
+
+        values = [1.0, 2.0, 3.0, 4.0, 5.0]
+        logs: dict = {}
+        for val in values:
+            logs = {"entropy": val, "kl": val * 0.1, "reward": val}
+            cb.on_log(args, state, control, logs=logs)
+
+        # After 5 steps: entropy_history = [1,2,3,4,5], mean = 3.0
+        assert logs["stability/entropy_rolling_mean"] == pytest.approx(3.0)
+        assert logs["stability/kl_rolling_mean"] == pytest.approx(0.3)
+        assert logs["stability/reward_rolling_mean"] == pytest.approx(3.0)
+
+        # reward_rolling_std: sample std of [1,2,3,4,5]
+        # variance = sum((v-3)^2) / 4 = 10/4 = 2.5, std = sqrt(2.5)
+        assert logs["stability/reward_rolling_std"] == pytest.approx(2.5 ** 0.5)
+
+    def test_rolling_std_single_value(self):
+        """With only 1 data point, reward_rolling_std should be 0.0."""
+        cb = self._make_callback()
+        args, state, control = self._mock_args_state_control()
+
+        logs: dict = {"reward": 5.0}
+        cb.on_log(args, state, control, logs=logs)
+
+        assert logs["stability/reward_rolling_std"] == pytest.approx(0.0)
+
+    def test_collapse_indicators_always_present(self):
+        """Collapse counters are always in logs, even when 0."""
+        cb = self._make_callback()
+        args, state, control = self._mock_args_state_control()
+
+        logs: dict = {"entropy": 5.0}
+        cb.on_log(args, state, control, logs=logs)
+
+        assert logs["stability/consecutive_below_entropy_floor"] == pytest.approx(0.0)
+        assert logs["stability/consecutive_above_kl_ceiling"] == pytest.approx(0.0)
+
+    def test_collapse_indicators_increment(self):
+        """Collapse counters reflect actual violation counts and reset."""
+        cb = self._make_callback(entropy_floor=2.0, kl_ceiling=1.0)
+        args, state, control = self._mock_args_state_control()
+
+        # Step 1: entropy below floor, kl above ceiling.
+        logs: dict = {"entropy": 0.5, "kl": 5.0}
+        cb.on_log(args, state, control, logs=logs)
+        assert logs["stability/consecutive_below_entropy_floor"] == pytest.approx(1.0)
+        assert logs["stability/consecutive_above_kl_ceiling"] == pytest.approx(1.0)
+
+        # Step 2: same violations.
+        logs = {"entropy": 0.3, "kl": 8.0}
+        cb.on_log(args, state, control, logs=logs)
+        assert logs["stability/consecutive_below_entropy_floor"] == pytest.approx(2.0)
+        assert logs["stability/consecutive_above_kl_ceiling"] == pytest.approx(2.0)
+
+        # Step 3: entropy recovers, kl still high.
+        logs = {"entropy": 3.0, "kl": 6.0}
+        cb.on_log(args, state, control, logs=logs)
+        assert logs["stability/consecutive_below_entropy_floor"] == pytest.approx(0.0)
+        assert logs["stability/consecutive_above_kl_ceiling"] == pytest.approx(3.0)
+
+    def test_metrics_respect_monitoring_interval(self):
+        """New metrics should not be injected on non-monitoring steps."""
+        cb = self._make_callback(monitoring_interval=5)
+        args, state, control = self._mock_args_state_control()
+
+        # Step 1: not on interval.
+        state.global_step = 1
+        logs: dict = {"entropy": 1.0, "kl": 0.5, "reward": 2.0}
+        cb.on_log(args, state, control, logs=logs)
+        assert "stability/entropy" not in logs
+        assert "stability/consecutive_below_entropy_floor" not in logs
+
+        # Step 5: on interval.
+        state.global_step = 5
+        logs = {"entropy": 1.0, "kl": 0.5, "reward": 2.0}
+        cb.on_log(args, state, control, logs=logs)
+        assert "stability/entropy" in logs
+        assert "stability/consecutive_below_entropy_floor" in logs
+
+    def test_all_metrics_are_float(self):
+        """All injected stability metrics must be float for W&B/TensorBoard."""
+        cb = self._make_callback(entropy_floor=2.0, kl_ceiling=1.0)
+        args, state, control = self._mock_args_state_control()
+
+        for i in range(10):
+            logs: dict = {"entropy": float(i), "kl": float(i) * 0.1, "reward": float(i)}
+            cb.on_log(args, state, control, logs=logs)
+
+        stability_keys = [k for k in logs if k.startswith("stability/")]
+        # At least: 3 current + 3 rolling mean + 1 rolling std + 2 counters + 3 trends = 12
+        assert len(stability_keys) >= 9
+        for key in stability_keys:
+            assert isinstance(logs[key], float), f"{key} should be float, got {type(logs[key])}"
+
 
 # ---------------------------------------------------------------------------
 # Reward clipping tests
