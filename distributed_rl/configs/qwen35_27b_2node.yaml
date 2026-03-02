@@ -1,0 +1,164 @@
+# Qwen3.5-27B GRPO — 2-node × 8-GPU (16 GPUs total)
+# Remote LLM reward → 전용 reward GPU 불필요, 16 GPU 전부 학습에 사용
+#
+# Launch (node 0 — master):
+#   torchrun --nnodes=2 --nproc_per_node=8 --node_rank=0 \
+#       --master_addr=$MASTER_ADDR --master_port=29500 \
+#       -m distributed_rl --config configs/qwen35_27b_2node.yaml
+#
+# Launch (node 1):
+#   torchrun --nnodes=2 --nproc_per_node=8 --node_rank=1 \
+#       --master_addr=$MASTER_ADDR --master_port=29500 \
+#       -m distributed_rl --config configs/qwen35_27b_2node.yaml
+
+model:
+  policy_name_or_path: Qwen/Qwen3.5-27B
+  trust_remote_code: true
+  attn_implementation: flash_attention_2
+  gradient_checkpointing: true
+  gradient_checkpointing_kwargs:
+    use_reentrant: false
+
+data:
+  hf_dataset_name: google/wmt24pp
+  hf_dataset_config_name: en-ko_KR
+  hf_train_split: train
+  hf_eval_split: train
+  eval_limit: 32
+
+  id_field: segment_id
+  src_text_field: source
+  ref_text_field: target
+  src_lang_field: src_lang
+  tgt_lang_field: tgt_lang
+  src_lang_code_field: src_lang_code
+  tgt_lang_code_field: tgt_lang_code
+  is_bad_source_field: is_bad_source
+  skip_bad_source: true
+  default_src_lang: English
+  default_tgt_lang: Korean
+  default_src_lang_code: en
+  default_tgt_lang_code: ko
+
+prompt:
+  template: >-
+    You are a professional {source_lang} ({src_lang_code}) to {target_lang} ({tgt_lang_code})
+    translator. Your goal is to accurately convey the meaning and nuances of the original
+    {source_lang} text while adhering to {target_lang} grammar, vocabulary, and cultural
+    sensitivities. Produce only the {target_lang} translation, without any additional
+    explanations or commentary. Please translate the following {source_lang} text into
+    {target_lang}:\n\n{text}
+
+generation:
+  max_new_tokens: 256
+  temperature: 0.4
+  top_p: 0.95
+  top_k: 50
+  num_generations: 4
+  repetition_penalty: 1.0
+
+reward:
+  # MetricX (로컬) + Remote LLM Judge 합산
+  w_metricx: 1.0
+  w_xcomet: 0.0
+  w_remote_llm: 0.5
+
+  metricx:
+    enabled: false            # Remote reward만 사용 시 false로 변경
+  xcomet:
+    enabled: false
+
+  remote_llm:
+    enabled: true
+    mode: judge
+    base_url: "http://10.0.0.5:8000/v1"    # vLLM / TGI 서버 주소
+    api_key_env: REMOTE_LLM_REWARD_API_KEY
+    model: "Qwen/Qwen2.5-72B-Instruct"     # Judge로 쓸 모델
+
+    judge_system_message: >-
+      You are an expert English-to-Korean translation quality evaluator with
+      deep knowledge of both languages.  You assess translations along three
+      dimensions: (1) Accuracy — whether the meaning is faithfully preserved,
+      (2) Fluency — whether the Korean output is natural, idiomatic, and
+      grammatically correct, and (3) Adequacy — whether all information
+      (including nuance, tone, and register) is retained.  You are strict but
+      fair: penalize mistranslations, omissions, and unnatural phrasing, but
+      do not penalize stylistic choices that are equally valid.  Rate on a
+      scale from 0 to 10.
+
+    judge_prompt_template: >-
+      Evaluate the quality of the following English-to-Korean translation.
+
+
+      Source text: {src}
+
+      Translation: {mt}
+
+      Reference translation: {ref}
+
+
+      Assess the translation on:
+
+      1. Accuracy: Does it faithfully convey the source meaning?
+
+      2. Fluency: Is the Korean natural and grammatically correct?
+
+      3. Adequacy: Is all information (nuance, tone, register) preserved?
+
+
+      Provide a brief assessment (2-3 sentences), then give your final score.
+
+      You MUST end your response with exactly: Score: X
+
+      where X is a number from 0 to 10 (decimals allowed, e.g. Score: 7.5).
+
+    score_regex: "(?i)(?:score\\s*[:=]\\s*)([\\d]+(?:\\.[\\d]+)?)"
+    score_min: 0.0
+    score_max: 10.0
+
+    temperature: 0.0          # 일관성 있는 평가를 위해 deterministic
+    max_tokens: 512
+    max_concurrent_requests: 32   # 2-node 배치 크기에 맞춰 증가
+    request_timeout_sec: 120.0
+    fallback_score: 0.0
+    max_retries: 3
+
+training:
+  loss_type: grpo
+  beta: 0.01
+  epsilon: 0.2
+  scale_rewards: group
+  lr: 5.0e-7                 # 16 GPU 대규모 배치 → LR 낮춤
+  per_device_train_batch_size: 1    # 27B 모델, GPU당 1 prompt
+  gradient_accumulation_steps: 4    # Effective batch = 16 GPU × 1 × 4 = 64 prompts
+  max_grad_norm: 1.0
+  max_steps: 720
+  warmup_ratio: 0.03
+  save_steps: 200
+  eval_steps: 50
+  logging_steps: 1
+  # Dense model — MoE 설정 불필요
+  output_router_logits: false
+  router_aux_loss_coef: 0.0
+
+# MiniRL stability controls (arxiv 2512.01374)
+stability:
+  enable_monitoring: true
+  entropy_floor: 0.3
+  kl_ceiling: 15.0
+  reward_clip_value: 10.0
+  epsilon_high: 0.27
+  epsilon_low: 0.2
+
+distributed:
+  deepspeed: configs/deepspeed_zero2.json
+  nccl_timeout_minutes: 120     # Remote API 대기 시간 포함
+
+misc:
+  seed: 42
+  dtype: bfloat16
+  output_dir: ./outputs/qwen35-27b-grpo-2node
+  huggingface_cache_dir: /media/sdd3
+  huggingface_token_env: HF_TOKEN
+  report_to:
+    - wandb

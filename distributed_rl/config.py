@@ -296,11 +296,85 @@ class XCometConfig:
 
 
 @dataclass
+class RemoteLLMRewardConfig:
+    """Configuration for a remote LLM-based reward model.
+
+    Calls an OpenAI-compatible chat completion API to score translation
+    quality.  The remote server can be vLLM, TGI, or any OpenAI-compatible
+    endpoint.
+
+    Two modes:
+      - "judge": LLM-as-a-Judge.  Sends a prompt asking the LLM to rate
+        the translation, parses a numeric score from the text response.
+      - "scoring": Custom scoring endpoint.  The model returns a raw numeric
+        score directly (the full response content is parsed as a float).
+    """
+
+    enabled: bool = False  # Disabled by default; opt-in
+
+    # --- Connection ---
+    # OpenAI SDK base_url pointing to the remote server.
+    # Example: "http://10.0.0.5:8000/v1" for a vLLM server.
+    base_url: str = "http://localhost:8000/v1"
+
+    # API key: checked in this order:
+    #   1. api_key field (direct value)
+    #   2. Environment variable named by api_key_env
+    # Follows the same pattern as misc.huggingface_token / huggingface_token_env.
+    api_key: str | None = None
+    api_key_env: str = "REMOTE_LLM_REWARD_API_KEY"
+
+    # Model name passed to the OpenAI SDK.
+    # For vLLM this is the HF model ID, e.g. "Qwen/Qwen2.5-72B-Instruct".
+    model: str = "default"
+
+    # --- Mode ---
+    # "judge" = LLM-as-a-Judge with prompt template + score regex parsing.
+    # "scoring" = endpoint returns numeric score directly (no prompt/parsing).
+    mode: str = "judge"
+
+    # --- Judge mode settings ---
+    # Prompt template for judge mode.  Must contain {src} and {mt} placeholders.
+    # May optionally contain {ref} (filled with reference or "N/A").
+    # Empty string = use built-in default template.
+    judge_prompt_template: str = ""
+    judge_system_message: str = ""
+
+    # Regex to extract numeric score from judge response.
+    # Must contain one capture group matching a number.
+    score_regex: str = r"(?i)(?:score\s*[:=]\s*)([\d]+(?:\.[\d]+)?)"
+
+    # Expected score range for normalization to [0, 1]:
+    #   normalized = (raw - score_min) / (score_max - score_min)
+    score_min: float = 0.0
+    score_max: float = 10.0
+
+    # --- Generation parameters (judge mode) ---
+    temperature: float = 0.0   # Deterministic for consistent scoring
+    max_tokens: int = 256
+
+    # --- Concurrency ---
+    # Each sample = one API call.  Controls ThreadPoolExecutor parallelism.
+    max_concurrent_requests: int = 16
+
+    # Timeout per individual API request (seconds).
+    request_timeout_sec: float = 60.0
+
+    # --- Error handling ---
+    # Score returned when API call or score parsing fails.
+    fallback_score: float = 0.0
+
+    # Max retries per request (handled by OpenAI SDK's built-in retry).
+    max_retries: int = 2
+
+
+@dataclass
 class RewardConfig:
     """Reward model ensemble configuration.
 
     Multiple reward models can be combined via weighted sum:
       total_reward = w_metricx * metricx_reward + w_xcomet * xcomet_reward
+                   + w_remote_llm * remote_llm_reward
 
     TRL's GRPOTrainer accepts a list of ``reward_funcs``.  It calls each one
     and sums their outputs per completion.  The weights here are baked into
@@ -311,9 +385,11 @@ class RewardConfig:
     # removing the model config.
     w_metricx: float = 1.0
     w_xcomet: float = 0.0
+    w_remote_llm: float = 0.0
 
     metricx: MetricXConfig = field(default_factory=MetricXConfig)
     xcomet: XCometConfig = field(default_factory=XCometConfig)
+    remote_llm: RemoteLLMRewardConfig = field(default_factory=RemoteLLMRewardConfig)
 
 
 @dataclass
@@ -630,7 +706,9 @@ def _validate_config(cfg: DistributedRLConfig) -> None:
 
     # --- Reward ---
     # At least one reward model must be enabled, otherwise there's no signal to train on.
-    if not cfg.reward.metricx.enabled and not cfg.reward.xcomet.enabled:
+    if (not cfg.reward.metricx.enabled
+            and not cfg.reward.xcomet.enabled
+            and not cfg.reward.remote_llm.enabled):
         raise ValueError("At least one reward model must be enabled.")
 
     # MetricX and XComet need different GPUs because they both occupy significant VRAM.
@@ -649,6 +727,23 @@ def _validate_config(cfg: DistributedRLConfig) -> None:
             "Current zero_stage=%s; will be ignored.",
             cfg.distributed.zero_stage,
         )
+
+    # --- Remote LLM reward ---
+    if cfg.reward.remote_llm.enabled:
+        valid_remote_modes = {"judge", "scoring"}
+        if cfg.reward.remote_llm.mode not in valid_remote_modes:
+            raise ValueError(
+                f"reward.remote_llm.mode must be one of {valid_remote_modes}, "
+                f"got {cfg.reward.remote_llm.mode!r}"
+            )
+        if not cfg.reward.remote_llm.base_url.strip():
+            raise ValueError("reward.remote_llm.base_url must not be empty when enabled.")
+        if cfg.reward.remote_llm.score_max <= cfg.reward.remote_llm.score_min:
+            raise ValueError(
+                "reward.remote_llm.score_max must be greater than score_min."
+            )
+        if cfg.reward.remote_llm.max_concurrent_requests < 1:
+            raise ValueError("reward.remote_llm.max_concurrent_requests must be >= 1.")
 
     # --- Stability (MiniRL) ---
     valid_routing = {"none", "r2", "r3"}

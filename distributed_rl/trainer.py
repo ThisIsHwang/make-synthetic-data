@@ -97,6 +97,7 @@ from .distributed import (
 )
 from .rewards.base import make_trl_reward_func
 from .rewards.metricx import MetricXReward
+from .rewards.remote_llm import RemoteLLMReward
 from .rewards.xcomet import XCometReward
 
 logger = logging.getLogger(__name__)
@@ -332,6 +333,22 @@ def build_reward_funcs(cfg: DistributedRLConfig) -> list[Callable[..., list[floa
                 ref_column="ref_text",
                 weight=cfg.reward.w_xcomet,
                 offset=0.0,  # XComet: higher=better, no inversion needed
+                clip_value=cfg.stability.reward_clip_value,
+            )
+        else:
+            func = _dummy_reward_func
+        reward_funcs.append(func)
+
+    # --- Remote LLM reward ---
+    if cfg.reward.remote_llm.enabled:
+        if rank0:
+            remote_llm = RemoteLLMReward(cfg.reward.remote_llm)
+            func = make_trl_reward_func(
+                reward_model=remote_llm,
+                src_column="src_text",
+                ref_column="ref_text",
+                weight=cfg.reward.w_remote_llm,
+                offset=0.0,  # RemoteLLMReward: higher=better, normalized to [0,1]
                 clip_value=cfg.stability.reward_clip_value,
             )
         else:

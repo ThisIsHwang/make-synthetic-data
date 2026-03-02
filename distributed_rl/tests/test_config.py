@@ -104,6 +104,65 @@ class TestLoadConfig:
             load_config(cfg_path)
 
 
+class TestRemoteLLMRewardConfig:
+    def test_validation_rejects_invalid_mode(self, tmp_path: Path):
+        config_data = {
+            "data": {"hf_dataset_name": "test"},
+            "reward": {
+                "metricx": {"enabled": False},
+                "xcomet": {"enabled": False},
+                "remote_llm": {"enabled": True, "mode": "invalid"},
+            },
+        }
+        cfg_path = tmp_path / "bad_remote.yaml"
+        cfg_path.write_text(yaml.safe_dump(config_data))
+        with pytest.raises(ValueError, match="mode"):
+            load_config(cfg_path)
+
+    def test_remote_llm_as_only_reward(self, tmp_path: Path):
+        """Remote LLM alone should pass 'at least one reward' validation."""
+        config_data = {
+            "data": {"hf_dataset_name": "test"},
+            "reward": {
+                "metricx": {"enabled": False},
+                "xcomet": {"enabled": False},
+                "remote_llm": {
+                    "enabled": True,
+                    "mode": "judge",
+                    "base_url": "http://localhost:8000/v1",
+                },
+            },
+        }
+        cfg_path = tmp_path / "remote_only.yaml"
+        cfg_path.write_text(yaml.safe_dump(config_data))
+        cfg = load_config(cfg_path)
+        assert cfg.reward.remote_llm.enabled is True
+
+    def test_validation_rejects_bad_score_range(self, tmp_path: Path):
+        config_data = {
+            "data": {"hf_dataset_name": "test"},
+            "reward": {
+                "metricx": {"enabled": False},
+                "xcomet": {"enabled": False},
+                "remote_llm": {
+                    "enabled": True,
+                    "score_min": 10.0,
+                    "score_max": 5.0,
+                },
+            },
+        }
+        cfg_path = tmp_path / "bad_range.yaml"
+        cfg_path.write_text(yaml.safe_dump(config_data))
+        with pytest.raises(ValueError, match="score_max"):
+            load_config(cfg_path)
+
+    def test_default_disabled(self):
+        """RemoteLLMRewardConfig is disabled by default."""
+        cfg = _coerce_dataclass(DistributedRLConfig, {})
+        assert cfg.reward.remote_llm.enabled is False
+        assert cfg.reward.w_remote_llm == 0.0
+
+
 class TestExistingConfigs:
     def test_toy_config_loads(self, configs_dir: Path):
         cfg_path = configs_dir / "train_toy.yaml"

@@ -30,6 +30,7 @@ Adding a new reward model:
 
 from .base import RewardModel, SampleForScoring, RewardOutput, make_trl_reward_func
 from .metricx import MetricXReward
+from .remote_llm import RemoteLLMReward
 from .xcomet import XCometReward
 
 __all__ = [
@@ -38,5 +39,6 @@ __all__ = [
     "RewardOutput",
     "make_trl_reward_func",
     "MetricXReward",
+    "RemoteLLMReward",
     "XCometReward",
 ]
