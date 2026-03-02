@@ -1,0 +1,72 @@
+# Toy config for quick testing on a single GPU with a small model.
+# Launch: python -m distributed_rl --config configs/train_toy.yaml
+
+model:
+  policy_name_or_path: Qwen/Qwen2-0.5B-Instruct
+  trust_remote_code: true
+  attn_implementation: auto
+  gradient_checkpointing: false
+
+data:
+  hf_dataset_name: google/wmt24pp
+  hf_dataset_config_name: en-ko_KR
+  hf_train_split: train
+  limit: 64
+  eval_limit: 16
+
+  id_field: segment_id
+  src_text_field: source
+  ref_text_field: target
+  src_lang_field: src_lang
+  tgt_lang_field: tgt_lang
+  src_lang_code_field: src_lang_code
+  tgt_lang_code_field: tgt_lang_code
+  default_src_lang: English
+  default_tgt_lang: Korean
+
+prompt:
+  template: >-
+    You are a professional {source_lang} ({src_lang_code}) to {target_lang} ({tgt_lang_code})
+    translator. Produce only the {target_lang} translation, without any additional
+    explanations or commentary. Translate the following:\n\n{text}
+
+generation:
+  max_new_tokens: 64
+  temperature: 0.8
+  top_p: 0.95
+  num_generations: 2
+
+reward:
+  w_metricx: 1.0
+  w_xcomet: 0.0
+  metricx:
+    enabled: true
+    model_name: google/metricx-24-hybrid-large-v2p6
+    tokenizer_name: google/mt5-xl
+    gpu_id: 0
+    dtype: bfloat16
+    batch_size: 4
+    offset: 5.0
+  xcomet:
+    enabled: false
+
+training:
+  loss_type: grpo
+  beta: 0.01
+  epsilon: 0.2
+  scale_rewards: group
+  lr: 1.0e-6
+  per_device_train_batch_size: 2
+  gradient_accumulation_steps: 1
+  max_steps: 10
+  save_steps: 5
+  eval_steps: 5
+  logging_steps: 1
+
+distributed:
+  zero_stage: 0
+
+misc:
+  seed: 42
+  dtype: bfloat16
+  output_dir: ./outputs/toy-grpo
