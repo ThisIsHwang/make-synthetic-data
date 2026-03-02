@@ -30,7 +30,13 @@ except Exception as exc:  # pragma: no cover - optional during lightweight tests
 
 from .config import MQMConfig, MetricXConfig, XCometConfig
 from .rl_types import RewardOutput, SampleForScoring
-from .utils import resolve_device, resolve_torch_dtype
+from .utils import (
+    build_worker_launch_command,
+    collect_huggingface_worker_env,
+    merge_env_overrides,
+    resolve_device,
+    resolve_torch_dtype,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -45,20 +51,30 @@ class _ScorerSubprocessClient:
         timeout_sec: float,
         config_payload: dict[str, Any],
         env_overrides: dict[str, str] | None = None,
+        remote_host: str | None = None,
+        remote_workdir: str | None = None,
     ) -> None:
         self._backend = backend
         self._timeout_sec = float(timeout_sec)
+        self._remote_host = str(remote_host).strip() if remote_host else ""
         worker_script = Path(__file__).resolve().with_name("scorer_worker.py")
         if not worker_script.exists():
             raise FileNotFoundError(f"scorer worker script not found: {worker_script}")
 
-        cmd = [python_executable, str(worker_script), "--backend", backend]
+        cmd = build_worker_launch_command(
+            python_executable=python_executable,
+            worker_script=worker_script,
+            worker_args=["--backend", backend],
+            remote_host=self._remote_host or None,
+            remote_workdir=remote_workdir,
+            remote_env=env_overrides if self._remote_host else None,
+        )
         worker_env = dict(os.environ)
         for key in ("LOCAL_RANK", "RANK", "WORLD_SIZE", "MASTER_ADDR", "MASTER_PORT"):
             worker_env.pop(key, None)
         # PYTHONHOME can break venv resolution and make installed packages invisible.
         worker_env.pop("PYTHONHOME", None)
-        if env_overrides:
+        if env_overrides and not self._remote_host:
             for key, value in env_overrides.items():
                 worker_env[str(key)] = str(value)
 
@@ -73,7 +89,8 @@ class _ScorerSubprocessClient:
                 env=worker_env,
             )
         except Exception as exc:
-            raise RuntimeError(f"Failed to start {backend} scorer worker: cmd={cmd}") from exc
+            location = f" via ssh host={self._remote_host}" if self._remote_host else ""
+            raise RuntimeError(f"Failed to start {backend} scorer worker{location}: cmd={cmd}") from exc
 
         try:
             init_resp = self.request({"type": "init", "config": config_payload})
@@ -483,10 +500,13 @@ class MetricXQEScorer:
 
         if self.cfg.python_executable:
             worker_cfg_device = self.cfg.device
-            worker_env_overrides: dict[str, str] | None = None
+            worker_env_overrides: dict[str, str] | None = collect_huggingface_worker_env() or None
             metricx_gpu_idx = _parse_cuda_device_index(self.cfg.device)
             if metricx_gpu_idx is not None:
-                worker_env_overrides = {"CUDA_VISIBLE_DEVICES": str(metricx_gpu_idx)}
+                worker_env_overrides = merge_env_overrides(
+                    worker_env_overrides,
+                    {"CUDA_VISIBLE_DEVICES": str(metricx_gpu_idx)},
+                )
                 worker_cfg_device = "cuda:0"
             cfg_payload = {
                 "model_name": self.cfg.model_name,
@@ -504,10 +524,13 @@ class MetricXQEScorer:
                 timeout_sec=float(self.cfg.subprocess_timeout_sec),
                 config_payload=cfg_payload,
                 env_overrides=worker_env_overrides,
+                remote_host=self.cfg.worker_host,
+                remote_workdir=self.cfg.worker_remote_workdir,
             )
             logger.info(
-                "MetricX scorer will run in external python=%s (requested_device=%s worker_device=%s).",
+                "MetricX scorer will run in external python=%s host=%s (requested_device=%s worker_device=%s).",
                 self.cfg.python_executable,
+                self.cfg.worker_host or "local",
                 self.cfg.device,
                 worker_cfg_device,
             )
@@ -912,10 +935,13 @@ class XCometXLScorer:
 
         if self.cfg.python_executable:
             worker_cfg_device = self.cfg.device
-            worker_env_overrides: dict[str, str] | None = None
+            worker_env_overrides: dict[str, str] | None = collect_huggingface_worker_env() or None
             xcomet_gpu_idx = _parse_cuda_device_index(self.cfg.device)
             if xcomet_gpu_idx is not None:
-                worker_env_overrides = {"CUDA_VISIBLE_DEVICES": str(xcomet_gpu_idx)}
+                worker_env_overrides = merge_env_overrides(
+                    worker_env_overrides,
+                    {"CUDA_VISIBLE_DEVICES": str(xcomet_gpu_idx)},
+                )
                 worker_cfg_device = "cuda:0"
             cfg_payload = {
                 "model_name": self.cfg.model_name,
@@ -929,10 +955,13 @@ class XCometXLScorer:
                 timeout_sec=float(self.cfg.subprocess_timeout_sec),
                 config_payload=cfg_payload,
                 env_overrides=worker_env_overrides,
+                remote_host=self.cfg.worker_host,
+                remote_workdir=self.cfg.worker_remote_workdir,
             )
             logger.info(
-                "xCOMET scorer will run in external python=%s (requested_device=%s worker_device=%s).",
+                "xCOMET scorer will run in external python=%s host=%s (requested_device=%s worker_device=%s).",
                 self.cfg.python_executable,
+                self.cfg.worker_host or "local",
                 self.cfg.device,
                 worker_cfg_device,
             )

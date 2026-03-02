@@ -84,7 +84,9 @@ def test_metricx_worker_device_is_pinned_to_cuda0(monkeypatch) -> None:
     )
     del scorer
 
-    assert captured["env_overrides"] == {"CUDA_VISIBLE_DEVICES": "7"}
+    env_overrides = captured["env_overrides"]
+    assert isinstance(env_overrides, dict)
+    assert env_overrides.get("CUDA_VISIBLE_DEVICES") == "7"
     cfg_payload = captured["config_payload"]
     assert isinstance(cfg_payload, dict)
     assert cfg_payload["device"] == "cuda:0"
@@ -120,3 +122,73 @@ def test_reference_worker_env_strips_dist_vars(monkeypatch) -> None:
     assert "WORLD_SIZE" not in env
     assert "MASTER_ADDR" not in env
     assert "MASTER_PORT" not in env
+
+
+def test_scorer_worker_remote_launch_uses_ssh(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def _fake_popen(*args, **kwargs):
+        captured["cmd"] = list(args[0])
+        captured["env"] = dict(kwargs.get("env") or {})
+        return _FakeProc(env=kwargs.get("env"))
+
+    monkeypatch.setattr("gemma27_rl.rewards.subprocess.Popen", _fake_popen)
+    monkeypatch.setattr(_ScorerSubprocessClient, "request", lambda self, payload: {"ok": True})
+
+    client = _ScorerSubprocessClient(
+        backend="metricx",
+        python_executable="python",
+        timeout_sec=1.0,
+        config_payload={"device": "cuda:0"},
+        env_overrides={"CUDA_VISIBLE_DEVICES": "7"},
+        remote_host="aux-node-1",
+        remote_workdir="/shared/gemma27_rl",
+    )
+    client.close()
+
+    cmd = captured["cmd"]
+    assert isinstance(cmd, list)
+    assert cmd[0] == "ssh"
+    assert cmd[1] == "aux-node-1"
+    remote_cmd = str(cmd[2])
+    assert "CUDA_VISIBLE_DEVICES=7" in remote_cmd
+    assert "cd /shared/gemma27_rl" in remote_cmd
+    assert "scorer_worker.py" in remote_cmd
+    assert "--backend metricx" in remote_cmd
+    env = captured["env"]
+    assert isinstance(env, dict)
+    assert "CUDA_VISIBLE_DEVICES" not in env
+
+
+def test_reference_worker_remote_launch_uses_ssh(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def _fake_popen(*args, **kwargs):
+        captured["cmd"] = list(args[0])
+        captured["env"] = dict(kwargs.get("env") or {})
+        return _FakeProc(env=kwargs.get("env"))
+
+    monkeypatch.setattr("gemma27_rl.trainer.subprocess.Popen", _fake_popen)
+    monkeypatch.setattr(ReferenceLogprobClient, "request", lambda self, payload: {"ok": True})
+
+    client = ReferenceLogprobClient(
+        python_executable="python",
+        timeout_sec=1.0,
+        config_payload={"model_name_or_path": "dummy", "device": "cpu"},
+        env_overrides={"CUDA_VISIBLE_DEVICES": "6"},
+        remote_host="aux-node-1",
+        remote_workdir="/shared/gemma27_rl",
+    )
+    client.close()
+
+    cmd = captured["cmd"]
+    assert isinstance(cmd, list)
+    assert cmd[0] == "ssh"
+    assert cmd[1] == "aux-node-1"
+    remote_cmd = str(cmd[2])
+    assert "CUDA_VISIBLE_DEVICES=6" in remote_cmd
+    assert "cd /shared/gemma27_rl" in remote_cmd
+    assert "reference_worker.py" in remote_cmd
+    env = captured["env"]
+    assert isinstance(env, dict)
+    assert "CUDA_VISIBLE_DEVICES" not in env

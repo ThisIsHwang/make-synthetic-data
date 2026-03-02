@@ -27,11 +27,10 @@ uv pip install --python .venv_metricx/bin/python -e .
 
 echo "[4/5] Installing xCOMET environment packages..."
 uv pip install --python .venv_xcomet/bin/python \
-  torch unbabel-comet
+  torch unbabel-comet "setuptools<81"
 uv pip install --python .venv_xcomet/bin/python -e .
 
 echo "[5/5] Done."
 echo "train python   : ${ROOT_DIR}/.venv_train/bin/python"
 echo "metricx python : ${ROOT_DIR}/.venv_metricx/bin/python"
 echo "xcomet python  : ${ROOT_DIR}/.venv_xcomet/bin/python"
-

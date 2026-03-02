@@ -7,6 +7,14 @@ from gemma27_rl.rewards import MetricXQEScorer, metricx_qe_input, metricx_score_
 from gemma27_rl.rl_types import SampleForScoring
 
 
+def test_metricx_model_import_compatible_with_installed_transformers() -> None:
+    pytest.importorskip("torch")
+    pytest.importorskip("transformers")
+    from gemma27_rl.metricx_model import MT5ForRegression
+
+    assert MT5ForRegression is not None
+
+
 def test_metricx_qe_input_format() -> None:
     assert metricx_qe_input("src", "mt") == "source: src candidate: mt"
 

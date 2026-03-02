@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import logging
 import math
+import os
 
 import torch
 import torch.nn.functional as F
@@ -8,6 +10,35 @@ from torch import nn
 
 from .config import RLConfig
 from .rl_types import Rollout, TrainStats
+
+logger = logging.getLogger(__name__)
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _env_int(name: str, default: int, minimum: int = 1) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return max(minimum, int(default))
+    try:
+        value = int(raw.strip())
+    except Exception:
+        return max(minimum, int(default))
+    return max(minimum, value)
+
+
+def _is_rank0_process() -> bool:
+    rank_raw = os.environ.get("RANK")
+    if rank_raw is None:
+        return True
+    if not rank_raw.isdigit():
+        return True
+    return int(rank_raw) == 0
 
 
 def _token_logprobs_and_entropy(
@@ -96,6 +127,14 @@ def update_policy(
     total_clip = 0.0
     total_entropy = 0.0
     total_ref_kl = 0.0
+    debug_loss_trace = _is_rank0_process() and (
+        _env_flag("GEMMA27_RL_DEBUG_LOSS_TRACE", default=False)
+        or _env_flag("GEMMA27_RL_DEBUG_SPAN_LOSS", default=False)
+    )
+    debug_loss_max_rollouts = _env_int("GEMMA27_RL_DEBUG_LOSS_MAX_ROLLOUTS", default=1, minimum=1)
+    debug_loss_max_tokens = _env_int("GEMMA27_RL_DEBUG_LOSS_MAX_TOKENS", default=256, minimum=1)
+    debug_loss_only_nonzero_adv = _env_flag("GEMMA27_RL_DEBUG_LOSS_ONLY_NONZERO_ADV", default=False)
+    debug_loss_logged = 0
 
     for rollout, adv_row in zip(rollouts, advantages):
         input_ids = torch.tensor(
@@ -104,7 +143,11 @@ def update_policy(
             dtype=torch.long,
         )
         attention_mask = torch.ones_like(input_ids)
-        outputs = policy_model(input_ids=input_ids, attention_mask=attention_mask)
+        try:
+            # Keep training activation memory bounded; KV cache is only useful for autoregressive generation.
+            outputs = policy_model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
+        except TypeError:
+            outputs = policy_model(input_ids=input_ids, attention_mask=attention_mask)
         new_logprobs, entropy = _token_logprobs_and_entropy(
             outputs.logits,
             prompt_len=len(rollout.prompt_input_ids),
@@ -123,25 +166,98 @@ def update_policy(
         if rl_cfg.algorithm == "grpo":
             ratio = torch.exp(new_lp - old_lp)
             clipped = torch.clamp(ratio, 1.0 - rl_cfg.clip_eps, 1.0 + rl_cfg.clip_eps)
-            per_token_loss = -torch.minimum(ratio * adv, clipped * adv)
+            policy_term = -torch.minimum(ratio * adv, clipped * adv)
             clip_fraction = ((ratio > (1.0 + rl_cfg.clip_eps)) | (ratio < (1.0 - rl_cfg.clip_eps))).float()
             approx_kl = 0.5 * ((new_lp - old_lp) ** 2)
         elif rl_cfg.algorithm == "reinforce":
-            per_token_loss = -(new_lp * adv)
+            ratio = torch.ones_like(new_lp)
+            clipped = ratio
+            policy_term = -(new_lp * adv)
             clip_fraction = torch.zeros_like(new_lp)
             approx_kl = 0.5 * ((new_lp - old_lp) ** 2)
         else:
             raise ValueError(f"Unsupported algorithm: {rl_cfg.algorithm}")
 
+        per_token_loss = policy_term
+        kl_term = torch.zeros_like(per_token_loss)
         if rl_cfg.kl_coef > 0 and ref_lp is not None:
             ref_kl = new_lp - ref_lp
-            per_token_loss = per_token_loss + (rl_cfg.kl_coef * ref_kl)
+            kl_term = rl_cfg.kl_coef * ref_kl
+            per_token_loss = per_token_loss + kl_term
             total_ref_kl += float(ref_kl.detach().sum().item())
 
+        entropy_term = torch.zeros_like(per_token_loss)
         if rl_cfg.entropy_coef > 0:
             ent = entropy[: per_token_loss.numel()]
-            per_token_loss = per_token_loss - (rl_cfg.entropy_coef * ent)
+            entropy_term = -(rl_cfg.entropy_coef * ent)
+            per_token_loss = per_token_loss + entropy_term
             total_entropy += float(ent.detach().sum().item())
+
+        if debug_loss_trace and debug_loss_logged < debug_loss_max_rollouts:
+            logger.info(
+                "[loss-debug] example_id=%s tokens=%s algorithm=%s",
+                rollout.example_id,
+                int(per_token_loss.numel()),
+                rl_cfg.algorithm,
+            )
+            printed = 0
+            non_zero_adv = 0
+            for tok_idx in range(int(per_token_loss.numel())):
+                adv_i = float(adv[tok_idx].detach().item())
+                if abs(adv_i) > 0:
+                    non_zero_adv += 1
+                if debug_loss_only_nonzero_adv and abs(adv_i) <= 0:
+                    continue
+                if printed >= debug_loss_max_tokens:
+                    break
+                tok_id = int(rollout.completion_token_ids[tok_idx]) if tok_idx < len(rollout.completion_token_ids) else -1
+                if ref_lp is not None and tok_idx < int(ref_lp.numel()):
+                    logger.info(
+                        "[loss-debug] tok[%03d] id=%s old_lp=%.6f new_lp=%.6f ref_lp=%.6f adv=%.6f ratio=%.6f clipped=%.6f policy=%.6f kl=%.6f entropy=%.6f total=%.6f",
+                        tok_idx,
+                        tok_id,
+                        float(old_lp[tok_idx].detach().item()),
+                        float(new_lp[tok_idx].detach().item()),
+                        float(ref_lp[tok_idx].detach().item()),
+                        adv_i,
+                        float(ratio[tok_idx].detach().item()),
+                        float(clipped[tok_idx].detach().item()),
+                        float(policy_term[tok_idx].detach().item()),
+                        float(kl_term[tok_idx].detach().item()),
+                        float(entropy_term[tok_idx].detach().item()),
+                        float(per_token_loss[tok_idx].detach().item()),
+                    )
+                else:
+                    logger.info(
+                        "[loss-debug] tok[%03d] id=%s old_lp=%.6f new_lp=%.6f adv=%.6f ratio=%.6f clipped=%.6f policy=%.6f kl=%.6f entropy=%.6f total=%.6f",
+                        tok_idx,
+                        tok_id,
+                        float(old_lp[tok_idx].detach().item()),
+                        float(new_lp[tok_idx].detach().item()),
+                        adv_i,
+                        float(ratio[tok_idx].detach().item()),
+                        float(clipped[tok_idx].detach().item()),
+                        float(policy_term[tok_idx].detach().item()),
+                        float(kl_term[tok_idx].detach().item()),
+                        float(entropy_term[tok_idx].detach().item()),
+                        float(per_token_loss[tok_idx].detach().item()),
+                    )
+                printed += 1
+            if int(per_token_loss.numel()) > printed:
+                logger.info(
+                    "[loss-debug] token rows truncated: printed=%s total=%s non_zero_adv=%s",
+                    printed,
+                    int(per_token_loss.numel()),
+                    non_zero_adv,
+                )
+            else:
+                logger.info(
+                    "[loss-debug] token rows complete: printed=%s total=%s non_zero_adv=%s",
+                    printed,
+                    int(per_token_loss.numel()),
+                    non_zero_adv,
+                )
+            debug_loss_logged += 1
 
         loss_sum = per_token_loss.sum()
         token_count = int(per_token_loss.numel())

@@ -100,6 +100,30 @@ def main(argv: list[str] | None = None) -> int:
                 _reply({"ok": True, "logprobs": logprobs})
                 continue
 
+            if req_type == "score_batch":
+                items = req.get("items") or []
+                if not isinstance(items, list):
+                    raise ValueError("score_batch.items must be a list")
+                rows: list[list[float]] = []
+                for item in items:
+                    if not isinstance(item, dict):
+                        raise ValueError("score_batch.items[*] must be objects")
+                    prompt_ids = item.get("prompt_ids") or []
+                    completion_ids = item.get("completion_ids") or []
+                    if not isinstance(prompt_ids, list) or not isinstance(completion_ids, list):
+                        raise ValueError("score_batch.items[*].prompt_ids and completion_ids must be lists")
+                    prompt_ids_int = [int(v) for v in prompt_ids]
+                    completion_ids_int = [int(v) for v in completion_ids]
+                    row = compute_completion_logprobs(
+                        model=model,
+                        prompt_input_ids=prompt_ids_int,
+                        completion_token_ids=completion_ids_int,
+                        device=device,
+                    ).tolist()
+                    rows.append([float(v) for v in row])
+                _reply({"ok": True, "logprobs_rows": rows})
+                continue
+
             raise ValueError(f"unsupported request type: {req_type}")
         except Exception as exc:
             _reply(

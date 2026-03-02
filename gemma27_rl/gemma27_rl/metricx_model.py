@@ -11,10 +11,16 @@ from torch import nn
 import transformers
 from transformers.modeling_outputs import BaseModelOutput, ModelOutput
 
-MT5Config = transformers.models.mt5.modeling_mt5.MT5Config
-MT5PreTrainedModel = transformers.models.mt5.modeling_mt5.MT5PreTrainedModel
-MT5Stack = transformers.models.mt5.modeling_mt5.MT5Stack
-_HEAD_MASK_WARNING_MSG = transformers.models.mt5.modeling_mt5.__HEAD_MASK_WARNING_MSG  # pylint: disable=protected-access
+_MT5_MODELING = transformers.models.mt5.modeling_mt5
+
+MT5Config = _MT5_MODELING.MT5Config
+MT5PreTrainedModel = _MT5_MODELING.MT5PreTrainedModel
+MT5Stack = _MT5_MODELING.MT5Stack
+_HEAD_MASK_WARNING_MSG = getattr(
+    _MT5_MODELING,
+    "__HEAD_MASK_WARNING_MSG",
+    "Passing `head_mask` without `decoder_head_mask` is deprecated; set both explicitly.",
+)
 
 
 @dataclasses.dataclass

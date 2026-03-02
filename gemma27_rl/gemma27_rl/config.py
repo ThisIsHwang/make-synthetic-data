@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 import math
+import os
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +34,8 @@ class ModelConfig:
     reference_runtime: str = "worker"  # worker|in_process|cpu
     reference_python_executable: str | None = None
     reference_subprocess_timeout_sec: float = 600.0
+    reference_worker_host: str | None = None
+    reference_worker_remote_workdir: str | None = None
 
 
 @dataclass
@@ -106,6 +109,8 @@ class MetricXConfig:
     offset: float = 5.0
     python_executable: str | None = None
     subprocess_timeout_sec: float = 600.0
+    worker_host: str | None = None
+    worker_remote_workdir: str | None = None
 
 
 @dataclass
@@ -117,6 +122,8 @@ class XCometConfig:
     use_reference: bool = False
     python_executable: str | None = None
     subprocess_timeout_sec: float = 600.0
+    worker_host: str | None = None
+    worker_remote_workdir: str | None = None
 
 
 @dataclass
@@ -198,6 +205,7 @@ class EvalConfig:
     eval_every_n_updates: int = 5
     eval_limit: int = 64
     run_before_train: bool = True
+    distributed_shard: bool = False
     # Optional eval-only generation overrides.
     # Example:
     # generation_overrides:
@@ -229,6 +237,8 @@ class MiscConfig:
     huggingface_cache_dir: str | None = "/media/sdd3"
     huggingface_token: str | None = None
     huggingface_token_env: str = "HF_TOKEN"
+    aux_worker_host: str | None = None
+    aux_worker_remote_workdir: str | None = None
 
 
 @dataclass
@@ -282,8 +292,10 @@ def _resolve_command_or_path(value: str | None, base_dir: Path) -> str | None:
         return text
     path = Path(text).expanduser()
     if path.is_absolute():
-        return str(path)
-    return str((base_dir / path).resolve())
+        return os.path.abspath(str(path))
+    # Keep symlinked executables (e.g., venv/bin/python) as-is. Resolving here
+    # can collapse them to the system interpreter and break package imports.
+    return os.path.abspath(str(base_dir / path))
 
 
 def _resolve_model_name_or_path(value: str | None, base_dir: Path) -> str | None:
@@ -333,6 +345,24 @@ def _parse_cuda_index(device: str | None) -> int | None:
     return None
 
 
+def _normalize_optional_text(value: str | None) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _effective_worker_host(component_host: str | None, fallback_host: str | None) -> str | None:
+    return _normalize_optional_text(component_host) or _normalize_optional_text(fallback_host)
+
+
+def _host_label(host: str | None) -> str:
+    normalized = _normalize_optional_text(host)
+    if normalized is None:
+        return "__local__"
+    return normalized.lower()
+
+
 def _validate_config(cfg: RLPostTrainConfig) -> None:
     use_hf_dataset = bool(cfg.data.hf_dataset_name and str(cfg.data.hf_dataset_name).strip())
     if use_hf_dataset:
@@ -377,6 +407,8 @@ def _validate_config(cfg: RLPostTrainConfig) -> None:
         raise ValueError("generation.chat_template_kwargs must be a dict")
     if cfg.eval.generation_overrides is not None and not isinstance(cfg.eval.generation_overrides, dict):
         raise ValueError("eval.generation_overrides must be a dict")
+    if not isinstance(cfg.eval.distributed_shard, bool):
+        raise ValueError("eval.distributed_shard must be a bool")
     if cfg.reward.overlap_policy not in {"any_overlap", "majority_overlap"}:
         raise ValueError("reward.overlap_policy must be any_overlap or majority_overlap")
     if cfg.reward.span_combine_policy not in {"sum", "min", "max"}:
@@ -394,6 +426,20 @@ def _validate_config(cfg: RLPostTrainConfig) -> None:
             continue
         text = str(exe).strip()
         if not text:
+            raise ValueError(f"{field_name} must not be empty when set.")
+    for field_name, raw in (
+        ("misc.aux_worker_host", cfg.misc.aux_worker_host),
+        ("misc.aux_worker_remote_workdir", cfg.misc.aux_worker_remote_workdir),
+        ("model.reference_worker_host", cfg.model.reference_worker_host),
+        ("model.reference_worker_remote_workdir", cfg.model.reference_worker_remote_workdir),
+        ("reward.metricx.worker_host", cfg.reward.metricx.worker_host),
+        ("reward.metricx.worker_remote_workdir", cfg.reward.metricx.worker_remote_workdir),
+        ("reward.xcomet.worker_host", cfg.reward.xcomet.worker_host),
+        ("reward.xcomet.worker_remote_workdir", cfg.reward.xcomet.worker_remote_workdir),
+    ):
+        if raw is None:
+            continue
+        if not str(raw).strip():
             raise ValueError(f"{field_name} must not be empty when set.")
     if not cfg.reward.metricx.enabled and not cfg.reward.xcomet.enabled and not cfg.reward.mqm.enabled:
         raise ValueError("At least one reward model must be enabled.")
@@ -426,6 +472,14 @@ def _validate_config(cfg: RLPostTrainConfig) -> None:
     cfg.model.policy_gpu_ids = _normalize_gpu_ids(cfg.model.policy_gpu_ids, "model.policy_gpu_ids")
     cfg.model.reference_gpu_ids = _normalize_gpu_ids(cfg.model.reference_gpu_ids, "model.reference_gpu_ids")
 
+    reference_host = _effective_worker_host(cfg.model.reference_worker_host, cfg.misc.aux_worker_host)
+    metricx_host = _effective_worker_host(cfg.reward.metricx.worker_host, cfg.misc.aux_worker_host)
+    xcomet_host = _effective_worker_host(cfg.reward.xcomet.worker_host, cfg.misc.aux_worker_host)
+
+    reference_host_label = _host_label(reference_host)
+    metricx_host_label = _host_label(metricx_host)
+    xcomet_host_label = _host_label(xcomet_host)
+
     if cfg.rl.backend != "deepspeed":
         if len(cfg.model.policy_gpu_ids) > 1:
             raise ValueError(
@@ -438,7 +492,7 @@ def _validate_config(cfg: RLPostTrainConfig) -> None:
             )
 
     policy_set = set(cfg.model.policy_gpu_ids)
-    ref_set = set(cfg.model.reference_gpu_ids)
+    ref_set = set(cfg.model.reference_gpu_ids) if reference_host is None else set()
     overlap = sorted(policy_set & ref_set)
     if overlap:
         raise ValueError(
@@ -449,19 +503,43 @@ def _validate_config(cfg: RLPostTrainConfig) -> None:
     reserved = set(policy_set) | set(ref_set)
     metricx_idx = _parse_cuda_index(cfg.reward.metricx.device if cfg.reward.metricx.enabled else None)
     xcomet_idx = _parse_cuda_index(cfg.reward.xcomet.device if cfg.reward.xcomet.enabled else None)
+    reference_idx = None
+    if cfg.model.reference_gpu_ids:
+        reference_idx = int(cfg.model.reference_gpu_ids[0])
+    elif cfg.model.reference_runtime != "cpu":
+        reference_idx = _parse_cuda_index(cfg.model.reference_device)
 
-    if metricx_idx is not None and metricx_idx in reserved:
+    if metricx_host is None and metricx_idx is not None and metricx_idx in reserved:
         raise ValueError(
             "reward.metricx.device overlaps policy/reference GPU allocation. "
             f"metricx_gpu={metricx_idx} reserved={sorted(reserved)}"
         )
-    if xcomet_idx is not None and xcomet_idx in reserved:
+    if xcomet_host is None and xcomet_idx is not None and xcomet_idx in reserved:
         raise ValueError(
             "reward.xcomet.device overlaps policy/reference GPU allocation. "
             f"xcomet_gpu={xcomet_idx} reserved={sorted(reserved)}"
         )
-    if metricx_idx is not None and xcomet_idx is not None and metricx_idx == xcomet_idx:
+    if (
+        metricx_idx is not None
+        and xcomet_idx is not None
+        and metricx_idx == xcomet_idx
+        and metricx_host_label == xcomet_host_label
+    ):
         raise ValueError("reward.metricx.device and reward.xcomet.device must be different GPUs.")
+    if (
+        reference_idx is not None
+        and metricx_idx is not None
+        and reference_idx == metricx_idx
+        and reference_host_label == metricx_host_label
+    ):
+        raise ValueError("model.reference_gpu_ids/reference_device overlaps reward.metricx.device on the same host.")
+    if (
+        reference_idx is not None
+        and xcomet_idx is not None
+        and reference_idx == xcomet_idx
+        and reference_host_label == xcomet_host_label
+    ):
+        raise ValueError("model.reference_gpu_ids/reference_device overlaps reward.xcomet.device on the same host.")
 
 
 def load_config(path: str | Path) -> RLPostTrainConfig:
@@ -482,7 +560,13 @@ def load_config(path: str | Path) -> RLPostTrainConfig:
     cfg.logging.output_dir = _resolve_optional_path(cfg.logging.output_dir, base_dir) or cfg.logging.output_dir
     cfg.logging.resume_from_checkpoint = _resolve_optional_path(cfg.logging.resume_from_checkpoint, base_dir)
     cfg.misc.huggingface_cache_dir = _resolve_optional_path(cfg.misc.huggingface_cache_dir, base_dir)
+    cfg.misc.aux_worker_remote_workdir = _resolve_optional_path(cfg.misc.aux_worker_remote_workdir, base_dir)
     cfg.rl.deepspeed_config_path = _resolve_optional_path(cfg.rl.deepspeed_config_path, base_dir)
+    cfg.model.reference_worker_remote_workdir = _resolve_optional_path(
+        cfg.model.reference_worker_remote_workdir, base_dir
+    )
+    cfg.reward.metricx.worker_remote_workdir = _resolve_optional_path(cfg.reward.metricx.worker_remote_workdir, base_dir)
+    cfg.reward.xcomet.worker_remote_workdir = _resolve_optional_path(cfg.reward.xcomet.worker_remote_workdir, base_dir)
     cfg.reward.metricx.python_executable = _resolve_command_or_path(cfg.reward.metricx.python_executable, base_dir)
     cfg.reward.xcomet.python_executable = _resolve_command_or_path(cfg.reward.xcomet.python_executable, base_dir)
     cfg.model.reference_python_executable = _resolve_command_or_path(cfg.model.reference_python_executable, base_dir)

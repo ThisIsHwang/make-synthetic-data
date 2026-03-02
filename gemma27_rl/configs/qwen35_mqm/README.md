@@ -1,12 +1,13 @@
-# Qwen3.5-27B + MetricX-XXL + GEMBA-MQM (OpenAI-Compatible)
+# Qwen3.5-27B + MetricX/XCOMET (+ optional MQM)
 
 This folder contains isolated configs for RL experiments with:
 - policy: `Qwen/Qwen3.5-27B-Instruct`
-- sequence rewards: `MetricX-24-XXL` + `GEMBA-MQM`
-- **xCOMET disabled**
+- sequence rewards: `MetricX-24-XXL` (+ optional `XCOMET-XL`, `GEMBA-MQM`)
 - **DeepSpeed backend enabled** (no `device_map=auto`)
 - scorer runtime isolation: MetricX/xCOMET can run on separate uv envs via
   `reward.metricx.python_executable` / `reward.xcomet.python_executable`.
+- remote worker routing: reference/MetricX/xCOMET can run on a dedicated aux node
+  via `misc.aux_worker_host` (or per-component `*_worker_host`)
 
 MQM prompt/scoring behavior is aligned with:
 `/home/seungyoonee/initial_translation/configs/metrics/gemba_mqm.yaml`
@@ -27,6 +28,12 @@ and the message/scoring logic in:
   - larger sampling and training batch settings
   - `rl.backend: deepspeed`, `zero_stage: 2`
 
+- `train_wmt24pp_enko_qwen35_27b_metricx_xcomet_multinode8p1aux.yaml`
+  - multi-node run template
+  - **8 policy nodes** use all GPUs for Qwen policy (`policy_gpu_ids: [0..7]` per node)
+  - **1 aux node** runs reference + MetricX + xCOMET via SSH worker launch
+  - set `misc.aux_worker_host` / `misc.aux_worker_remote_workdir` to your cluster values
+
 ## Run
 
 Create split uv envs (example):
@@ -35,6 +42,8 @@ Create split uv envs (example):
 cd /home/seungyoonee/make-synthetic-data/gemma27_rl
 ./scripts/setup_split_uv_envs.sh
 ```
+
+Note: xCOMET venv is pinned to `setuptools<81` (for `pkg_resources` compatibility).
 
 ```bash
 export HF_TOKEN=...
@@ -46,4 +55,13 @@ or
 
 ```bash
 .venv_train/bin/deepspeed --num_gpus 8 .venv_train/bin/gemma27_rl --config configs/qwen35_mqm/train_wmt24pp_enko_qwen35_27b_mqm_scale8gpu.yaml
+```
+
+8+1 multi-node example (policy nodes are only in hostfile/include; aux node is **not** in DeepSpeed ranks):
+
+```bash
+HOSTFILE=/path/to/policy_8nodes.hostfile \
+INCLUDE='policy-node-01:0,1,2,3,4,5,6,7@policy-node-02:0,1,2,3,4,5,6,7@policy-node-03:0,1,2,3,4,5,6,7@policy-node-04:0,1,2,3,4,5,6,7@policy-node-05:0,1,2,3,4,5,6,7@policy-node-06:0,1,2,3,4,5,6,7@policy-node-07:0,1,2,3,4,5,6,7@policy-node-08:0,1,2,3,4,5,6,7' \
+CONFIG=configs/qwen35_mqm/train_wmt24pp_enko_qwen35_27b_metricx_xcomet_multinode8p1aux.yaml \
+./scripts/run_deepspeed_from_venv.sh
 ```

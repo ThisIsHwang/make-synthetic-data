@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import os
+
 import pytest
 
 pytest.importorskip("torch")
 
 from gemma27_rl.config import RLPostTrainConfig
 from gemma27_rl import trainer as trainer_mod
-from gemma27_rl.trainer import _validate_deepspeed_partition_strict
+from gemma27_rl.trainer import _configure_nccl_heartbeat_timeout, _validate_deepspeed_partition_strict
 
 
 def _base_cfg() -> RLPostTrainConfig:
@@ -24,7 +26,7 @@ def test_deepspeed_partition_world_size_mismatch(monkeypatch: pytest.MonkeyPatch
     cfg.model.policy_gpu_ids = [0, 1]
     monkeypatch.setenv("WORLD_SIZE", "1")
     monkeypatch.setenv("LOCAL_RANK", "0")
-    with pytest.raises(RuntimeError, match="WORLD_SIZE == len\\(model.policy_gpu_ids\\)"):
+    with pytest.raises(RuntimeError, match="WORLD_SIZE to be a multiple"):
         _validate_deepspeed_partition_strict(cfg)
 
 
@@ -48,6 +50,16 @@ def test_deepspeed_partition_reserved_overlap(monkeypatch: pytest.MonkeyPatch) -
         _validate_deepspeed_partition_strict(cfg)
 
 
+def test_deepspeed_partition_remote_reference_overlap_allowed(monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = _base_cfg()
+    cfg.model.policy_gpu_ids = [0]
+    cfg.model.reference_gpu_ids = [0]
+    cfg.model.reference_worker_host = "aux-node-1"
+    monkeypatch.setenv("WORLD_SIZE", "1")
+    monkeypatch.setenv("LOCAL_RANK", "0")
+    _validate_deepspeed_partition_strict(cfg)
+
+
 def test_assign_disjoint_keeps_physical_reserved_ids_under_deepspeed_include(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -68,3 +80,28 @@ def test_assign_disjoint_keeps_physical_reserved_ids_under_deepspeed_include(
     assert cfg.model.policy_gpu_ids == [0, 1, 2, 3, 4, 5]
     assert cfg.model.reference_gpu_ids == [6]
     assert cfg.reward.metricx.device == "cuda:7"
+
+
+def test_configure_nccl_heartbeat_timeout_sets_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = _base_cfg()
+    monkeypatch.setenv("WORLD_SIZE", "8")
+    monkeypatch.delenv("TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC", raising=False)
+    _configure_nccl_heartbeat_timeout(cfg)
+    assert os.environ.get("TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC") == "7200"
+
+
+def test_configure_nccl_heartbeat_timeout_keeps_user_value(monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = _base_cfg()
+    monkeypatch.setenv("WORLD_SIZE", "8")
+    monkeypatch.setenv("TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC", "900")
+    _configure_nccl_heartbeat_timeout(cfg)
+    assert os.environ.get("TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC") == "900"
+
+
+def test_configure_nccl_heartbeat_timeout_ignored_for_native(monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = _base_cfg()
+    cfg.rl.backend = "native"
+    monkeypatch.setenv("WORLD_SIZE", "8")
+    monkeypatch.delenv("TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC", raising=False)
+    _configure_nccl_heartbeat_timeout(cfg)
+    assert os.environ.get("TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC") is None

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import json
 import logging
 import math
@@ -8,6 +9,7 @@ from pathlib import Path
 import random
 import select
 import shutil
+import socket
 from statistics import mean
 import subprocess
 import sys
@@ -40,10 +42,13 @@ from .rewards import (
     metricx_score_to_reward,
     spans_to_token_rewards,
 )
-from .rollout import generate_rollouts
+from .rollout import compute_completion_logprobs, generate_rollouts
 from .rl_types import Rollout, SampleForScoring
 from .utils import (
+    build_worker_launch_command,
+    collect_huggingface_worker_env,
     configure_huggingface_cache,
+    merge_env_overrides,
     resolve_device,
     resolve_huggingface_token,
     resolve_torch_dtype,
@@ -52,6 +57,174 @@ from .utils import (
 
 
 logger = logging.getLogger(__name__)
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _env_int(name: str, default: int, minimum: int = 1) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return max(minimum, int(default))
+    try:
+        value = int(raw.strip())
+    except Exception:
+        return max(minimum, int(default))
+    return max(minimum, value)
+
+
+def _span_overlap_chars(start: int, end: int, tok_s: int, tok_e: int) -> int:
+    if end <= start or tok_e <= tok_s:
+        return 0
+    return max(0, min(tok_e, end) - max(tok_s, start))
+
+
+def _span_applies_to_token(
+    span: dict[str, Any],
+    tok_s: int,
+    tok_e: int,
+    overlap_policy: str,
+    majority_threshold: float,
+) -> bool:
+    try:
+        start = int(span.get("start", 0))
+        end = int(span.get("end", 0))
+    except Exception:
+        return False
+    overlap = _span_overlap_chars(start, end, tok_s, tok_e)
+    if overlap <= 0:
+        return False
+    if overlap_policy == "any_overlap":
+        return True
+    ratio = overlap / max(1, tok_e - tok_s)
+    return ratio >= majority_threshold
+
+
+def _short_text(text: str, limit: int = 120) -> str:
+    clean = text.replace("\n", "\\n")
+    if len(clean) <= limit:
+        return clean
+    return clean[:limit] + "..."
+
+
+def _log_span_debug_for_rollout(
+    *,
+    rollout: Rollout,
+    span_row: list[dict[str, Any]],
+    token_rewards: list[float],
+    raw_adv: list[float],
+    adv_used: list[float] | None,
+    seq_reward: float,
+    overlap_policy: str,
+    majority_threshold: float,
+    max_tokens: int,
+    only_nonzero: bool,
+) -> None:
+    adv_used_row = adv_used or []
+    logger.info(
+        "[span-debug] example_id=%s spans=%s tokens=%s seq_reward=%.4f completion=%r",
+        rollout.example_id,
+        len(span_row),
+        len(rollout.token_char_offsets),
+        float(seq_reward),
+        _short_text(rollout.completion_text),
+    )
+    for span_idx, span in enumerate(span_row):
+        try:
+            start = int(span.get("start", 0))
+            end = int(span.get("end", 0))
+        except Exception:
+            continue
+        severity = str(span.get("severity", "")).upper()
+        confidence = span.get("confidence", None)
+        snippet = ""
+        if end > start:
+            snippet = rollout.completion_text[max(0, start) : max(0, end)]
+        logger.info(
+            "[span-debug] span[%s] severity=%s confidence=%s range=[%s,%s) text=%r",
+            span_idx,
+            severity,
+            confidence,
+            start,
+            end,
+            _short_text(snippet, limit=80),
+        )
+
+    printed = 0
+    non_zero = 0
+    for tok_idx, (tok_s, tok_e) in enumerate(rollout.token_char_offsets):
+        tok_reward = token_rewards[tok_idx] if tok_idx < len(token_rewards) else 0.0
+        tok_adv_raw = raw_adv[tok_idx] if tok_idx < len(raw_adv) else 0.0
+        tok_adv_used = tok_adv_raw
+        if tok_idx < len(adv_used_row):
+            tok_adv_used = adv_used_row[tok_idx]
+        if abs(tok_reward) > 0:
+            non_zero += 1
+        overlap_ids: list[int] = []
+        for span_idx, span in enumerate(span_row):
+            if _span_applies_to_token(
+                span=span,
+                tok_s=tok_s,
+                tok_e=tok_e,
+                overlap_policy=overlap_policy,
+                majority_threshold=majority_threshold,
+            ):
+                overlap_ids.append(span_idx)
+
+        if only_nonzero and abs(tok_reward) <= 0 and not overlap_ids:
+            continue
+        if printed >= max_tokens:
+            break
+
+        tok_text = ""
+        if tok_e > tok_s:
+            tok_text = rollout.completion_text[max(0, tok_s) : max(0, tok_e)]
+        tok_id = int(rollout.completion_token_ids[tok_idx]) if tok_idx < len(rollout.completion_token_ids) else -1
+        if adv_used_row:
+            logger.info(
+                "[span-debug] tok[%03d] id=%s range=[%d,%d) text=%r spans=%s tok_reward=%.4f raw_adv=%.4f adv_used=%.4f",
+                tok_idx,
+                tok_id,
+                tok_s,
+                tok_e,
+                _short_text(tok_text, limit=60),
+                overlap_ids,
+                float(tok_reward),
+                float(tok_adv_raw),
+                float(tok_adv_used),
+            )
+        else:
+            logger.info(
+                "[span-debug] tok[%03d] id=%s range=[%d,%d) text=%r spans=%s tok_reward=%.4f raw_adv=%.4f",
+                tok_idx,
+                tok_id,
+                tok_s,
+                tok_e,
+                _short_text(tok_text, limit=60),
+                overlap_ids,
+                float(tok_reward),
+                float(tok_adv_raw),
+            )
+        printed += 1
+
+    if len(rollout.token_char_offsets) > printed:
+        logger.info(
+            "[span-debug] token rows truncated: printed=%s total=%s (non_zero_token_rewards=%s)",
+            printed,
+            len(rollout.token_char_offsets),
+            non_zero,
+        )
+    else:
+        logger.info(
+            "[span-debug] token rows complete: printed=%s total=%s (non_zero_token_rewards=%s)",
+            printed,
+            len(rollout.token_char_offsets),
+            non_zero,
+        )
 
 
 def _is_distributed_initialized() -> bool:
@@ -85,10 +258,88 @@ def _dist_barrier() -> None:
         torch.distributed.barrier()
 
 
+def _configure_nccl_heartbeat_timeout(cfg: RLPostTrainConfig) -> None:
+    if str(cfg.rl.backend).strip().lower() != "deepspeed":
+        return
+    if _distributed_world_size() <= 1:
+        return
+    # In this trainer, rank0 performs rollout/reward/eval while other ranks may
+    # wait in a collective for several minutes. The default 480s watchdog can
+    # abort these valid waits, so set a safer default unless the user already
+    # configured it.
+    key = "TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC"
+    if key not in os.environ:
+        os.environ[key] = "7200"
+        logger.info("Set %s=%s (default for long rank0-only sections).", key, os.environ[key])
+
+
+def _configure_cuda_allocator() -> None:
+    if not torch.cuda.is_available():
+        return
+    key = "PYTORCH_CUDA_ALLOC_CONF"
+    if key not in os.environ:
+        os.environ[key] = "expandable_segments:True"
+        logger.info("Set %s=%s (default to reduce CUDA allocator fragmentation).", key, os.environ[key])
+
+
+def _set_rollout_sampling_seed(seed: int) -> None:
+    # Keep stochastic generation aligned across ranks when using ZeRO-sharded models.
+    torch.manual_seed(int(seed))
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(int(seed))
+
+
 def _broadcast_object_list(payload: list[Any], src: int = 0) -> list[Any]:
     if _is_distributed_initialized():
         torch.distributed.broadcast_object_list(payload, src=src)
     return payload
+
+
+def _gather_object_to_rank0(local_obj: Any) -> list[Any] | None:
+    if not _is_distributed_initialized():
+        return [local_obj]
+    gathered: list[Any] | None = [None for _ in range(_distributed_world_size())] if _is_rank0() else None
+    torch.distributed.gather_object(local_obj, object_gather_list=gathered, dst=0)
+    return gathered
+
+
+def _scatter_object_from_rank0(per_rank_objects: list[Any] | None, *, rank: int) -> Any:
+    if not _is_distributed_initialized():
+        if isinstance(per_rank_objects, list) and per_rank_objects:
+            return per_rank_objects[0]
+        return None
+
+    world_size = _distributed_world_size()
+    local_rank_raw = os.environ.get("LOCAL_RANK")
+    if torch.cuda.is_available() and local_rank_raw and local_rank_raw.isdigit():
+        torch.cuda.set_device(int(local_rank_raw))
+
+    if hasattr(torch.distributed, "scatter_object_list"):
+        try:
+            recv: list[Any] = [None]
+            if _is_rank0():
+                payload = list(per_rank_objects or [])
+                if len(payload) < world_size:
+                    payload.extend([None for _ in range(world_size - len(payload))])
+                elif len(payload) > world_size:
+                    payload = payload[:world_size]
+                torch.distributed.scatter_object_list(recv, scatter_object_input_list=payload, src=0)
+            else:
+                torch.distributed.scatter_object_list(recv, scatter_object_input_list=None, src=0)
+            return recv[0]
+        except Exception as exc:
+            if _is_rank0():
+                logger.warning(
+                    "scatter_object_list failed; falling back to broadcast object distribution. error=%s",
+                    exc,
+                )
+
+    shared: list[Any] = [per_rank_objects if _is_rank0() else None]
+    torch.distributed.broadcast_object_list(shared, src=0)
+    payload = shared[0]
+    if isinstance(payload, list) and 0 <= rank < len(payload):
+        return payload[rank]
+    return None
 
 
 def _local_rank_device(default_device: str) -> str:
@@ -178,6 +429,27 @@ def _deepspeed_initialize(
     return engine, optimizer
 
 
+def _configure_policy_train_memory(policy_model: AutoModelForCausalLM) -> None:
+    cfg_obj = getattr(policy_model, "config", None)
+    if cfg_obj is not None and getattr(cfg_obj, "use_cache", None):
+        cfg_obj.use_cache = False
+        logger.info("Disabled policy model KV cache for training (config.use_cache=False).")
+
+    gc_enable = getattr(policy_model, "gradient_checkpointing_enable", None)
+    if callable(gc_enable):
+        enabled = False
+        try:
+            gc_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+            enabled = True
+        except TypeError:
+            gc_enable()
+            enabled = True
+        except Exception as exc:
+            logger.warning("Failed to enable gradient checkpointing: %s", exc)
+        if enabled:
+            logger.info("Enabled policy gradient checkpointing for training memory reduction.")
+
+
 def _dtype_to_config_name(dtype: Any, fallback: str) -> str:
     if dtype is None:
         return fallback
@@ -198,8 +470,11 @@ class ReferenceLogprobClient:
         timeout_sec: float,
         config_payload: dict[str, Any],
         env_overrides: dict[str, str] | None = None,
+        remote_host: str | None = None,
+        remote_workdir: str | None = None,
     ) -> None:
         self._timeout_sec = float(timeout_sec)
+        self._remote_host = str(remote_host).strip() if remote_host else ""
         worker_script = Path(__file__).resolve().with_name("reference_worker.py")
         if not worker_script.exists():
             raise FileNotFoundError(f"reference worker script not found: {worker_script}")
@@ -207,11 +482,17 @@ class ReferenceLogprobClient:
         env = dict(os.environ)
         for key in ("LOCAL_RANK", "RANK", "WORLD_SIZE", "MASTER_ADDR", "MASTER_PORT"):
             env.pop(key, None)
-        if env_overrides:
+        if env_overrides and not self._remote_host:
             for key, value in env_overrides.items():
                 env[str(key)] = str(value)
 
-        cmd = [python_executable, str(worker_script)]
+        cmd = build_worker_launch_command(
+            python_executable=python_executable,
+            worker_script=worker_script,
+            remote_host=self._remote_host or None,
+            remote_workdir=remote_workdir,
+            remote_env=env_overrides if self._remote_host else None,
+        )
         try:
             self._proc = subprocess.Popen(
                 cmd,
@@ -223,7 +504,8 @@ class ReferenceLogprobClient:
                 env=env,
             )
         except Exception as exc:
-            raise RuntimeError(f"Failed to start reference worker: cmd={cmd}") from exc
+            location = f" via ssh host={self._remote_host}" if self._remote_host else ""
+            raise RuntimeError(f"Failed to start reference worker{location}: cmd={cmd}") from exc
 
         try:
             init_resp = self.request({"type": "init", "config": config_payload})
@@ -266,16 +548,41 @@ class ReferenceLogprobClient:
         return resp
 
     def score_logprobs(self, prompt_ids: list[int], completion_ids: list[int]) -> list[float]:
-        resp = self.request(
+        rows = self.score_logprobs_batch([(prompt_ids, completion_ids)])
+        return rows[0] if rows else []
+
+    def score_logprobs_batch(self, items: list[tuple[list[int], list[int]]]) -> list[list[float]]:
+        if not items:
+            return []
+        payload_items = [
             {
-                "type": "score",
                 "prompt_ids": [int(v) for v in prompt_ids],
                 "completion_ids": [int(v) for v in completion_ids],
             }
+            for prompt_ids, completion_ids in items
+        ]
+        resp = self.request(
+            {
+                "type": "score_batch",
+                "items": payload_items,
+            }
         )
         if not bool(resp.get("ok", False)):
-            raise RuntimeError(f"reference worker score failed: {resp.get('error', 'unknown error')}")
-        return [float(v) for v in list(resp.get("logprobs", []))]
+            raise RuntimeError(f"reference worker score_batch failed: {resp.get('error', 'unknown error')}")
+        rows_raw = resp.get("logprobs_rows", [])
+        if not isinstance(rows_raw, list):
+            raise RuntimeError("reference worker score_batch returned invalid logprobs_rows payload")
+        rows: list[list[float]] = []
+        for row in rows_raw:
+            if not isinstance(row, list):
+                rows.append([])
+                continue
+            rows.append([float(v) for v in row])
+        if len(rows) != len(items):
+            raise RuntimeError(
+                f"reference worker score_batch size mismatch: requested={len(items)} returned={len(rows)}"
+            )
+        return rows
 
     def close(self) -> None:
         if getattr(self, "_proc", None) is None:
@@ -339,6 +646,21 @@ def _parse_cuda_visible_devices_env() -> list[int] | None:
     return values if values else None
 
 
+def _normalize_optional_text(value: str | None) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _effective_worker_host(component_host: str | None, fallback_host: str | None) -> str | None:
+    return _normalize_optional_text(component_host) or _normalize_optional_text(fallback_host)
+
+
+def _effective_worker_workdir(component_workdir: str | None, fallback_workdir: str | None) -> str | None:
+    return _normalize_optional_text(component_workdir) or _normalize_optional_text(fallback_workdir)
+
+
 def _get_rank_gpu_mapping_entry(policy_gpu_ids: list[int]) -> dict[str, Any]:
     local_rank_raw = os.environ.get("LOCAL_RANK")
     local_rank = int(local_rank_raw) if local_rank_raw and local_rank_raw.isdigit() else None
@@ -357,6 +679,7 @@ def _get_rank_gpu_mapping_entry(policy_gpu_ids: list[int]) -> dict[str, Any]:
         "rank": _distributed_rank(),
         "local_rank": local_rank,
         "physical_gpu": physical_gpu,
+        "host": socket.gethostname(),
         "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
     }
 
@@ -382,9 +705,10 @@ def _validate_deepspeed_partition_strict(cfg: RLPostTrainConfig) -> None:
         )
 
     world_size = _distributed_world_size()
-    if world_size != len(policy_gpu_ids):
+    local_world_size = len(policy_gpu_ids)
+    if world_size < local_world_size or (world_size % local_world_size) != 0:
         raise RuntimeError(
-            "DeepSpeed strict mode requires WORLD_SIZE == len(model.policy_gpu_ids). "
+            "DeepSpeed strict mode requires WORLD_SIZE to be a multiple of len(model.policy_gpu_ids). "
             f"world_size={world_size} policy_gpu_ids={policy_gpu_ids}. "
             f"Example: {_deepspeed_launch_hint(policy_gpu_ids)}"
         )
@@ -392,13 +716,16 @@ def _validate_deepspeed_partition_strict(cfg: RLPostTrainConfig) -> None:
     reference_gpu_ids = _normalize_gpu_id_list(cfg.model.reference_gpu_ids)
     policy_set = set(policy_gpu_ids)
     reserved_map: dict[str, int] = {}
-    if reference_gpu_ids:
+    reference_host = _effective_worker_host(cfg.model.reference_worker_host, cfg.misc.aux_worker_host)
+    metricx_host = _effective_worker_host(cfg.reward.metricx.worker_host, cfg.misc.aux_worker_host)
+    xcomet_host = _effective_worker_host(cfg.reward.xcomet.worker_host, cfg.misc.aux_worker_host)
+    if reference_gpu_ids and reference_host is None:
         reserved_map["reference"] = int(reference_gpu_ids[0])
-    if cfg.reward.metricx.enabled:
+    if cfg.reward.metricx.enabled and metricx_host is None:
         metricx_idx = _parse_cuda_index(cfg.reward.metricx.device)
         if metricx_idx is not None:
             reserved_map["metricx"] = metricx_idx
-    if cfg.reward.xcomet.enabled:
+    if cfg.reward.xcomet.enabled and xcomet_host is None:
         xcomet_idx = _parse_cuda_index(cfg.reward.xcomet.device)
         if xcomet_idx is not None:
             reserved_map["xcomet"] = xcomet_idx
@@ -431,20 +758,35 @@ def _validate_deepspeed_partition_strict(cfg: RLPostTrainConfig) -> None:
             f"Example: {_deepspeed_launch_hint(policy_gpu_ids)}"
         )
 
-    actual_policy = sorted({int(e["physical_gpu"]) for e in entries})
     expected_policy = sorted(policy_gpu_ids)
-    if actual_policy != expected_policy:
-        raise RuntimeError(
-            "DeepSpeed strict policy partition mismatch. "
-            f"expected_policy={expected_policy} actual_policy={actual_policy} entries={entries}. "
-            f"Launch with explicit include. Example: {_deepspeed_launch_hint(expected_policy)}"
-        )
+    by_host: dict[str, list[dict[str, Any]]] = {}
+    for entry in entries:
+        host = str(entry.get("host") or "")
+        by_host.setdefault(host, []).append(entry)
+
+    for host, host_entries in sorted(by_host.items(), key=lambda kv: kv[0]):
+        if len(host_entries) != local_world_size:
+            raise RuntimeError(
+                "DeepSpeed strict mode requires each policy host to run "
+                "len(model.policy_gpu_ids) ranks. "
+                f"host={host!r} host_ranks={len(host_entries)} expected={local_world_size} "
+                f"entries={host_entries}"
+            )
+        host_policy = sorted({int(e["physical_gpu"]) for e in host_entries})
+        if host_policy != expected_policy:
+            raise RuntimeError(
+                "DeepSpeed strict policy partition mismatch. "
+                f"host={host!r} expected_policy={expected_policy} actual_policy={host_policy} "
+                f"entries={host_entries}. "
+                f"Launch with explicit include. Example: {_deepspeed_launch_hint(expected_policy)}"
+            )
 
     if _is_rank0():
         logger.info(
-            "DeepSpeed strict GPU mapping: policy=%s reserved=%s rank_mapping=%s",
+            "DeepSpeed strict GPU mapping: policy=%s reserved=%s hosts=%s rank_mapping=%s",
             expected_policy,
             reserved_map,
+            sorted(by_host.keys()),
             [{k: v for k, v in e.items() if k in {'rank', 'local_rank', 'physical_gpu'}} for e in entries],
         )
 
@@ -491,6 +833,10 @@ def _assign_disjoint_gpu_devices(cfg: RLPostTrainConfig) -> None:
 
     explicit_policy_ids = _normalize_gpu_id_list(cfg.model.policy_gpu_ids)
     explicit_reference_ids = _normalize_gpu_id_list(cfg.model.reference_gpu_ids)
+    reference_host = _effective_worker_host(cfg.model.reference_worker_host, cfg.misc.aux_worker_host)
+    metricx_host = _effective_worker_host(cfg.reward.metricx.worker_host, cfg.misc.aux_worker_host)
+    xcomet_host = _effective_worker_host(cfg.reward.xcomet.worker_host, cfg.misc.aux_worker_host)
+    local_reference_ids = explicit_reference_ids if reference_host is None else []
 
     if explicit_policy_ids or explicit_reference_ids:
         # In DeepSpeed launcher mode, CUDA_VISIBLE_DEVICES may expose only policy GPUs
@@ -501,10 +847,10 @@ def _assign_disjoint_gpu_devices(cfg: RLPostTrainConfig) -> None:
         skip_local_range_check = bool(
             cfg.rl.backend == "deepspeed"
             and visible_ids is not None
-            and len(visible_ids) < max(explicit_policy_ids + explicit_reference_ids + [0]) + 1
+            and len(visible_ids) < max(explicit_policy_ids + local_reference_ids + [0]) + 1
         )
         if not skip_local_range_check:
-            for idx in explicit_policy_ids + explicit_reference_ids:
+            for idx in explicit_policy_ids + local_reference_ids:
                 if idx >= device_count:
                     raise ValueError(
                         f"Configured GPU index out of range: {idx} (cuda_count={device_count})"
@@ -516,7 +862,7 @@ def _assign_disjoint_gpu_devices(cfg: RLPostTrainConfig) -> None:
                 os.environ.get("CUDA_VISIBLE_DEVICES"),
             )
 
-        used: set[int] = set(explicit_policy_ids) | set(explicit_reference_ids)
+        used: set[int] = set(explicit_policy_ids) | set(local_reference_ids)
 
         if _is_cuda_text(cfg.misc.device):
             if not explicit_policy_ids:
@@ -532,7 +878,7 @@ def _assign_disjoint_gpu_devices(cfg: RLPostTrainConfig) -> None:
         # For explicit DeepSpeed partition, keep reward device ids exactly as configured
         # (physical GPU indices) and do not remap against local visible GPUs.
         if cfg.rl.backend != "deepspeed":
-            if cfg.reward.metricx.enabled and _is_cuda_text(cfg.reward.metricx.device):
+            if cfg.reward.metricx.enabled and metricx_host is None and _is_cuda_text(cfg.reward.metricx.device):
                 metricx_idx = _pick_free_gpu(
                     preferred=_parse_cuda_index(cfg.reward.metricx.device),
                     used=used,
@@ -541,7 +887,7 @@ def _assign_disjoint_gpu_devices(cfg: RLPostTrainConfig) -> None:
                 used.add(metricx_idx)
                 cfg.reward.metricx.device = f"cuda:{metricx_idx}"
 
-            if cfg.reward.xcomet.enabled and _is_cuda_text(cfg.reward.xcomet.device):
+            if cfg.reward.xcomet.enabled and xcomet_host is None and _is_cuda_text(cfg.reward.xcomet.device):
                 xcomet_idx = _pick_free_gpu(
                     preferred=_parse_cuda_index(cfg.reward.xcomet.device),
                     used=used,
@@ -563,13 +909,21 @@ def _assign_disjoint_gpu_devices(cfg: RLPostTrainConfig) -> None:
         {"name": "policy", "enabled": _is_cuda_text(cfg.misc.device), "raw": cfg.misc.device, "required": True},
         {
             "name": "metricx",
-            "enabled": bool(cfg.reward.metricx.enabled and _is_cuda_text(cfg.reward.metricx.device)),
+            "enabled": bool(
+                cfg.reward.metricx.enabled
+                and metricx_host is None
+                and _is_cuda_text(cfg.reward.metricx.device)
+            ),
             "raw": cfg.reward.metricx.device,
             "required": False,
         },
         {
             "name": "xcomet",
-            "enabled": bool(cfg.reward.xcomet.enabled and _is_cuda_text(cfg.reward.xcomet.device)),
+            "enabled": bool(
+                cfg.reward.xcomet.enabled
+                and xcomet_host is None
+                and _is_cuda_text(cfg.reward.xcomet.device)
+            ),
             "raw": cfg.reward.xcomet.device,
             "required": False,
         },
@@ -623,6 +977,25 @@ def _mean_std(values: list[float]) -> tuple[float, float]:
     m = sum(values) / len(values)
     var = sum((v - m) ** 2 for v in values) / len(values)
     return float(m), float(var**0.5)
+
+
+def _apply_aux_worker_defaults(cfg: RLPostTrainConfig) -> None:
+    aux_host = _normalize_optional_text(cfg.misc.aux_worker_host)
+    aux_workdir = _normalize_optional_text(cfg.misc.aux_worker_remote_workdir)
+    if aux_host is not None:
+        if _normalize_optional_text(cfg.model.reference_worker_host) is None:
+            cfg.model.reference_worker_host = aux_host
+        if _normalize_optional_text(cfg.reward.metricx.worker_host) is None:
+            cfg.reward.metricx.worker_host = aux_host
+        if _normalize_optional_text(cfg.reward.xcomet.worker_host) is None:
+            cfg.reward.xcomet.worker_host = aux_host
+    if aux_workdir is not None:
+        if _normalize_optional_text(cfg.model.reference_worker_remote_workdir) is None:
+            cfg.model.reference_worker_remote_workdir = aux_workdir
+        if _normalize_optional_text(cfg.reward.metricx.worker_remote_workdir) is None:
+            cfg.reward.metricx.worker_remote_workdir = aux_workdir
+        if _normalize_optional_text(cfg.reward.xcomet.worker_remote_workdir) is None:
+            cfg.reward.xcomet.worker_remote_workdir = aux_workdir
 
 
 def _flatten(rows: list[list[float]]) -> list[float]:
@@ -963,10 +1336,18 @@ def _create_reference_logprob_client(
 
     dtype, attn_impl = _resolve_model_dtype_and_attn(cfg, requested_device)
     worker_device = requested_device
-    worker_env_overrides: dict[str, str] | None = None
+    worker_env_overrides: dict[str, str] | None = collect_huggingface_worker_env() or None
+    remote_host = _effective_worker_host(cfg.model.reference_worker_host, cfg.misc.aux_worker_host)
+    remote_workdir = _effective_worker_workdir(
+        cfg.model.reference_worker_remote_workdir,
+        cfg.misc.aux_worker_remote_workdir,
+    )
     reference_gpu_idx = _parse_cuda_index(requested_device)
     if reference_gpu_idx is not None:
-        worker_env_overrides = {"CUDA_VISIBLE_DEVICES": str(reference_gpu_idx)}
+        worker_env_overrides = merge_env_overrides(
+            worker_env_overrides,
+            {"CUDA_VISIBLE_DEVICES": str(reference_gpu_idx)},
+        )
         worker_device = "cuda:0"
 
     cfg_payload: dict[str, Any] = {
@@ -982,10 +1363,13 @@ def _create_reference_logprob_client(
         timeout_sec=float(cfg.model.reference_subprocess_timeout_sec),
         config_payload=cfg_payload,
         env_overrides=worker_env_overrides,
+        remote_host=remote_host,
+        remote_workdir=remote_workdir,
     )
     logger.info(
-        "Reference worker started with python=%s requested_device=%s worker_device=%s model=%s",
+        "Reference worker started with python=%s host=%s requested_device=%s worker_device=%s model=%s",
         python_executable,
+        remote_host or "local",
         requested_device,
         worker_device,
         ref_name,
@@ -1124,16 +1508,57 @@ def _prepare_rewards_and_advantages(
         return out, replaced
 
     samples = [SampleForScoring(src=r.src_text, mt=r.completion_text, ref=r.ref_text) for r in rollouts]
+    debug_span_loss = _env_flag("GEMMA27_RL_DEBUG_SPAN_LOSS", default=False)
+    debug_span_max_rollouts = _env_int("GEMMA27_RL_DEBUG_SPAN_MAX_ROLLOUTS", default=1, minimum=1)
+    debug_span_max_tokens = _env_int("GEMMA27_RL_DEBUG_SPAN_MAX_TOKENS", default=256, minimum=1)
+    debug_span_only_nonzero = _env_flag("GEMMA27_RL_DEBUG_SPAN_ONLY_NONZERO", default=False)
+    debug_span_records: list[tuple[int, Rollout, list[dict[str, Any]], list[float], list[float], float]] = []
 
-    if cfg.reward.metricx.enabled and metricx_scorer is not None:
-        metricx_scores = _score_with_cache_metricx(
-            samples=samples,
-            scorer=metricx_scorer,
-            cache=metricx_cache,
-            use_cache=cfg.reward.cache_enabled,
+    metricx_enabled = cfg.reward.metricx.enabled and metricx_scorer is not None
+    xcomet_enabled = cfg.reward.xcomet.enabled and xcomet_scorer is not None
+
+    metricx_scores = [cfg.reward.metricx.offset for _ in rollouts]
+    xcomet_scores = [0.0 for _ in rollouts]
+    span_rows = [[] for _ in rollouts]
+
+    if metricx_enabled and xcomet_enabled:
+        logger.info(
+            "reward scoring: running MetricX and xCOMET in parallel for %s rollouts",
+            len(rollouts),
         )
+        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="reward-scorer") as executor:
+            metricx_future = executor.submit(
+                _score_with_cache_metricx,
+                samples=samples,
+                scorer=metricx_scorer,
+                cache=metricx_cache,
+                use_cache=cfg.reward.cache_enabled,
+            )
+            xcomet_future = executor.submit(
+                _score_with_cache_xcomet,
+                samples=samples,
+                scorer=xcomet_scorer,
+                cache=xcomet_cache,
+                use_cache=cfg.reward.cache_enabled,
+            )
+            metricx_scores = metricx_future.result()
+            xcomet_scores, span_rows = xcomet_future.result()
     else:
-        metricx_scores = [cfg.reward.metricx.offset for _ in rollouts]
+        if metricx_enabled:
+            metricx_scores = _score_with_cache_metricx(
+                samples=samples,
+                scorer=metricx_scorer,
+                cache=metricx_cache,
+                use_cache=cfg.reward.cache_enabled,
+            )
+        if xcomet_enabled:
+            xcomet_scores, span_rows = _score_with_cache_xcomet(
+                samples=samples,
+                scorer=xcomet_scorer,
+                cache=xcomet_cache,
+                use_cache=cfg.reward.cache_enabled,
+            )
+
     metricx_scores, metricx_replaced = _sanitize(metricx_scores, fallback=cfg.reward.metricx.offset)
     if metricx_replaced > 0:
         msg = (
@@ -1151,16 +1576,6 @@ def _prepare_rewards_and_advantages(
 
     metricx_rewards = [metricx_score_to_reward(v, offset=cfg.reward.metricx.offset) for v in metricx_scores]
 
-    if cfg.reward.xcomet.enabled and xcomet_scorer is not None:
-        xcomet_scores, span_rows = _score_with_cache_xcomet(
-            samples=samples,
-            scorer=xcomet_scorer,
-            cache=xcomet_cache,
-            use_cache=cfg.reward.cache_enabled,
-        )
-    else:
-        xcomet_scores = [0.0 for _ in rollouts]
-        span_rows = [[] for _ in rollouts]
     xcomet_scores, xcomet_replaced = _sanitize(xcomet_scores, fallback=0.0)
     if xcomet_replaced > 0:
         logger.warning(
@@ -1224,6 +1639,17 @@ def _prepare_rewards_and_advantages(
 
         token_reward_rows.append(token_rewards)
         raw_adv_rows.append(raw_adv)
+        if debug_span_loss and len(debug_span_records) < debug_span_max_rollouts:
+            debug_span_records.append(
+                (
+                    len(raw_adv_rows) - 1,
+                    rollout,
+                    span_row,
+                    list(token_rewards),
+                    list(raw_adv),
+                    float(seq_reward),
+                )
+            )
 
         span_counter = {"MINOR": 0, "MAJOR": 0, "CRITICAL": 0}
         for span in span_row:
@@ -1253,6 +1679,22 @@ def _prepare_rewards_and_advantages(
             "norm_mean": raw_m,
             "norm_std": raw_s,
         }
+
+    if debug_span_loss and debug_span_records:
+        for row_idx, rollout, span_row, token_rewards, raw_adv_pre, seq_reward in debug_span_records:
+            adv_used = norm_adv_rows[row_idx] if row_idx < len(norm_adv_rows) else []
+            _log_span_debug_for_rollout(
+                rollout=rollout,
+                span_row=span_row,
+                token_rewards=token_rewards,
+                raw_adv=raw_adv_pre,
+                adv_used=adv_used,
+                seq_reward=seq_reward,
+                overlap_policy=cfg.reward.overlap_policy,
+                majority_threshold=cfg.reward.majority_threshold,
+                max_tokens=debug_span_max_tokens,
+                only_nonzero=debug_span_only_nonzero,
+            )
 
     flat_token_rewards = _flatten(token_reward_rows)
     token_reward_m, token_reward_s = _mean_std(flat_token_rewards)
@@ -1433,6 +1875,7 @@ def run_metric_only_eval(cfg: RLPostTrainConfig) -> dict[str, Any]:
         token_env_name=cfg.misc.huggingface_token_env,
     )
     configure_huggingface_cache(cfg.misc.huggingface_cache_dir, token=hf_token)
+    _apply_aux_worker_defaults(cfg)
     _assign_disjoint_gpu_devices(cfg)
     device = resolve_device(cfg.misc.device)
 
@@ -1483,6 +1926,7 @@ def run_metric_only_eval(cfg: RLPostTrainConfig) -> dict[str, Any]:
         metricx_scorer=metricx_scorer,
         xcomet_scorer=xcomet_scorer,
         mqm_scorer=mqm_scorer,
+        show_progress=True,
     )
     logger.info("Eval report: %s", report)
     return report
@@ -1490,11 +1934,14 @@ def run_metric_only_eval(cfg: RLPostTrainConfig) -> dict[str, Any]:
 
 def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
     set_seed(cfg.misc.seed)
+    _configure_nccl_heartbeat_timeout(cfg)
+    _configure_cuda_allocator()
     hf_token = resolve_huggingface_token(
         explicit_token=cfg.misc.huggingface_token,
         token_env_name=cfg.misc.huggingface_token_env,
     )
     configure_huggingface_cache(cfg.misc.huggingface_cache_dir, token=hf_token)
+    _apply_aux_worker_defaults(cfg)
     _assign_disjoint_gpu_devices(cfg)
     use_deepspeed = cfg.rl.backend == "deepspeed"
     if use_deepspeed and _distributed_world_size() > 1 and not _is_distributed_initialized():
@@ -1509,7 +1956,9 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
         base_device = _local_rank_device(base_device)
         _validate_deepspeed_partition_strict(cfg)
     device = base_device
+    rank = _distributed_rank()
     rank0 = _is_rank0()
+    world_size = _distributed_world_size()
 
     output_dir = Path(cfg.logging.output_dir)
     if rank0:
@@ -1562,6 +2011,7 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
     else:
         policy_source = str(resume_ckpt) if resume_ckpt is not None else cfg.model.policy_name_or_path
     policy_model = _load_policy_model(cfg, device=device, model_name_or_path=policy_source)
+    _configure_policy_train_memory(policy_model)
     train_model: Any = policy_model
     optimizer: torch.optim.Optimizer | None = None
     if use_deepspeed:
@@ -1711,6 +2161,29 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
             "resume checkpoints will not be written during training."
         )
 
+    distributed_eval_shard = bool(use_deepspeed and world_size > 1 and cfg.eval.distributed_shard)
+    if use_deepspeed and world_size > 1 and (not distributed_eval_shard) and rank0:
+        logger.info(
+            "Eval distributed sharding is disabled; keeping all ranks in eval generation to avoid ZeRO/NCCL deadlock."
+        )
+
+    def _run_eval_once(*, collect_outputs: bool, show_progress: bool) -> dict[str, Any]:
+        return evaluate_on_dataset(
+            examples=eval_examples,
+            policy_model=policy_eval_model,
+            tokenizer=tokenizer,
+            cfg=cfg,
+            device=device,
+            metricx_scorer=metricx_scorer,
+            xcomet_scorer=xcomet_scorer,
+            mqm_scorer=mqm_scorer,
+            collect_outputs=collect_outputs,
+            show_progress=show_progress,
+            distributed_eval_shard=distributed_eval_shard,
+            distributed_rank=rank,
+            distributed_world_size=world_size,
+        )
+
     if cfg.eval.run_before_train and eval_examples and start_update <= 1:
         if (not use_deepspeed) or rank0:
             logger.info(
@@ -1720,17 +2193,11 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
                 bool(xcomet_scorer is not None and cfg.reward.xcomet.enabled),
                 bool(mqm_scorer is not None and cfg.reward.mqm.enabled),
             )
-            report = evaluate_on_dataset(
-                examples=eval_examples,
-                policy_model=policy_eval_model,
-                tokenizer=tokenizer,
-                cfg=cfg,
-                device=device,
-                metricx_scorer=metricx_scorer,
-                xcomet_scorer=xcomet_scorer,
-                mqm_scorer=mqm_scorer,
-                collect_outputs=cfg.logging.save_eval_outputs,
-            )
+        report = _run_eval_once(
+            collect_outputs=bool(cfg.logging.save_eval_outputs and ((not use_deepspeed) or rank0)),
+            show_progress=bool((not use_deepspeed) or rank0),
+        )
+        if (not use_deepspeed) or rank0:
             eval_select_score = _compute_eval_selection_score(report, cfg)
             report["model_select_score"] = eval_select_score
             eval_rows = report.pop("eval_rows", [])
@@ -1763,14 +2230,18 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
     train_indices = list(range(len(train_examples)))
     rng.shuffle(train_indices)
     train_cursor = 0
-    updates_per_epoch = math.ceil(len(train_examples) / max(1, cfg.rl.batch_size))
-    logger.info(
-        "train_examples=%s batch_size=%s updates_per_epoch=%s configured_updates=%s",
-        len(train_examples),
-        cfg.rl.batch_size,
-        updates_per_epoch,
-        cfg.rl.updates,
-    )
+    per_rank_batch_size = max(1, int(cfg.rl.batch_size))
+    effective_batch_size = per_rank_batch_size * (world_size if (use_deepspeed and world_size > 1) else 1)
+    updates_per_epoch = math.ceil(len(train_examples) / max(1, effective_batch_size))
+    if (not use_deepspeed) or rank0:
+        logger.info(
+            "train_examples=%s per_rank_batch_size=%s effective_batch_size=%s updates_per_epoch=%s configured_updates=%s",
+            len(train_examples),
+            per_rank_batch_size,
+            effective_batch_size,
+            updates_per_epoch,
+            cfg.rl.updates,
+        )
 
     if start_update > cfg.rl.updates:
         logger.info(
@@ -1784,7 +2255,195 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
         advantages: list[list[float]] = []
         reward_stats: dict[str, float] = {}
         adv_stats: dict[str, float] = {}
-        if (not use_deepspeed) or rank0:
+        log_rollouts: list[Rollout] = rollouts
+        log_advantages: list[list[float]] = advantages
+        if use_deepspeed and world_size > 1:
+            per_rank_batches: list[list[int]] = []
+            if rank0:
+                global_batch_size = per_rank_batch_size * world_size
+                global_indices: list[int] = []
+                while len(global_indices) < global_batch_size:
+                    if train_cursor >= len(train_indices):
+                        rng.shuffle(train_indices)
+                        train_cursor = 0
+                    remaining = len(train_indices) - train_cursor
+                    take = min(global_batch_size - len(global_indices), remaining)
+                    if take <= 0:
+                        break
+                    global_indices.extend(train_indices[train_cursor:train_cursor + take])
+                    train_cursor += take
+                per_rank_batches = [
+                    global_indices[i * per_rank_batch_size : (i + 1) * per_rank_batch_size]
+                    for i in range(world_size)
+                ]
+
+            shared_batch: list[Any] = [per_rank_batches]
+            _broadcast_object_list(shared_batch, src=0)
+            per_rank_batches = shared_batch[0] or []
+            local_indices = (
+                [int(i) for i in per_rank_batches[rank]]
+                if rank < len(per_rank_batches)
+                else []
+            )
+            if not local_indices:
+                logger.warning("Rank %s has empty rollout shard at update=%s; skipping step.", rank, update_idx)
+            local_examples = [train_examples[i] for i in local_indices]
+
+            _set_rollout_sampling_seed(cfg.misc.seed + update_idx + (rank * 1009))
+            local_rollouts = generate_rollouts(
+                examples=local_examples,
+                policy_model=policy_eval_model,
+                tokenizer=tokenizer,
+                gen_cfg=cfg.generation,
+                device=device,
+                ref_model=ref_model if rank0 else None,
+                ref_device=ref_device if rank0 else None,
+                ref_logprob_fn=(
+                    ref_logprob_client.score_logprobs
+                    if (rank0 and ref_logprob_client is not None)
+                    else None
+                ),
+                prompt_template=cfg.prompt.template,
+                show_progress=bool(rank0),
+                progress_desc=f"rollout u{update_idx}",
+            )
+            gathered_rollouts = _gather_object_to_rank0(local_rollouts)
+            per_rank_payload: list[Any] | None = None
+            shared_stats: list[Any] = [reward_stats if rank0 else {}, adv_stats if rank0 else {}]
+            if rank0:
+                per_rank_rollouts: list[list[Rollout]] = []
+                for shard_idx in range(world_size):
+                    shard_rollouts: list[Rollout] = []
+                    if gathered_rollouts is not None and shard_idx < len(gathered_rollouts):
+                        raw_shard = gathered_rollouts[shard_idx]
+                        if isinstance(raw_shard, list):
+                            shard_rollouts = [r for r in raw_shard if isinstance(r, Rollout)]
+                    per_rank_rollouts.append(shard_rollouts)
+
+                merged_rollouts: list[Rollout] = []
+                for shard_rollouts in per_rank_rollouts:
+                    merged_rollouts.extend(shard_rollouts)
+
+                if merged_rollouts and cfg.rl.kl_coef > 0:
+                    missing_ref = 0
+                    missing_idx = [i for i, r in enumerate(merged_rollouts) if r.ref_logprobs is None]
+                    if missing_idx and ref_logprob_client is not None:
+                        batch_chunk = 16
+                        batch_calls = 0
+                        requests = [
+                            (
+                                merged_rollouts[i].prompt_input_ids,
+                                merged_rollouts[i].completion_token_ids,
+                            )
+                            for i in missing_idx
+                        ]
+                        responses: list[list[float]] = []
+                        for start in range(0, len(requests), batch_chunk):
+                            chunk = requests[start:start + batch_chunk]
+                            responses.extend(ref_logprob_client.score_logprobs_batch(chunk))
+                            batch_calls += 1
+                        if len(responses) != len(missing_idx):
+                            raise RuntimeError(
+                                "reference score_batch result size mismatch while filling missing logprobs"
+                            )
+                        for idx, row in zip(missing_idx, responses):
+                            merged_rollouts[idx].ref_logprobs = [float(v) for v in row]
+                        missing_ref = len(missing_idx)
+                        logger.info(
+                            "Filled reference logprobs on rank0 for %s gathered rollouts at update=%s (batch_calls=%s chunk=%s).",
+                            missing_ref,
+                            update_idx,
+                            batch_calls,
+                            batch_chunk,
+                        )
+                    elif missing_idx and ref_model is not None:
+                        for idx in missing_idx:
+                            rollout = merged_rollouts[idx]
+                            rollout.ref_logprobs = compute_completion_logprobs(
+                                ref_model,
+                                rollout.prompt_input_ids,
+                                rollout.completion_token_ids,
+                                device=ref_device or device,
+                            ).tolist()
+                        missing_ref = len(missing_idx)
+                    if missing_ref > 0 and ref_logprob_client is None:
+                        logger.info(
+                            "Filled reference logprobs on rank0 for %s gathered rollouts at update=%s.",
+                            missing_ref,
+                            update_idx,
+                        )
+
+                merged_advantages: list[list[float]] = []
+                if merged_rollouts:
+                    merged_advantages, reward_stats, adv_stats = _prepare_rewards_and_advantages(
+                        rollouts=merged_rollouts,
+                        cfg=cfg,
+                        metricx_scorer=metricx_scorer,
+                        xcomet_scorer=xcomet_scorer,
+                        mqm_scorer=mqm_scorer,
+                        metricx_cache=metricx_cache,
+                        xcomet_cache=xcomet_cache,
+                        mqm_cache=mqm_cache,
+                    )
+                else:
+                    logger.warning("No rollouts generated at update=%s; skipping step.", update_idx)
+
+                shard_sizes = [len(shard) for shard in per_rank_rollouts]
+                can_shard_update = (
+                    bool(merged_rollouts)
+                    and bool(shard_sizes)
+                    and min(shard_sizes) > 0
+                    and len(set(shard_sizes)) == 1
+                    and len(merged_advantages) == len(merged_rollouts)
+                )
+                if can_shard_update:
+                    logger.info(
+                        "Using per-rank policy update shards at update=%s shard_size=%s merged_rollouts=%s.",
+                        update_idx,
+                        shard_sizes[0] if shard_sizes else 0,
+                        len(merged_rollouts),
+                    )
+                    per_rank_advantages: list[list[list[float]]] = []
+                    cursor = 0
+                    for shard_rollouts in per_rank_rollouts:
+                        take = len(shard_rollouts)
+                        per_rank_advantages.append(merged_advantages[cursor:cursor + take])
+                        cursor += take
+                    per_rank_payload = [
+                        {"rollouts": per_rank_rollouts[i], "advantages": per_rank_advantages[i]}
+                        for i in range(world_size)
+                    ]
+                else:
+                    if merged_rollouts and len(set(shard_sizes)) > 1:
+                        logger.warning(
+                            "Uneven rollout shard sizes at update=%s; falling back to replicated policy update this step. shard_sizes=%s",
+                            update_idx,
+                            shard_sizes,
+                        )
+                    per_rank_payload = [
+                        {"rollouts": merged_rollouts, "advantages": merged_advantages}
+                        for _ in range(world_size)
+                    ]
+
+                shared_stats = [reward_stats, adv_stats]
+                log_rollouts = merged_rollouts
+                log_advantages = merged_advantages
+
+            local_payload = _scatter_object_from_rank0(per_rank_payload if rank0 else None, rank=rank)
+            if isinstance(local_payload, dict):
+                rollouts = list(local_payload.get("rollouts") or [])
+                advantages = list(local_payload.get("advantages") or [])
+            else:
+                rollouts = []
+                advantages = []
+
+            _broadcast_object_list(shared_stats, src=0)
+            reward_stats = shared_stats[0] or {}
+            adv_stats = shared_stats[1] or {}
+            if not rank0:
+                log_rollouts = rollouts
+                log_advantages = advantages
+        elif (not use_deepspeed) or rank0:
             if train_cursor >= len(train_indices):
                 rng.shuffle(train_indices)
                 train_cursor = 0
@@ -1806,6 +2465,8 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
                     else None
                 ),
                 prompt_template=cfg.prompt.template,
+                show_progress=True,
+                progress_desc=f"rollout u{update_idx}",
             )
             if rollouts:
                 advantages, reward_stats, adv_stats = _prepare_rewards_and_advantages(
@@ -1820,14 +2481,8 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
                 )
             else:
                 logger.warning("No rollouts generated at update=%s; skipping step.", update_idx)
-
-        if use_deepspeed and _distributed_world_size() > 1:
-            shared: list[Any] = [rollouts, advantages, reward_stats, adv_stats]
-            _broadcast_object_list(shared, src=0)
-            rollouts = shared[0] or []
-            advantages = shared[1] or []
-            reward_stats = shared[2] or {}
-            adv_stats = shared[3] or {}
+            log_rollouts = rollouts
+            log_advantages = advantages
 
         if not rollouts:
             _dist_barrier()
@@ -1847,7 +2502,7 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
             )
         train_stats = step_stats[-1]
 
-        completion_lens = [len(r.completion_token_ids) for r in rollouts]
+        completion_lens = [len(r.completion_token_ids) for r in log_rollouts]
         payload = {
             "type": "train",
             "update": update_idx,
@@ -1870,8 +2525,8 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
                 _append_rollout_jsonl(
                     path=rollout_log_path,
                     update_idx=update_idx,
-                    rollouts=rollouts,
-                    advantages=advantages,
+                    rollouts=log_rollouts,
+                    advantages=log_advantages,
                     reward_stats=reward_stats,
                 )
 
@@ -1959,17 +2614,11 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
                     bool(xcomet_scorer is not None and cfg.reward.xcomet.enabled),
                     bool(mqm_scorer is not None and cfg.reward.mqm.enabled),
                 )
-                report = evaluate_on_dataset(
-                    examples=eval_examples,
-                    policy_model=policy_eval_model,
-                    tokenizer=tokenizer,
-                    cfg=cfg,
-                    device=device,
-                    metricx_scorer=metricx_scorer,
-                    xcomet_scorer=xcomet_scorer,
-                    mqm_scorer=mqm_scorer,
-                    collect_outputs=cfg.logging.save_eval_outputs,
-                )
+            report = _run_eval_once(
+                collect_outputs=bool(cfg.logging.save_eval_outputs and ((not use_deepspeed) or rank0)),
+                show_progress=bool((not use_deepspeed) or rank0),
+            )
+            if (not use_deepspeed) or rank0:
                 eval_select_score = _compute_eval_selection_score(report, cfg)
                 report["model_select_score"] = eval_select_score
                 eval_rows = report.pop("eval_rows", [])

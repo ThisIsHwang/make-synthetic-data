@@ -4,17 +4,24 @@ from collections import Counter
 from copy import deepcopy
 import logging
 import math
+import os
 from statistics import mean
 from typing import Any
+
+try:
+    import torch
+except Exception:  # pragma: no cover - optional for lightweight tests
+    torch = None  # type: ignore[assignment]
 
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
 from .config import GenerationConfig, RLPostTrainConfig
 from .rewards import OpenAICompatibleMQMScorer, MetricXQEScorer, XCometXLScorer, metricx_score_to_reward
 from .rollout import generate_rollouts
-from .rl_types import Example, SampleForScoring
+from .rl_types import Example, Rollout, SampleForScoring
 
 logger = logging.getLogger(__name__)
+_EVAL_PAD_PREFIX = "__eval_pad__:"
 
 
 def _mean_std(values: list[float]) -> tuple[float, float]:
@@ -23,6 +30,99 @@ def _mean_std(values: list[float]) -> tuple[float, float]:
     m = mean(values)
     var = sum((v - m) ** 2 for v in values) / len(values)
     return float(m), float(var**0.5)
+
+
+def _distributed_ready(rank: int, world_size: int) -> bool:
+    if torch is None:
+        return False
+    if world_size <= 1:
+        return False
+    if rank < 0:
+        return False
+    if not torch.distributed.is_available():
+        return False
+    return torch.distributed.is_initialized()
+
+
+def _set_distributed_cuda_device() -> None:
+    if torch is None or (not torch.cuda.is_available()):
+        return
+    local_rank_raw = os.environ.get("LOCAL_RANK")
+    if local_rank_raw is None or (not local_rank_raw.isdigit()):
+        return
+    torch.cuda.set_device(int(local_rank_raw))
+
+
+def _gather_rollouts_to_rank0(local_rollouts: list[Rollout], *, rank: int, world_size: int) -> list[Rollout]:
+    if not _distributed_ready(rank, world_size):
+        return local_rollouts
+    # NCCL object collectives require local rank/device alignment.
+    _set_distributed_cuda_device()
+    gathered: list[Any] = [None for _ in range(world_size)]
+    torch.distributed.all_gather_object(gathered, local_rollouts)
+    if rank != 0:
+        return []
+    merged: list[Rollout] = []
+    for shard in gathered:
+        if isinstance(shard, list):
+            merged.extend(shard)
+    return merged
+
+
+def _broadcast_report_from_rank0(report: dict[str, Any] | None, *, rank: int, world_size: int) -> dict[str, Any] | None:
+    if not _distributed_ready(rank, world_size):
+        return report
+    _set_distributed_cuda_device()
+    payload: list[Any] = [report if rank == 0 else None]
+    torch.distributed.broadcast_object_list(payload, src=0)
+    value = payload[0]
+    return value if isinstance(value, dict) else None
+
+
+def _pad_eval_shard_examples(
+    examples: list[Example],
+    *,
+    rank: int,
+    world_size: int,
+) -> tuple[list[Example], int]:
+    local_examples = list(examples[rank::world_size])
+    if world_size <= 1:
+        return local_examples, 0
+    target_count = math.ceil(len(examples) / float(world_size))
+    pad_count = max(0, int(target_count) - len(local_examples))
+    if pad_count <= 0:
+        return local_examples, 0
+
+    if local_examples:
+        anchor = local_examples[0]
+    elif examples:
+        anchor = examples[0]
+    else:
+        # Defensive fallback; evaluate_on_dataset already handles empty examples.
+        anchor = Example(
+            example_id="__eval_anchor__",
+            src_text="",
+            src_lang="English",
+            tgt_lang="Korean",
+            src_lang_code="en",
+            tgt_lang_code="ko",
+            ref_text=None,
+        )
+
+    padded = list(local_examples)
+    for i in range(pad_count):
+        padded.append(
+            Example(
+                example_id=f"{_EVAL_PAD_PREFIX}{rank}:{i}",
+                src_text=anchor.src_text or ".",
+                src_lang=anchor.src_lang,
+                tgt_lang=anchor.tgt_lang,
+                src_lang_code=anchor.src_lang_code,
+                tgt_lang_code=anchor.tgt_lang_code,
+                ref_text=anchor.ref_text,
+            )
+        )
+    return padded, pad_count
 
 
 def evaluate_on_dataset(
@@ -35,6 +135,10 @@ def evaluate_on_dataset(
     xcomet_scorer: XCometXLScorer | None = None,
     mqm_scorer: OpenAICompatibleMQMScorer | None = None,
     collect_outputs: bool = False,
+    show_progress: bool = False,
+    distributed_eval_shard: bool = False,
+    distributed_rank: int = 0,
+    distributed_world_size: int = 1,
 ) -> dict[str, Any]:
     if not examples:
         empty = {
@@ -68,16 +172,57 @@ def evaluate_on_dataset(
                 logger.warning("Ignoring unknown eval.generation_overrides key: %s", key)
         logger.info("evaluate_on_dataset: applied eval generation overrides: %s", eval_overrides)
 
-    rollouts = generate_rollouts(
-        examples=examples,
+    shard_eval = bool(distributed_eval_shard and distributed_world_size > 1)
+    if shard_eval:
+        local_examples, pad_count = _pad_eval_shard_examples(
+            examples,
+            rank=distributed_rank,
+            world_size=distributed_world_size,
+        )
+        if distributed_rank == 0:
+            logger.info(
+                "evaluate_on_dataset: distributed shard mode enabled world_size=%s rank=%s local_examples=%s pad=%s",
+                distributed_world_size,
+                distributed_rank,
+                len(local_examples),
+                pad_count,
+            )
+    else:
+        local_examples = examples
+        pad_count = 0
+
+    local_rollouts = generate_rollouts(
+        examples=local_examples,
         policy_model=policy_model,
         tokenizer=tokenizer,
         gen_cfg=gen_cfg,
         device=device,
         ref_model=None,
         prompt_template=cfg.prompt.template,
+        show_progress=bool(show_progress),
+        progress_desc="eval rollout",
+        compute_old_logprobs=False,
+        compute_token_offsets=False,
+        include_prompt_input_ids=False,
     )
-    logger.info("evaluate_on_dataset: rollout complete rollouts=%s", len(rollouts))
+    if pad_count > 0:
+        local_rollouts = [r for r in local_rollouts if not str(r.example_id).startswith(_EVAL_PAD_PREFIX)]
+    if shard_eval:
+        logger.info(
+            "evaluate_on_dataset: local rollout done rank=%s local_rollouts=%s",
+            distributed_rank,
+            len(local_rollouts),
+        )
+        logger.info("evaluate_on_dataset: gather begin rank=%s", distributed_rank)
+    rollouts = _gather_rollouts_to_rank0(
+        local_rollouts,
+        rank=distributed_rank,
+        world_size=distributed_world_size,
+    )
+    if shard_eval:
+        logger.info("evaluate_on_dataset: gather done rank=%s merged_rollouts=%s", distributed_rank, len(rollouts))
+    if (not shard_eval) or distributed_rank == 0:
+        logger.info("evaluate_on_dataset: rollout complete rollouts=%s", len(rollouts))
 
     samples = [SampleForScoring(src=r.src_text, mt=r.completion_text, ref=r.ref_text) for r in rollouts]
 
@@ -196,6 +341,17 @@ def evaluate_on_dataset(
                 }
             )
         report["eval_rows"] = rows
+
+    if shard_eval:
+        report_summary = dict(report)
+        report_summary.pop("eval_rows", None)
+        synced = _broadcast_report_from_rank0(
+            report_summary if distributed_rank == 0 else None,
+            rank=distributed_rank,
+            world_size=distributed_world_size,
+        )
+        if distributed_rank != 0 and synced is not None:
+            report = synced
 
     logger.info(
         "evaluate_on_dataset: done metricx=%.4f xcomet=%.4f mqm=%.4f",

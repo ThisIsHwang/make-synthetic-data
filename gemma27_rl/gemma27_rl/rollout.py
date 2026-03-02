@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import logging
+import os
 from typing import Any, Callable
 
 try:
@@ -24,6 +25,11 @@ except Exception:  # pragma: no cover - optional during lightweight tests
     class LogitsProcessorList(list):  # type: ignore[no-redef]
         pass
 
+try:
+    from tqdm.auto import tqdm
+except Exception:  # pragma: no cover - optional dependency
+    tqdm = None  # type: ignore[assignment]
+
 from .config import GenerationConfig
 from .prompting import (
     DEFAULT_TRANSLATION_PROMPT_TEMPLATE,
@@ -45,6 +51,33 @@ class TokenDecodeConfig:
 def _require_torch() -> None:
     if torch is None or F is None:
         raise RuntimeError("torch is required for rollout generation/logprob computation.")
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _distributed_world_size() -> int:
+    if torch is None:
+        return 1
+    try:
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            return int(torch.distributed.get_world_size())
+    except Exception:  # pragma: no cover - defensive
+        return 1
+    return 1
+
+
+def _should_enable_synced_gpus() -> bool:
+    # For ZeRO-3 style distributed generation, ranks can otherwise diverge in
+    # decode-step counts and deadlock in collectives.
+    world_size = _distributed_world_size()
+    if world_size <= 1:
+        return False
+    return _env_flag("GEMMA27_RL_SYNCED_GENERATION", default=True)
 
 
 def _decode_single_token(tokenizer: PreTrainedTokenizerBase, token_id: int, cfg: TokenDecodeConfig) -> str:
@@ -246,6 +279,11 @@ def generate_rollouts(
     ref_device: str | None = None,
     ref_logprob_fn: Callable[[list[int], list[int]], list[float]] | None = None,
     prompt_template: str | None = None,
+    show_progress: bool = False,
+    progress_desc: str | None = None,
+    compute_old_logprobs: bool = True,
+    compute_token_offsets: bool = True,
+    include_prompt_input_ids: bool = True,
 ) -> list[Rollout]:
     _require_torch()
     if not examples:
@@ -272,6 +310,7 @@ def generate_rollouts(
     rollouts: list[Rollout] = []
     decode_cfg = TokenDecodeConfig()
     ref_dev = ref_device or device
+    empty_completion_fallbacks = 0
 
     prompt_texts: list[str] = [
         format_translation_prompt(
@@ -358,11 +397,18 @@ def generate_rollouts(
 
     do_sample = bool(gen_cfg.do_sample and gen_cfg.temperature > 0)
     logits_processor = _build_custom_logits_processors(gen_cfg, start_index=input_width)
+    synced_gpus = _should_enable_synced_gpus()
+    if synced_gpus:
+        logger.info(
+            "generate_rollouts: enabling synced_gpus=True (world_size=%s).",
+            _distributed_world_size(),
+        )
     with torch.no_grad():
         generated = policy_model.generate(
             input_ids=input_ids,
             attention_mask=attention_mask,
             max_new_tokens=gen_cfg.max_new_tokens,
+            use_cache=True,
             do_sample=do_sample,
             temperature=gen_cfg.temperature if do_sample else None,
             top_p=gen_cfg.top_p if do_sample else None,
@@ -372,59 +418,103 @@ def generate_rollouts(
             pad_token_id=pad_token_id,
             eos_token_id=eos_for_generate,
             logits_processor=logits_processor,
+            synced_gpus=synced_gpus,
         )
 
     sequences = generated if isinstance(generated, torch.Tensor) else generated.sequences
     num_return = max(1, int(gen_cfg.num_samples_per_prompt))
-    for seq_idx, seq in enumerate(sequences):
-        ex_idx = seq_idx // num_return
-        if ex_idx >= len(examples):
-            break
-        ex = examples[ex_idx]
-        prompt_text = prompt_texts[ex_idx]
-        prompt_ids = prompt_id_rows[ex_idx]
-
-        full_ids = seq.detach().cpu().tolist()
-        completion_raw_ids = full_ids[input_width:]
-        completion_raw_ids = _trim_completion_ids(
-            completion_raw_ids,
-            eos_token_ids=eos_token_ids,
-            pad_token_id=pad_token_id,
+    progress_total = int(sequences.shape[0]) if hasattr(sequences, "shape") else None
+    iterable = enumerate(sequences)
+    bar = None
+    if show_progress and tqdm is not None:
+        bar = tqdm(
+            iterable,
+            total=progress_total,
+            desc=progress_desc or "rollout",
+            leave=False,
+            mininterval=2.0,
         )
-        raw_text = tokenizer.decode(completion_raw_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
-        completion_text = postprocess_translation(raw_text)
-        completion_ids = tokenizer(completion_text, add_special_tokens=False)["input_ids"]
-        completion_ids = [int(x) for x in completion_ids]
-        if not completion_ids:
-            continue
+        iterable = bar
+    try:
+        for seq_idx, seq in iterable:
+            ex_idx = seq_idx // num_return
+            if ex_idx >= len(examples):
+                break
+            ex = examples[ex_idx]
+            prompt_text = prompt_texts[ex_idx]
+            prompt_ids = prompt_id_rows[ex_idx]
 
-        old_lp = compute_completion_logprobs(policy_model, prompt_ids, completion_ids, device=device).tolist()
-        ref_lp = None
-        if ref_logprob_fn is not None:
-            ref_lp = [float(v) for v in ref_logprob_fn(prompt_ids, completion_ids)]
-        elif ref_model is not None:
-            ref_lp = compute_completion_logprobs(ref_model, prompt_ids, completion_ids, device=ref_dev).tolist()
-
-        offsets = compute_token_char_offsets(
-            tokenizer=tokenizer,
-            completion_token_ids=completion_ids,
-            decode_cfg=decode_cfg,
-            completion_text=completion_text,
-        )
-
-        rollouts.append(
-            Rollout(
-                example_id=ex.example_id,
-                prompt_text=prompt_text,
-                prompt_input_ids=prompt_ids,
-                completion_text=completion_text,
-                completion_token_ids=completion_ids,
-                old_logprobs=old_lp,
-                ref_logprobs=ref_lp,
-                token_char_offsets=offsets,
-                src_text=ex.src_text,
-                ref_text=ex.ref_text,
+            full_ids = seq.detach().cpu().tolist()
+            completion_raw_ids = full_ids[input_width:]
+            completion_raw_ids = _trim_completion_ids(
+                completion_raw_ids,
+                eos_token_ids=eos_token_ids,
+                pad_token_id=pad_token_id,
             )
+            raw_text = tokenizer.decode(completion_raw_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+            completion_text = postprocess_translation(raw_text)
+            completion_ids = tokenizer(completion_text, add_special_tokens=False)["input_ids"]
+            completion_ids = [int(x) for x in completion_ids]
+            if not completion_ids:
+                empty_completion_fallbacks += 1
+                fallback_ids = tokenizer(" ", add_special_tokens=False)["input_ids"]
+                fallback_ids = [int(x) for x in fallback_ids]
+                if not fallback_ids:
+                    if completion_raw_ids:
+                        fallback_ids = [int(completion_raw_ids[0])]
+                    elif eos_token_ids:
+                        fallback_ids = [int(eos_token_ids[0])]
+                    elif pad_token_id is not None:
+                        fallback_ids = [int(pad_token_id)]
+                    else:
+                        fallback_ids = [0]
+                completion_ids = fallback_ids[:1]
+                completion_text = tokenizer.decode(
+                    completion_ids,
+                    skip_special_tokens=True,
+                    clean_up_tokenization_spaces=False,
+                )
+
+            old_lp: list[float] = []
+            if compute_old_logprobs:
+                old_lp = compute_completion_logprobs(policy_model, prompt_ids, completion_ids, device=device).tolist()
+            ref_lp = None
+            if compute_old_logprobs and ref_logprob_fn is not None:
+                ref_lp = [float(v) for v in ref_logprob_fn(prompt_ids, completion_ids)]
+            elif compute_old_logprobs and ref_model is not None:
+                ref_lp = compute_completion_logprobs(ref_model, prompt_ids, completion_ids, device=ref_dev).tolist()
+
+            offsets: list[tuple[int, int]] = []
+            if compute_token_offsets:
+                offsets = compute_token_char_offsets(
+                    tokenizer=tokenizer,
+                    completion_token_ids=completion_ids,
+                    decode_cfg=decode_cfg,
+                    completion_text=completion_text,
+                )
+
+            rollouts.append(
+                Rollout(
+                    example_id=ex.example_id,
+                    prompt_text=prompt_text,
+                    prompt_input_ids=(prompt_ids if include_prompt_input_ids else []),
+                    completion_text=completion_text,
+                    completion_token_ids=completion_ids,
+                    old_logprobs=old_lp,
+                    ref_logprobs=ref_lp,
+                    token_char_offsets=offsets,
+                    src_text=ex.src_text,
+                    ref_text=ex.ref_text,
+                )
+            )
+    finally:
+        if bar is not None:
+            bar.close()
+
+    if empty_completion_fallbacks > 0:
+        logger.info(
+            "generate_rollouts: replaced %s empty completions with fallback token to keep rollout shape stable.",
+            empty_completion_fallbacks,
         )
 
     return rollouts

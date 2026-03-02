@@ -4,6 +4,7 @@ import logging
 import os
 from pathlib import Path
 import random
+import shlex
 
 try:
     import torch
@@ -117,3 +118,78 @@ def resolve_huggingface_token(explicit_token: str | None, token_env_name: str | 
 
 def world_size() -> int:
     return int(os.environ.get("WORLD_SIZE", "1"))
+
+
+def collect_huggingface_worker_env() -> dict[str, str]:
+    keys = (
+        "HF_TOKEN",
+        "HUGGING_FACE_HUB_TOKEN",
+        "HF_HOME",
+        "HF_HUB_CACHE",
+        "HUGGINGFACE_HUB_CACHE",
+        "TRANSFORMERS_CACHE",
+        "HF_DATASETS_CACHE",
+        "HF_HUB_DISABLE_XET",
+        "HF_HUB_ENABLE_HF_TRANSFER",
+        "HF_HUB_DOWNLOAD_TIMEOUT",
+        "HF_HUB_ETAG_TIMEOUT",
+    )
+    out: dict[str, str] = {}
+    for key in keys:
+        value = os.environ.get(key)
+        if value is None:
+            continue
+        text = str(value)
+        if not text:
+            continue
+        out[key] = text
+    return out
+
+
+def merge_env_overrides(
+    base: dict[str, str] | None,
+    extra: dict[str, str] | None,
+) -> dict[str, str] | None:
+    merged: dict[str, str] = {}
+    if base:
+        merged.update({str(k): str(v) for k, v in base.items()})
+    if extra:
+        merged.update({str(k): str(v) for k, v in extra.items()})
+    return merged or None
+
+
+def build_worker_launch_command(
+    *,
+    python_executable: str,
+    worker_script: str | Path,
+    worker_args: list[str] | None = None,
+    remote_host: str | None = None,
+    remote_workdir: str | None = None,
+    remote_env: dict[str, str] | None = None,
+) -> list[str]:
+    script_path = str(worker_script)
+    args = [str(v) for v in (worker_args or [])]
+    host = str(remote_host).strip() if remote_host else ""
+    if not host:
+        return [str(python_executable), script_path, *args]
+
+    parts: list[str] = []
+    workdir = str(remote_workdir).strip() if remote_workdir else ""
+    if workdir:
+        parts.append(f"cd {shlex.quote(workdir)}")
+        parts.append("&&")
+
+    if remote_env:
+        env_tokens = [
+            f"{str(key)}={shlex.quote(str(value))}"
+            for key, value in sorted(remote_env.items(), key=lambda kv: str(kv[0]))
+        ]
+        if env_tokens:
+            parts.append(" ".join(env_tokens))
+
+    parts.append("exec")
+    parts.append(shlex.quote(str(python_executable)))
+    parts.append(shlex.quote(script_path))
+    parts.extend(shlex.quote(arg) for arg in args)
+    remote_cmd = " ".join(parts)
+    return ["ssh", host, remote_cmd]

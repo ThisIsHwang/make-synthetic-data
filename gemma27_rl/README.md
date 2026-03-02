@@ -29,6 +29,8 @@ uv pip install -e .
 ./scripts/setup_split_uv_envs.sh
 ```
 
+참고: `xCOMET` 환경은 `pkg_resources` 호환을 위해 `setuptools<81`을 사용합니다.
+
 ## 2) 설정
 
 기본 예시: `configs/train_toy.yaml`
@@ -50,6 +52,10 @@ Qwen3.5 + MQM 전용 예시: `configs/qwen35_mqm/`
 - `reward.metricx.*`, `reward.xcomet.*`, `reward.mqm.*`
 - `reward.metricx.python_executable`: MetricX를 별도 uv 환경 파이썬으로 실행할 때 지정
 - `reward.xcomet.python_executable`: xCOMET을 별도 uv 환경 파이썬으로 실행할 때 지정
+- `misc.aux_worker_host`: reference/MetricX/xCOMET을 올릴 전용 aux 노드 host (SSH 접속 가능해야 함)
+- `misc.aux_worker_remote_workdir`: aux 노드에서 worker 실행 전 `cd`할 경로
+- `model.reference_worker_host`, `reward.metricx.worker_host`, `reward.xcomet.worker_host`:
+  컴포넌트별 host override (미설정 시 `misc.aux_worker_host` 사용)
 - `rl.*` (clip, kl, batch, updates)
 - `misc.huggingface_cache_dir`: HF 캐시 루트 (예: `/media/sdd3`)
 - `misc.huggingface_token`: (권장 비활성) 직접 토큰 입력값
@@ -73,6 +79,12 @@ GPU 배치(명시적 8-GPU 분할):
 - reference 모델은 단일 GPU(`reference_gpu_ids` 첫 번째)만 사용합니다.
 - MetricX/XCOMET은 `reward.metricx.device`, `reward.xcomet.device`로 단일 GPU를 직접 지정하세요.
 - 예시(6/1/1): `policy=[0,1,2,3,4,5]`, `reference=[6]`, `metricx=cuda:7`.
+
+멀티노드 8+1(정책 8노드 + 보조 1노드):
+- DeepSpeed rank는 policy 노드들만 포함하세요 (aux 노드는 hostfile/include에 넣지 않음).
+- `model.policy_gpu_ids: [0..7]`는 policy 노드의 local GPU 인덱스 기준입니다.
+- reference/MetricX/xCOMET은 aux 노드에서 SSH 서브프로세스로 실행됩니다.
+- 예시 config: `configs/qwen35_mqm/train_wmt24pp_enko_qwen35_27b_metricx_xcomet_multinode8p1aux.yaml`
 
 GEMBA-MQM 프롬프트/스코어링:
 - MQM judge 메시지 구성은 아래 구현을 따릅니다.
@@ -113,6 +125,15 @@ venv 일치 강제 실행(DeepSpeed launcher/entrypoint/python 모두 동일 ven
 VENV_BIN=/abs/path/to/.venv_train/bin \
 INCLUDE=localhost:0,1,2,3,4,5,6,7 \
 CONFIG=configs/qwen35_mqm/train_wmt24pp_enko_qwen35_27b_mqm_scale8gpu.yaml \
+./scripts/run_deepspeed_from_venv.sh
+```
+
+멀티노드 8+1 실행 예시:
+
+```bash
+HOSTFILE=/path/to/policy_8nodes.hostfile \
+INCLUDE='policy-node-01:0,1,2,3,4,5,6,7@policy-node-02:0,1,2,3,4,5,6,7@policy-node-03:0,1,2,3,4,5,6,7@policy-node-04:0,1,2,3,4,5,6,7@policy-node-05:0,1,2,3,4,5,6,7@policy-node-06:0,1,2,3,4,5,6,7@policy-node-07:0,1,2,3,4,5,6,7@policy-node-08:0,1,2,3,4,5,6,7' \
+CONFIG=configs/qwen35_mqm/train_wmt24pp_enko_qwen35_27b_metricx_xcomet_multinode8p1aux.yaml \
 ./scripts/run_deepspeed_from_venv.sh
 ```
 
