@@ -121,6 +121,7 @@ def make_trl_reward_func(
     ref_column: str = "ref_text",
     weight: float = 1.0,
     offset: float = 0.0,
+    clip_value: float = 0.0,
 ) -> Callable[..., list[float]]:
     """Wrap a RewardModel as a TRL-compatible reward function.
 
@@ -158,6 +159,10 @@ def make_trl_reward_func(
                 when using multiple reward models).
         offset: Subtraction offset for "lower=better" metrics.
                 Set to 0 for "higher=better" metrics.
+        clip_value: If > 0, clip transformed rewards to [-clip_value, +clip_value].
+                Prevents extreme outliers from destabilizing advantage
+                normalization.  Set to 0 to disable (default).
+                Ref: MiniRL (arxiv 2512.01374)
 
     Returns:
         A callable with signature:
@@ -185,7 +190,15 @@ def make_trl_reward_func(
         # For MetricX (offset=5.0): reward = weight * (5.0 - metricx_score)
         # For XComet (offset=0.0):  reward = weight * xcomet_score
         if offset != 0.0:
-            return [weight * (offset - s) for s in output.sequence_scores]
-        return [weight * s for s in output.sequence_scores]
+            rewards = [weight * (offset - s) for s in output.sequence_scores]
+        else:
+            rewards = [weight * s for s in output.sequence_scores]
+
+        # Clip extreme rewards to prevent advantage destabilization.
+        # MiniRL (arxiv 2512.01374) recommends bounding reward signals.
+        if clip_value > 0.0:
+            rewards = [max(-clip_value, min(clip_value, r)) for r in rewards]
+
+        return rewards
 
     return _reward_func

@@ -255,6 +255,14 @@ def build_grpo_config(cfg: DistributedRLConfig) -> Any:
     if cfg.training.loss_type == "gspo":
         grpo_kwargs["importance_sampling_level"] = "sequence_token"
 
+    # --- Asymmetric clipping (MiniRL, arxiv 2512.01374 Section 3.2) ---
+    # Paper recommends ε_high=0.27, ε_low=0.2 instead of symmetric ε=0.2.
+    # TRL >= 0.29.0 supports these as separate GRPOConfig parameters.
+    if cfg.stability.epsilon_high > 0:
+        grpo_kwargs["epsilon_high"] = cfg.stability.epsilon_high
+    if cfg.stability.epsilon_low > 0:
+        grpo_kwargs["epsilon_low"] = cfg.stability.epsilon_low
+
     return GRPOConfig(**grpo_kwargs)
 
 
@@ -306,6 +314,7 @@ def build_reward_funcs(cfg: DistributedRLConfig) -> list[Callable[..., list[floa
                 ref_column="ref_text",
                 weight=cfg.reward.w_metricx,
                 offset=cfg.reward.metricx.offset,  # MetricX: lower=better → invert
+                clip_value=cfg.stability.reward_clip_value,
             )
         else:
             # Non-rank-0 processes return zeros.  The real scores will be
@@ -323,6 +332,7 @@ def build_reward_funcs(cfg: DistributedRLConfig) -> list[Callable[..., list[floa
                 ref_column="ref_text",
                 weight=cfg.reward.w_xcomet,
                 offset=0.0,  # XComet: higher=better, no inversion needed
+                clip_value=cfg.stability.reward_clip_value,
             )
         else:
             func = _dummy_reward_func
@@ -397,6 +407,20 @@ def run_training(cfg: DistributedRLConfig) -> None:
       9. Save the final model (rank 0 only)
     """
     from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    # --- TRL version check for stability features ---
+    try:
+        from trl import __version__ as _trl_ver
+        _major, _minor = (int(x) for x in _trl_ver.split(".")[:2])
+        if _major == 0 and _minor < 29:
+            logger.warning(
+                "TRL %s detected. Upgrade to >= 0.29.0 for: "
+                "(1) no length normalization (MiniRL recommendation), "
+                "(2) asymmetric epsilon_high/epsilon_low support.",
+                _trl_ver,
+            )
+    except Exception:
+        pass
 
     # --- Step 1: Build TRL GRPOConfig ---
     grpo_config = build_grpo_config(cfg)
@@ -491,6 +515,21 @@ def run_training(cfg: DistributedRLConfig) -> None:
     #
     # ``processing_class`` is the tokenizer — TRL uses it to tokenize prompts
     # and decode completions.
+
+    # --- Step 7b: Build stability callbacks (MiniRL) ---
+    callbacks = []
+    if cfg.stability.enable_monitoring:
+        from .stability import StabilityMonitorCallback
+
+        callbacks.append(StabilityMonitorCallback(cfg.stability))
+        logger.info(
+            "StabilityMonitorCallback enabled: entropy_floor=%.2f kl_ceiling=%.2f "
+            "halt_on_collapse_steps=%d",
+            cfg.stability.entropy_floor,
+            cfg.stability.kl_ceiling,
+            cfg.stability.halt_on_collapse_steps,
+        )
+
     trainer = GRPOTrainer(
         model=model,
         args=grpo_config,
@@ -498,6 +537,7 @@ def run_training(cfg: DistributedRLConfig) -> None:
         eval_dataset=eval_dataset,
         processing_class=tokenizer,
         reward_funcs=reward_funcs,
+        callbacks=callbacks if callbacks else None,
     )
 
     # Start the training loop.

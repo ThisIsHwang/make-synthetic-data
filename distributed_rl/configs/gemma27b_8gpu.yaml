@@ -87,6 +87,15 @@ training:
   output_router_logits: false
   router_aux_loss_coef: 0.0
 
+# MiniRL stability controls (arxiv 2512.01374)
+stability:
+  enable_monitoring: true
+  entropy_floor: 0.3
+  kl_ceiling: 15.0
+  reward_clip_value: 10.0
+  epsilon_high: 0.27          # Asymmetric clipping (paper recommendation)
+  epsilon_low: 0.2
+
 distributed:
   deepspeed: configs/deepspeed_zero2.json
   nccl_timeout_minutes: 120

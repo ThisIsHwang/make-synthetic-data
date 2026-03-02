@@ -365,6 +365,64 @@ class TrainingConfig:
 
 
 @dataclass
+class StabilityConfig:
+    """MiniRL-inspired training stability controls.
+
+    All features are opt-in: default values preserve existing behavior
+    (zero overhead when disabled).
+
+    Ref: arxiv 2512.01374 — "Stabilizing Reinforcement Learning with LLMs"
+    Ref: TRL >= 0.29.0 already disables length normalization by default,
+         which aligns with MiniRL's finding that it "invalidates the
+         first-order approximation."
+    """
+
+    # --- Monitoring ---
+    # Enable the StabilityMonitorCallback that tracks entropy, KL, rewards.
+    enable_monitoring: bool = False
+
+    # How often (in training steps) to compute stability metrics.
+    monitoring_interval: int = 1
+
+    # --- Collapse detection ---
+    # If token-level entropy drops below this, log a warning.
+    # Entropy drops precede training collapse (MiniRL Section 4).
+    # Set to 0.0 to disable.
+    entropy_floor: float = 0.0
+
+    # If KL divergence exceeds this, log a warning.
+    # Set to 0.0 to disable.
+    kl_ceiling: float = 0.0
+
+    # Halt training if entropy stays below floor for this many consecutive steps.
+    # Set to 0 to disable (warning only).
+    halt_on_collapse_steps: int = 0
+
+    # --- Reward clipping ---
+    # Clip transformed reward values to [-v, +v] before they enter advantage
+    # computation.  Prevents extreme outliers from destabilizing group
+    # normalization.  Set to 0.0 to disable.
+    reward_clip_value: float = 0.0
+
+    # --- Asymmetric clipping (MiniRL Section 3.2) ---
+    # Paper recommends: epsilon_high=0.27, epsilon_low=0.2
+    # TRL >= 0.29.0 supports these as separate GRPOConfig parameters.
+    # When set to 0.0, falls back to the symmetric training.epsilon.
+    epsilon_high: float = 0.0
+    epsilon_low: float = 0.0
+
+    # --- Routing Replay for MoE (Phase 2, not yet implemented) ---
+    # "r2" = Vanilla Routing Replay (replay rollout expert assignments)
+    # "r3" = Uniform Routing Replay
+    # "none" = disabled (default)
+    routing_replay: str = "none"
+
+    # --- MoE router entropy monitoring ---
+    # Requires training.output_router_logits=True.
+    monitor_router_entropy: bool = False
+
+
+@dataclass
 class DistributedConfig:
     """DeepSpeed and NCCL distributed training settings.
 
@@ -431,6 +489,7 @@ class DistributedRLConfig:
     generation: GenerationConfig = field(default_factory=GenerationConfig)
     reward: RewardConfig = field(default_factory=RewardConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
+    stability: StabilityConfig = field(default_factory=StabilityConfig)
     distributed: DistributedConfig = field(default_factory=DistributedConfig)
     misc: MiscConfig = field(default_factory=MiscConfig)
 
@@ -590,6 +649,23 @@ def _validate_config(cfg: DistributedRLConfig) -> None:
             "Current zero_stage=%s; will be ignored.",
             cfg.distributed.zero_stage,
         )
+
+    # --- Stability (MiniRL) ---
+    valid_routing = {"none", "r2", "r3"}
+    if cfg.stability.routing_replay not in valid_routing:
+        raise ValueError(f"stability.routing_replay must be one of {valid_routing}")
+
+    if cfg.stability.routing_replay != "none" and not cfg.training.output_router_logits:
+        raise ValueError(
+            "stability.routing_replay requires training.output_router_logits=true "
+            "(MoE model with router logits output)."
+        )
+
+    if cfg.stability.epsilon_high < 0 or cfg.stability.epsilon_low < 0:
+        raise ValueError("stability.epsilon_high and epsilon_low must be >= 0.")
+
+    if cfg.stability.reward_clip_value < 0:
+        raise ValueError("stability.reward_clip_value must be >= 0.")
 
 
 # ---------------------------------------------------------------------------
