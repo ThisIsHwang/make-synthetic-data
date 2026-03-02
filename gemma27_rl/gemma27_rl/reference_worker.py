@@ -20,7 +20,7 @@ def _ensure_repo_import_path() -> None:
 
 _ensure_repo_import_path()
 
-from gemma27_rl.rollout import compute_completion_logprobs  # noqa: E402
+from gemma27_rl.rollout import compute_completion_logprobs, compute_completion_logprobs_batch  # noqa: E402
 from gemma27_rl.utils import resolve_torch_dtype  # noqa: E402
 
 
@@ -104,7 +104,7 @@ def main(argv: list[str] | None = None) -> int:
                 items = req.get("items") or []
                 if not isinstance(items, list):
                     raise ValueError("score_batch.items must be a list")
-                rows: list[list[float]] = []
+                parsed_items: list[tuple[list[int], list[int]]] = []
                 for item in items:
                     if not isinstance(item, dict):
                         raise ValueError("score_batch.items[*] must be objects")
@@ -114,13 +114,28 @@ def main(argv: list[str] | None = None) -> int:
                         raise ValueError("score_batch.items[*].prompt_ids and completion_ids must be lists")
                     prompt_ids_int = [int(v) for v in prompt_ids]
                     completion_ids_int = [int(v) for v in completion_ids]
-                    row = compute_completion_logprobs(
-                        model=model,
-                        prompt_input_ids=prompt_ids_int,
-                        completion_token_ids=completion_ids_int,
-                        device=device,
-                    ).tolist()
-                    rows.append([float(v) for v in row])
+                    parsed_items.append((prompt_ids_int, completion_ids_int))
+
+                micro_batch = max(1, len(parsed_items))
+                while True:
+                    try:
+                        rows_t = compute_completion_logprobs_batch(
+                            model=model,
+                            items=parsed_items,
+                            device=device,
+                            micro_batch_size=micro_batch,
+                        )
+                        break
+                    except Exception as exc:
+                        msg = str(exc).lower()
+                        is_oom = ("out of memory" in msg) or ("cuda oom" in msg)
+                        if (not is_oom) or micro_batch <= 1:
+                            raise
+                        micro_batch = max(1, micro_batch // 2)
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+
+                rows = [[float(v) for v in row.tolist()] for row in rows_t]
                 _reply({"ok": True, "logprobs_rows": rows})
                 continue
 

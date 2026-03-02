@@ -60,6 +60,56 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def _env_int(name: str, default: int, minimum: int = 1) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return max(minimum, int(default))
+    try:
+        value = int(raw.strip())
+    except Exception:
+        return max(minimum, int(default))
+    return max(minimum, value)
+
+
+def _looks_like_cuda_oom(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return ("out of memory" in text) or ("cuda oom" in text)
+
+
+def _compute_logprobs_batch_with_backoff(
+    model: PreTrainedModel,
+    items: list[tuple[list[int], list[int]]],
+    *,
+    device: str,
+    tag: str,
+) -> list[torch.Tensor]:
+    if not items:
+        return []
+    micro_batch = min(
+        len(items),
+        _env_int("GEMMA27_RL_LOGPROB_MICRO_BATCH", default=32, minimum=1),
+    )
+    while True:
+        try:
+            return compute_completion_logprobs_batch(
+                model=model,
+                items=items,
+                device=device,
+                micro_batch_size=micro_batch,
+            )
+        except Exception as exc:
+            if (not _looks_like_cuda_oom(exc)) or micro_batch <= 1:
+                raise
+            micro_batch = max(1, micro_batch // 2)
+            logger.warning(
+                "logprob batch OOM in %s; retrying with smaller micro_batch=%s.",
+                tag,
+                micro_batch,
+            )
+            if torch is not None and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+
 def _distributed_world_size() -> int:
     if torch is None:
         return 1
@@ -269,6 +319,85 @@ def compute_completion_logprobs(
     return token_log_probs.detach().cpu()
 
 
+def compute_completion_logprobs_batch(
+    model: PreTrainedModel,
+    items: list[tuple[list[int], list[int]]],
+    device: str,
+    *,
+    micro_batch_size: int | None = None,
+) -> list[torch.Tensor]:
+    _require_torch()
+    if not items:
+        return []
+
+    model_device = next(model.parameters()).device
+    target_device = str(model_device)
+    if device != target_device:
+        logger.debug(
+            "compute_completion_logprobs_batch device override: requested=%s actual_model_device=%s",
+            device,
+            target_device,
+        )
+
+    parsed_items: list[tuple[list[int], list[int]]] = []
+    for prompt_input_ids, completion_token_ids in items:
+        if len(prompt_input_ids) == 0:
+            raise ValueError("prompt_input_ids must be non-empty")
+        parsed_items.append(
+            (
+                [int(v) for v in prompt_input_ids],
+                [int(v) for v in completion_token_ids],
+            )
+        )
+
+    step = int(micro_batch_size or len(parsed_items))
+    step = max(1, min(step, len(parsed_items)))
+    all_rows: list[torch.Tensor] = []
+
+    for start_idx in range(0, len(parsed_items), step):
+        chunk = parsed_items[start_idx:start_idx + step]
+        if not chunk:
+            continue
+
+        prompt_lens = [len(prompt_ids) for prompt_ids, _ in chunk]
+        comp_lens = [len(completion_ids) for _, completion_ids in chunk]
+        seq_lens = [p + c for p, c in zip(prompt_lens, comp_lens)]
+        max_seq_len = max(seq_lens)
+
+        batch_size = len(chunk)
+        input_ids = torch.zeros((batch_size, max_seq_len), device=model_device, dtype=torch.long)
+        attn = torch.zeros((batch_size, max_seq_len), device=model_device, dtype=torch.long)
+
+        for row_idx, (prompt_ids, completion_ids) in enumerate(chunk):
+            full_ids = prompt_ids + completion_ids
+            seq_len = len(full_ids)
+            if seq_len <= 0:
+                continue
+            row_tensor = torch.tensor(full_ids, device=model_device, dtype=torch.long)
+            input_ids[row_idx, :seq_len] = row_tensor
+            attn[row_idx, :seq_len] = 1
+
+        with torch.no_grad():
+            outputs = model(input_ids=input_ids, attention_mask=attn)
+        logits = outputs.logits
+
+        for row_idx, (_, completion_ids) in enumerate(chunk):
+            comp_len = len(completion_ids)
+            if comp_len <= 0:
+                all_rows.append(torch.empty(0, dtype=torch.float32))
+                continue
+
+            start = prompt_lens[row_idx] - 1
+            end = start + comp_len
+            target_logits = logits[row_idx, start:end, :]
+            log_probs = F.log_softmax(target_logits, dim=-1)
+            labels = torch.tensor(completion_ids, device=model_device, dtype=torch.long)
+            token_log_probs = log_probs.gather(dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
+            all_rows.append(token_log_probs.detach().cpu())
+
+    return all_rows
+
+
 def generate_rollouts(
     examples: list[Example],
     policy_model: PreTrainedModel,
@@ -311,6 +440,8 @@ def generate_rollouts(
     decode_cfg = TokenDecodeConfig()
     ref_dev = ref_device or device
     empty_completion_fallbacks = 0
+    pending_policy_logprob_items: list[tuple[int, list[int], list[int]]] = []
+    pending_ref_model_logprob_items: list[tuple[int, list[int], list[int]]] = []
 
     prompt_texts: list[str] = [
         format_translation_prompt(
@@ -476,13 +607,14 @@ def generate_rollouts(
                 )
 
             old_lp: list[float] = []
+            rollout_idx = len(rollouts)
             if compute_old_logprobs:
-                old_lp = compute_completion_logprobs(policy_model, prompt_ids, completion_ids, device=device).tolist()
+                pending_policy_logprob_items.append((rollout_idx, list(prompt_ids), list(completion_ids)))
             ref_lp = None
             if compute_old_logprobs and ref_logprob_fn is not None:
                 ref_lp = [float(v) for v in ref_logprob_fn(prompt_ids, completion_ids)]
             elif compute_old_logprobs and ref_model is not None:
-                ref_lp = compute_completion_logprobs(ref_model, prompt_ids, completion_ids, device=ref_dev).tolist()
+                pending_ref_model_logprob_items.append((rollout_idx, list(prompt_ids), list(completion_ids)))
 
             offsets: list[tuple[int, int]] = []
             if compute_token_offsets:
@@ -510,6 +642,38 @@ def generate_rollouts(
     finally:
         if bar is not None:
             bar.close()
+
+    if compute_old_logprobs and pending_policy_logprob_items:
+        policy_rows = _compute_logprobs_batch_with_backoff(
+            model=policy_model,
+            items=[(prompt_ids, completion_ids) for _, prompt_ids, completion_ids in pending_policy_logprob_items],
+            device=device,
+            tag="policy_old_logprobs",
+        )
+        if len(policy_rows) != len(pending_policy_logprob_items):
+            raise RuntimeError(
+                "policy old_logprobs batch size mismatch: "
+                f"requested={len(pending_policy_logprob_items)} returned={len(policy_rows)}"
+            )
+        for (rollout_idx, _, _), row in zip(pending_policy_logprob_items, policy_rows):
+            if rollout_idx < len(rollouts):
+                rollouts[rollout_idx].old_logprobs = [float(v) for v in row.tolist()]
+
+    if compute_old_logprobs and pending_ref_model_logprob_items and ref_model is not None:
+        ref_rows = _compute_logprobs_batch_with_backoff(
+            model=ref_model,
+            items=[(prompt_ids, completion_ids) for _, prompt_ids, completion_ids in pending_ref_model_logprob_items],
+            device=ref_dev,
+            tag="reference_model_logprobs",
+        )
+        if len(ref_rows) != len(pending_ref_model_logprob_items):
+            raise RuntimeError(
+                "reference logprobs batch size mismatch: "
+                f"requested={len(pending_ref_model_logprob_items)} returned={len(ref_rows)}"
+            )
+        for (rollout_idx, _, _), row in zip(pending_ref_model_logprob_items, ref_rows):
+            if rollout_idx < len(rollouts):
+                rollouts[rollout_idx].ref_logprobs = [float(v) for v in row.tolist()]
 
     if empty_completion_fallbacks > 0:
         logger.info(

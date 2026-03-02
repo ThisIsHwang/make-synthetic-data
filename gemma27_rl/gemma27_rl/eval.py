@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from collections import Counter
 from copy import deepcopy
 import logging
@@ -228,10 +229,15 @@ def evaluate_on_dataset(
 
     metricx_scores = [0.0 for _ in rollouts]
     metricx_rewards = [0.0 for _ in rollouts]
-    if metricx_scorer is not None and cfg.reward.metricx.enabled:
-        logger.info("evaluate_on_dataset: scoring metricx...")
-        metricx_scores = metricx_scorer.score_batch(samples).sequence_scores
-        non_finite_idx = [idx for idx, value in enumerate(metricx_scores) if not math.isfinite(float(value))]
+    xcomet_scores = [0.0 for _ in rollouts]
+    spans: list[list[dict[str, Any]]] = [[] for _ in rollouts]
+
+    metricx_enabled = metricx_scorer is not None and cfg.reward.metricx.enabled
+    xcomet_enabled = xcomet_scorer is not None and cfg.reward.xcomet.enabled
+
+    def _score_metricx_eval() -> tuple[list[float], list[float]]:
+        metricx_local_scores = metricx_scorer.score_batch(samples).sequence_scores  # type: ignore[union-attr]
+        non_finite_idx = [idx for idx, value in enumerate(metricx_local_scores) if not math.isfinite(float(value))]
         if non_finite_idx:
             msg = (
                 f"MetricX produced {len(non_finite_idx)} non-finite eval scores "
@@ -245,29 +251,45 @@ def evaluate_on_dataset(
                     cfg.reward.metricx.offset,
                 )
                 for idx in non_finite_idx:
-                    metricx_scores[idx] = float(cfg.reward.metricx.offset)
+                    metricx_local_scores[idx] = float(cfg.reward.metricx.offset)
             else:
                 raise RuntimeError(
                     f"{msg} Eval aborted to avoid silently recording invalid MetricX values."
                 )
-        metricx_rewards = [metricx_score_to_reward(v, offset=cfg.reward.metricx.offset) for v in metricx_scores]
+        metricx_local_rewards = [metricx_score_to_reward(v, offset=cfg.reward.metricx.offset) for v in metricx_local_scores]
+        return metricx_local_scores, metricx_local_rewards
 
-    xcomet_scores = [0.0 for _ in rollouts]
-    spans: list[list[dict[str, Any]]] = [[] for _ in rollouts]
-    if xcomet_scorer is not None and cfg.reward.xcomet.enabled:
-        logger.info("evaluate_on_dataset: scoring xcomet...")
-        xcomet_out = xcomet_scorer.score_batch(samples)
-        xcomet_scores = xcomet_out.sequence_scores
-        non_finite_idx = [idx for idx, value in enumerate(xcomet_scores) if not math.isfinite(float(value))]
+    def _score_xcomet_eval() -> tuple[list[float], list[list[dict[str, Any]]]]:
+        xcomet_out = xcomet_scorer.score_batch(samples)  # type: ignore[union-attr]
+        xcomet_local_scores = xcomet_out.sequence_scores
+        non_finite_idx = [idx for idx, value in enumerate(xcomet_local_scores) if not math.isfinite(float(value))]
         if non_finite_idx:
             logger.warning(
                 "xCOMET produced %s non-finite eval scores; replacing with 0.0.",
                 len(non_finite_idx),
             )
             for idx in non_finite_idx:
-                xcomet_scores[idx] = 0.0
+                xcomet_local_scores[idx] = 0.0
         meta = xcomet_out.metadata or {}
-        spans = meta.get("error_spans", spans)
+        xcomet_local_spans: list[list[dict[str, Any]]] = meta.get("error_spans", [[] for _ in rollouts])
+        return xcomet_local_scores, xcomet_local_spans
+
+    if metricx_enabled and xcomet_enabled:
+        logger.info(
+            "evaluate_on_dataset: scoring metricx and xcomet in parallel..."
+        )
+        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="eval-scorer") as executor:
+            metricx_future = executor.submit(_score_metricx_eval)
+            xcomet_future = executor.submit(_score_xcomet_eval)
+            metricx_scores, metricx_rewards = metricx_future.result()
+            xcomet_scores, spans = xcomet_future.result()
+    else:
+        if metricx_enabled:
+            logger.info("evaluate_on_dataset: scoring metricx...")
+            metricx_scores, metricx_rewards = _score_metricx_eval()
+        if xcomet_enabled:
+            logger.info("evaluate_on_dataset: scoring xcomet...")
+            xcomet_scores, spans = _score_xcomet_eval()
 
     mqm_scores = [0.0 for _ in rollouts]
     mqm_spans: list[list[dict[str, Any]]] = [[] for _ in rollouts]

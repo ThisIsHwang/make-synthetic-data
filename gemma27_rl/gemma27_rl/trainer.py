@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 import json
 import logging
@@ -1010,6 +1011,62 @@ def _append_jsonl(path: Path, payload: dict[str, Any]) -> None:
         f.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
+class _AsyncJsonlWriter:
+    def __init__(self) -> None:
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="jsonl-writer")
+        self._pending: deque[Any] = deque()
+
+    def _reap_done(self) -> None:
+        if not self._pending:
+            return
+        kept: deque[Any] = deque()
+        while self._pending:
+            fut = self._pending.popleft()
+            if fut.done():
+                fut.result()
+            else:
+                kept.append(fut)
+        self._pending = kept
+
+    def _submit(self, fn: Any, *args: Any, **kwargs: Any) -> None:
+        self._reap_done()
+        fut = self._executor.submit(fn, *args, **kwargs)
+        self._pending.append(fut)
+
+    def append_json(self, path: Path, payload: dict[str, Any]) -> None:
+        self._submit(_append_jsonl, path, payload)
+
+    def append_rollouts(
+        self,
+        *,
+        path: Path,
+        update_idx: int,
+        rollouts: list[Rollout],
+        advantages: list[list[float]],
+        reward_stats: dict[str, float],
+    ) -> None:
+        self._submit(
+            _append_rollout_jsonl,
+            path,
+            update_idx,
+            rollouts,
+            advantages,
+            reward_stats,
+        )
+
+    def append_eval_rows(self, *, path: Path, update_idx: int, eval_rows: list[dict[str, Any]]) -> None:
+        self._submit(_append_eval_output_jsonl, path, update_idx, eval_rows)
+
+    def flush(self) -> None:
+        while self._pending:
+            fut = self._pending.popleft()
+            fut.result()
+
+    def close(self) -> None:
+        self.flush()
+        self._executor.shutdown(wait=True)
+
+
 def _truncate_jsonl_by_update(path: Path, max_update: int) -> None:
     if not path.exists():
         return
@@ -1052,42 +1109,44 @@ def _append_rollout_jsonl(
     advantages: list[list[float]],
     reward_stats: dict[str, float],
 ) -> None:
-    for ridx, rollout in enumerate(rollouts):
-        adv_row = advantages[ridx] if ridx < len(advantages) else []
-        payload = {
-            "type": "rollout",
-            "update": update_idx,
-            "rollout_idx": ridx,
-            "example_id": rollout.example_id,
-            "src_text": rollout.src_text,
-            "completion_text": rollout.completion_text,
-            "ref_text": rollout.ref_text,
-            "completion_len": len(rollout.completion_token_ids),
-            "adv_mean": float(sum(adv_row) / len(adv_row)) if adv_row else 0.0,
-            "adv_sum": float(sum(adv_row)) if adv_row else 0.0,
-            "old_logprob_mean": float(sum(rollout.old_logprobs) / len(rollout.old_logprobs))
-            if rollout.old_logprobs
-            else 0.0,
-            "ref_logprob_mean": float(sum(rollout.ref_logprobs) / len(rollout.ref_logprobs))
-            if rollout.ref_logprobs
-            else None,
-            "metricx_score_mean_batch": reward_stats.get("metricx_score_mean", 0.0),
-            "xcomet_score_mean_batch": reward_stats.get("xcomet_score_mean", 0.0),
-            "mqm_score_mean_batch": reward_stats.get("mqm_score_mean", 0.0),
-            "token_rewards_non_zero_ratio_batch": reward_stats.get("token_rewards_non_zero_ratio", 0.0),
-        }
-        _append_jsonl(path, payload)
+    with path.open("a", encoding="utf-8") as f:
+        for ridx, rollout in enumerate(rollouts):
+            adv_row = advantages[ridx] if ridx < len(advantages) else []
+            payload = {
+                "type": "rollout",
+                "update": update_idx,
+                "rollout_idx": ridx,
+                "example_id": rollout.example_id,
+                "src_text": rollout.src_text,
+                "completion_text": rollout.completion_text,
+                "ref_text": rollout.ref_text,
+                "completion_len": len(rollout.completion_token_ids),
+                "adv_mean": float(sum(adv_row) / len(adv_row)) if adv_row else 0.0,
+                "adv_sum": float(sum(adv_row)) if adv_row else 0.0,
+                "old_logprob_mean": float(sum(rollout.old_logprobs) / len(rollout.old_logprobs))
+                if rollout.old_logprobs
+                else 0.0,
+                "ref_logprob_mean": float(sum(rollout.ref_logprobs) / len(rollout.ref_logprobs))
+                if rollout.ref_logprobs
+                else None,
+                "metricx_score_mean_batch": reward_stats.get("metricx_score_mean", 0.0),
+                "xcomet_score_mean_batch": reward_stats.get("xcomet_score_mean", 0.0),
+                "mqm_score_mean_batch": reward_stats.get("mqm_score_mean", 0.0),
+                "token_rewards_non_zero_ratio_batch": reward_stats.get("token_rewards_non_zero_ratio", 0.0),
+            }
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
 def _append_eval_output_jsonl(path: Path, update_idx: int, eval_rows: list[dict[str, Any]]) -> None:
-    for ridx, row in enumerate(eval_rows):
-        payload = {
-            "type": "eval_output",
-            "update": update_idx,
-            "eval_row_idx": ridx,
-            **row,
-        }
-        _append_jsonl(path, payload)
+    with path.open("a", encoding="utf-8") as f:
+        for ridx, row in enumerate(eval_rows):
+            payload = {
+                "type": "eval_output",
+                "update": update_idx,
+                "eval_row_idx": ridx,
+                **row,
+            }
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
 def _parse_checkpoint_update_idx(path: Path) -> int | None:
@@ -1729,6 +1788,72 @@ def _prepare_rewards_and_advantages(
     return norm_adv_rows, reward_stats, norm_stats
 
 
+def _fill_missing_reference_logprobs(
+    *,
+    merged_rollouts: list[Rollout],
+    cfg: RLPostTrainConfig,
+    update_idx: int,
+    ref_logprob_client: ReferenceLogprobClient | None,
+    ref_model: AutoModelForCausalLM | None,
+    ref_device: str | None,
+    device: str,
+) -> int:
+    if (not merged_rollouts) or cfg.rl.kl_coef <= 0:
+        return 0
+
+    missing_idx = [i for i, rollout in enumerate(merged_rollouts) if rollout.ref_logprobs is None]
+    if not missing_idx:
+        return 0
+
+    if ref_logprob_client is not None:
+        batch_chunk = _env_int("GEMMA27_RL_REF_FILL_CHUNK", default=16, minimum=1)
+        requests = [
+            (
+                merged_rollouts[i].prompt_input_ids,
+                merged_rollouts[i].completion_token_ids,
+            )
+            for i in missing_idx
+        ]
+        responses: list[list[float]] = []
+        batch_calls = 0
+        for start in range(0, len(requests), batch_chunk):
+            chunk = requests[start:start + batch_chunk]
+            responses.extend(ref_logprob_client.score_logprobs_batch(chunk))
+            batch_calls += 1
+        if len(responses) != len(missing_idx):
+            raise RuntimeError(
+                "reference score_batch result size mismatch while filling missing logprobs"
+            )
+        for idx, row in zip(missing_idx, responses):
+            merged_rollouts[idx].ref_logprobs = [float(v) for v in row]
+        logger.info(
+            "Filled reference logprobs on rank0 for %s gathered rollouts at update=%s (batch_calls=%s chunk=%s).",
+            len(missing_idx),
+            update_idx,
+            batch_calls,
+            batch_chunk,
+        )
+        return len(missing_idx)
+
+    if ref_model is not None:
+        for idx in missing_idx:
+            rollout = merged_rollouts[idx]
+            rollout.ref_logprobs = compute_completion_logprobs(
+                ref_model,
+                rollout.prompt_input_ids,
+                rollout.completion_token_ids,
+                device=ref_device or device,
+            ).tolist()
+        logger.info(
+            "Filled reference logprobs on rank0 for %s gathered rollouts at update=%s.",
+            len(missing_idx),
+            update_idx,
+        )
+        return len(missing_idx)
+
+    return 0
+
+
 def _save_checkpoint_to_dir(
     ckpt_dir: Path,
     model: AutoModelForCausalLM,
@@ -2118,6 +2243,48 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
         artifacts["resumed_from"] = str(resume_ckpt)
         artifacts["resume_update"] = resume_update_idx
 
+    async_json_writer: _AsyncJsonlWriter | None = _AsyncJsonlWriter() if ((not use_deepspeed) or rank0) else None
+
+    def _log_json_row(payload: dict[str, Any]) -> None:
+        if async_json_writer is not None:
+            async_json_writer.append_json(log_path, payload)
+        else:
+            _append_jsonl(log_path, payload)
+
+    def _log_rollout_rows(
+        *,
+        update_idx: int,
+        rollouts: list[Rollout],
+        advantages: list[list[float]],
+        reward_stats: dict[str, float],
+    ) -> None:
+        if async_json_writer is not None:
+            async_json_writer.append_rollouts(
+                path=rollout_log_path,
+                update_idx=update_idx,
+                rollouts=rollouts,
+                advantages=advantages,
+                reward_stats=reward_stats,
+            )
+        else:
+            _append_rollout_jsonl(
+                path=rollout_log_path,
+                update_idx=update_idx,
+                rollouts=rollouts,
+                advantages=advantages,
+                reward_stats=reward_stats,
+            )
+
+    def _log_eval_rows(*, update_idx: int, eval_rows: list[dict[str, Any]]) -> None:
+        if async_json_writer is not None:
+            async_json_writer.append_eval_rows(
+                path=eval_output_path,
+                update_idx=update_idx,
+                eval_rows=eval_rows,
+            )
+        else:
+            _append_eval_output_jsonl(eval_output_path, update_idx=update_idx, eval_rows=eval_rows)
+
     best_dir = output_dir / "best"
     best_eval_score = float("-inf")
     best_eval_update: int | None = None
@@ -2201,9 +2368,9 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
             eval_select_score = _compute_eval_selection_score(report, cfg)
             report["model_select_score"] = eval_select_score
             eval_rows = report.pop("eval_rows", [])
-            _append_jsonl(log_path, {"type": "eval", "update": 0, **report})
+            _log_json_row({"type": "eval", "update": 0, **report})
             if cfg.logging.save_eval_outputs:
-                _append_eval_output_jsonl(eval_output_path, update_idx=0, eval_rows=eval_rows)
+                _log_eval_rows(update_idx=0, eval_rows=eval_rows)
             logger.info(
                 "finished eval (run_before_train): update=0 model_select_score=%.6f metricx=%.4f xcomet=%.4f mqm=%.4f",
                 float(eval_select_score),
@@ -2324,67 +2491,35 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
                 for shard_rollouts in per_rank_rollouts:
                     merged_rollouts.extend(shard_rollouts)
 
-                if merged_rollouts and cfg.rl.kl_coef > 0:
-                    missing_ref = 0
-                    missing_idx = [i for i, r in enumerate(merged_rollouts) if r.ref_logprobs is None]
-                    if missing_idx and ref_logprob_client is not None:
-                        batch_chunk = 16
-                        batch_calls = 0
-                        requests = [
-                            (
-                                merged_rollouts[i].prompt_input_ids,
-                                merged_rollouts[i].completion_token_ids,
-                            )
-                            for i in missing_idx
-                        ]
-                        responses: list[list[float]] = []
-                        for start in range(0, len(requests), batch_chunk):
-                            chunk = requests[start:start + batch_chunk]
-                            responses.extend(ref_logprob_client.score_logprobs_batch(chunk))
-                            batch_calls += 1
-                        if len(responses) != len(missing_idx):
-                            raise RuntimeError(
-                                "reference score_batch result size mismatch while filling missing logprobs"
-                            )
-                        for idx, row in zip(missing_idx, responses):
-                            merged_rollouts[idx].ref_logprobs = [float(v) for v in row]
-                        missing_ref = len(missing_idx)
-                        logger.info(
-                            "Filled reference logprobs on rank0 for %s gathered rollouts at update=%s (batch_calls=%s chunk=%s).",
-                            missing_ref,
-                            update_idx,
-                            batch_calls,
-                            batch_chunk,
-                        )
-                    elif missing_idx and ref_model is not None:
-                        for idx in missing_idx:
-                            rollout = merged_rollouts[idx]
-                            rollout.ref_logprobs = compute_completion_logprobs(
-                                ref_model,
-                                rollout.prompt_input_ids,
-                                rollout.completion_token_ids,
-                                device=ref_device or device,
-                            ).tolist()
-                        missing_ref = len(missing_idx)
-                    if missing_ref > 0 and ref_logprob_client is None:
-                        logger.info(
-                            "Filled reference logprobs on rank0 for %s gathered rollouts at update=%s.",
-                            missing_ref,
-                            update_idx,
-                        )
-
                 merged_advantages: list[list[float]] = []
                 if merged_rollouts:
-                    merged_advantages, reward_stats, adv_stats = _prepare_rewards_and_advantages(
-                        rollouts=merged_rollouts,
-                        cfg=cfg,
-                        metricx_scorer=metricx_scorer,
-                        xcomet_scorer=xcomet_scorer,
-                        mqm_scorer=mqm_scorer,
-                        metricx_cache=metricx_cache,
-                        xcomet_cache=xcomet_cache,
-                        mqm_cache=mqm_cache,
-                    )
+                    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="rank0-step") as step_executor:
+                        reward_future = step_executor.submit(
+                            _prepare_rewards_and_advantages,
+                            rollouts=merged_rollouts,
+                            cfg=cfg,
+                            metricx_scorer=metricx_scorer,
+                            xcomet_scorer=xcomet_scorer,
+                            mqm_scorer=mqm_scorer,
+                            metricx_cache=metricx_cache,
+                            xcomet_cache=xcomet_cache,
+                            mqm_cache=mqm_cache,
+                        )
+                        ref_fill_future = None
+                        if cfg.rl.kl_coef > 0:
+                            ref_fill_future = step_executor.submit(
+                                _fill_missing_reference_logprobs,
+                                merged_rollouts=merged_rollouts,
+                                cfg=cfg,
+                                update_idx=update_idx,
+                                ref_logprob_client=ref_logprob_client,
+                                ref_model=ref_model,
+                                ref_device=ref_device,
+                                device=device,
+                            )
+                        merged_advantages, reward_stats, adv_stats = reward_future.result()
+                        if ref_fill_future is not None:
+                            ref_fill_future.result()
                 else:
                     logger.warning("No rollouts generated at update=%s; skipping step.", update_idx)
 
@@ -2520,10 +2655,9 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
             **reward_stats,
         }
         if (not use_deepspeed) or rank0:
-            _append_jsonl(log_path, payload)
+            _log_json_row(payload)
             if cfg.logging.save_rollouts:
-                _append_rollout_jsonl(
-                    path=rollout_log_path,
+                _log_rollout_rows(
                     update_idx=update_idx,
                     rollouts=log_rollouts,
                     advantages=log_advantages,
@@ -2622,9 +2756,9 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
                 eval_select_score = _compute_eval_selection_score(report, cfg)
                 report["model_select_score"] = eval_select_score
                 eval_rows = report.pop("eval_rows", [])
-                _append_jsonl(log_path, {"type": "eval", "update": update_idx, **report})
+                _log_json_row({"type": "eval", "update": update_idx, **report})
                 if cfg.logging.save_eval_outputs:
-                    _append_eval_output_jsonl(eval_output_path, update_idx=update_idx, eval_rows=eval_rows)
+                    _log_eval_rows(update_idx=update_idx, eval_rows=eval_rows)
                 logger.info(
                     "finished eval: update=%s model_select_score=%.6f metricx=%.4f xcomet=%.4f mqm=%.4f",
                     update_idx,
@@ -2643,6 +2777,9 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
         if not math.isfinite(train_stats.policy_loss):
             raise RuntimeError(f"Non-finite loss at update {update_idx}")
         _dist_barrier()
+
+    if async_json_writer is not None:
+        async_json_writer.flush()
 
     if (not use_deepspeed) or rank0:
         final_dir = output_dir / "final"
@@ -2667,6 +2804,8 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
 
     if ref_logprob_client is not None:
         ref_logprob_client.close()
+    if async_json_writer is not None:
+        async_json_writer.close()
 
     if use_deepspeed and (not rank0):
         return {

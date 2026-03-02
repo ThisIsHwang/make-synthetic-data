@@ -49,7 +49,7 @@ prompt:
   template: "You are a professional {source_lang} ({src_lang_code}) to {target_lang} ({tgt_lang_code}) translator. Your goal is to accurately convey the meaning and nuances of the original {source_lang} text while adhering to {target_lang} grammar, vocabulary, and cultural sensitivities. Produce only the {target_lang} translation, without any additional explanations or commentary. Please translate the following {source_lang} text into {target_lang}:\n\n{text}"
 
 generation:
-  max_new_tokens: 256
+  max_new_tokens: 512
   temperature: 0.4
   top_p: 0.95
   top_k: 50
@@ -77,7 +77,7 @@ reward:
     enabled: true
     model_name: google/metricx-24-hybrid-xxl-v2p6
     tokenizer_name: google/mt5-xl
-    use_reference: false
+    use_reference: true
     batch_size: 2
     device: cuda:1
     dtype: float16
@@ -91,10 +91,10 @@ reward:
 
   xcomet:
     enabled: true
-    model_name: Unbabel/XCOMET-XL
+    model_name: Unbabel/XCOMET-XXL
     batch_size: 2
     device: cuda:2
-    use_reference: false
+    use_reference: true
     python_executable: ../../.venv_xcomet/bin/python
     subprocess_timeout_sec: 1800.0
     worker_host: null
@@ -152,7 +152,7 @@ eval:
   run_before_train: true
   distributed_shard: true
   generation_overrides:
-    max_new_tokens: 128
+    max_new_tokens: 512
 
 logging:
   output_dir: ./gemma27_rl_outputs/grpo-wmt24pp-enko-gemma-27b-multinode8p1aux-mx-xc
