@@ -1,6 +1,6 @@
 model:
-  policy_name_or_path: google/gemma-3-27b-it #Qwen/Qwen3.5-27B-Instruct
-  reference_name_or_path: google/gemma-3-27b-it #Qwen/Qwen3.5-27B-Instruct
+  policy_name_or_path: /workspace/.cache/huggingface/hub/models--Qwen--Qwen3.5-27B/snapshots/b7ca741b86de18df552fd2cc952861e04621a4bd
+  reference_name_or_path: /workspace/.cache/huggingface/hub/models--Qwen--Qwen3.5-27B/snapshots/b7ca741b86de18df552fd2cc952861e04621a4bd
   tokenizer_name_or_path: null
   trust_remote_code: true
   attn_implementation: auto
@@ -50,11 +50,12 @@ prompt:
 
 generation:
   max_new_tokens: 512
-  temperature: 0.4
-  top_p: 0.95
-  top_k: 50
+  temperature: 0.7
+  top_p: 0.8
+  top_k: 20
   num_samples_per_prompt: 4
   do_sample: true
+  presence_penalty: 1.5
   repetition_penalty: 1.0
 
 reward:
@@ -153,9 +154,16 @@ eval:
   distributed_shard: true
   generation_overrides:
     max_new_tokens: 512
+    temperature: 0.7
+    top_p: 0.8
+    top_k: 20
+    num_samples_per_prompt: 4
+    do_sample: true
+    presence_penalty: 1.5
+    repetition_penalty: 1.0
 
 logging:
-  output_dir: ./gemma27_rl_outputs/grpo-wmt24pp-enko-gemma-27b-multinode8p1aux-mx-xc
+  output_dir: ./gemma27_rl_outputs/grpo-wmt24pp-enko-qwen35-27b-multinode8p1aux-mx-xc
   jsonl_name: train_log.jsonl
   rollout_jsonl_name: train_rollouts.jsonl
   save_rollouts: true

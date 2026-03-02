@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass
+import json
 import logging
 import os
 from typing import Any, Callable
@@ -40,6 +42,7 @@ from .rl_types import Example, Rollout
 
 
 logger = logging.getLogger(__name__)
+_PROMPT_ENCODING_CACHE: OrderedDict[tuple[int, bool, str, str], tuple[int, ...]] = OrderedDict()
 
 
 @dataclass
@@ -69,6 +72,37 @@ def _env_int(name: str, default: int, minimum: int = 1) -> int:
     except Exception:
         return max(minimum, int(default))
     return max(minimum, value)
+
+
+def _serialize_chat_template_kwargs(chat_template_kwargs: dict[str, Any] | None) -> str:
+    if not chat_template_kwargs:
+        return "{}"
+    try:
+        return json.dumps(chat_template_kwargs, sort_keys=True, ensure_ascii=True, default=str)
+    except Exception:
+        return repr(chat_template_kwargs)
+
+
+def _prompt_cache_limit() -> int:
+    return _env_int("GEMMA27_RL_PROMPT_CACHE_SIZE", default=8192, minimum=0)
+
+
+def _prompt_cache_get(key: tuple[int, bool, str, str]) -> list[int] | None:
+    hit = _PROMPT_ENCODING_CACHE.get(key)
+    if hit is None:
+        return None
+    _PROMPT_ENCODING_CACHE.move_to_end(key)
+    return list(hit)
+
+
+def _prompt_cache_put(key: tuple[int, bool, str, str], prompt_ids: list[int]) -> None:
+    limit = _prompt_cache_limit()
+    if limit <= 0:
+        return
+    _PROMPT_ENCODING_CACHE[key] = tuple(int(tok) for tok in prompt_ids)
+    _PROMPT_ENCODING_CACHE.move_to_end(key)
+    while len(_PROMPT_ENCODING_CACHE) > limit:
+        _PROMPT_ENCODING_CACHE.popitem(last=False)
 
 
 def _looks_like_cuda_oom(exc: BaseException) -> bool:
@@ -166,6 +200,154 @@ def _resolve_eos_token_ids(
     return uniq
 
 
+def _extract_prompt_rows_from_tokenized(
+    tokenized: Any,
+    *,
+    pad_token_id: int | None,
+) -> list[list[int]]:
+    _require_torch()
+    if hasattr(tokenized, "keys") and ("input_ids" in tokenized):
+        input_ids = tokenized["input_ids"]
+        attention_mask = tokenized.get("attention_mask")
+    elif torch.is_tensor(tokenized):
+        input_ids = tokenized
+        attention_mask = None
+    else:
+        raise TypeError(
+            f"Unsupported tokenized output type: {type(tokenized)!r}. "
+            "Expected mapping with `input_ids` or torch.Tensor."
+        )
+
+    if not torch.is_tensor(input_ids):
+        input_ids = torch.as_tensor(input_ids, dtype=torch.long)
+    if attention_mask is None:
+        if pad_token_id is None:
+            attention_mask = torch.ones_like(input_ids)
+        else:
+            attention_mask = (input_ids != int(pad_token_id)).long()
+    else:
+        if not torch.is_tensor(attention_mask):
+            attention_mask = torch.as_tensor(attention_mask, dtype=torch.long)
+
+    input_ids_cpu = input_ids.detach().cpu()
+    attention_cpu = attention_mask.detach().cpu()
+    rows: list[list[int]] = []
+    for i in range(input_ids_cpu.shape[0]):
+        keep = attention_cpu[i].bool()
+        rows.append([int(tok) for tok in input_ids_cpu[i][keep].tolist()])
+    return rows
+
+
+def _encode_prompt_rows(
+    *,
+    tokenizer: PreTrainedTokenizerBase,
+    prompt_texts: list[str],
+    gen_cfg: GenerationConfig,
+    pad_token_id: int | None,
+) -> list[list[int]]:
+    _require_torch()
+    if not prompt_texts:
+        return []
+
+    use_chat_template = bool(getattr(tokenizer, "chat_template", None)) and hasattr(
+        tokenizer,
+        "apply_chat_template",
+    )
+    chat_kwargs = (
+        dict(gen_cfg.chat_template_kwargs)
+        if getattr(gen_cfg, "chat_template_kwargs", None) is not None
+        else {}
+    )
+    kwargs_key = _serialize_chat_template_kwargs(chat_kwargs if use_chat_template else None)
+    tok_id = id(tokenizer)
+
+    rows: list[list[int] | None] = [None] * len(prompt_texts)
+    missing_indices: list[int] = []
+    missing_texts: list[str] = []
+    missing_keys: list[tuple[int, bool, str, str]] = []
+
+    for idx, prompt in enumerate(prompt_texts):
+        key = (tok_id, use_chat_template, kwargs_key, prompt)
+        cached = _prompt_cache_get(key)
+        if cached is not None:
+            rows[idx] = cached
+        else:
+            missing_indices.append(idx)
+            missing_texts.append(prompt)
+            missing_keys.append(key)
+
+    if missing_texts:
+        tokenized = None
+        cache_missing_rows = True
+        if use_chat_template:
+            try:
+                chats = [[{"role": "user", "content": prompt}] for prompt in missing_texts]
+                tokenized = tokenizer.apply_chat_template(
+                    chats,
+                    tokenize=True,
+                    add_generation_prompt=True,
+                    return_tensors="pt",
+                    padding=True,
+                    **chat_kwargs,
+                )
+            except Exception as exc:
+                logger.warning("Chat template encode failed; falling back to plain prompt encode: %s", exc)
+                tokenized = None
+                cache_missing_rows = False
+
+        if tokenized is None:
+            tokenized = tokenizer(
+                missing_texts,
+                return_tensors="pt",
+                add_special_tokens=True,
+                padding=True,
+            )
+
+        missing_rows = _extract_prompt_rows_from_tokenized(tokenized, pad_token_id=pad_token_id)
+        if len(missing_rows) != len(missing_indices):
+            raise RuntimeError(
+                "prompt encoding row mismatch: "
+                f"missing={len(missing_indices)} encoded={len(missing_rows)}"
+            )
+        for idx, key, row in zip(missing_indices, missing_keys, missing_rows):
+            clean_row = [int(tok) for tok in row]
+            rows[idx] = clean_row
+            if cache_missing_rows:
+                _prompt_cache_put(key, clean_row)
+
+    out_rows: list[list[int]] = []
+    for idx, row in enumerate(rows):
+        if row is None:
+            raise RuntimeError(f"prompt row missing after encoding at index={idx}")
+        out_rows.append(row)
+    return out_rows
+
+
+def _build_left_padded_prompt_tensors(
+    *,
+    prompt_id_rows: list[list[int]],
+    device: str,
+    pad_token_id: int | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    _require_torch()
+    if not prompt_id_rows:
+        empty = torch.empty((0, 0), dtype=torch.long, device=device)
+        return empty, empty
+
+    width = max(1, max(len(row) for row in prompt_id_rows))
+    fill_value = int(pad_token_id) if pad_token_id is not None else 0
+    input_ids = torch.full((len(prompt_id_rows), width), fill_value=fill_value, dtype=torch.long, device=device)
+    attention_mask = torch.zeros((len(prompt_id_rows), width), dtype=torch.long, device=device)
+    for row_idx, row in enumerate(prompt_id_rows):
+        if not row:
+            continue
+        values = torch.tensor(row, dtype=torch.long, device=device)
+        take = len(row)
+        input_ids[row_idx, width - take:width] = values
+        attention_mask[row_idx, width - take:width] = 1
+    return input_ids, attention_mask
+
+
 def compute_token_char_offsets(
     tokenizer: PreTrainedTokenizerBase,
     completion_token_ids: list[int],
@@ -173,10 +355,39 @@ def compute_token_char_offsets(
     completion_text: str | None = None,
 ) -> list[tuple[int, int]]:
     cfg = decode_cfg or TokenDecodeConfig()
+    if not completion_token_ids:
+        return []
+
+    # Fast tokenizers can return native offset mapping without per-token decode.
+    is_fast = bool(getattr(tokenizer, "is_fast", False))
+    if is_fast:
+        if completion_text is None:
+            completion_text = tokenizer.decode(
+                completion_token_ids,
+                clean_up_tokenization_spaces=cfg.clean_up_tokenization_spaces,
+                skip_special_tokens=cfg.skip_special_tokens,
+            )
+        try:
+            encoded = tokenizer(
+                completion_text,
+                add_special_tokens=False,
+                return_offsets_mapping=True,
+            )
+            ids = encoded.get("input_ids", [])
+            mapping = encoded.get("offset_mapping", [])
+            if ids and isinstance(ids[0], list):
+                ids = ids[0]
+            if mapping and isinstance(mapping[0], list):
+                mapping = mapping[0]
+            if list(ids) == list(completion_token_ids) and len(mapping) == len(completion_token_ids):
+                return [(int(s), int(e)) for s, e in mapping]
+        except Exception as exc:  # pragma: no cover - tokenizer dependent
+            logger.warning("offset fast-path failed: %s", exc)
+
+    # Fallback for tokenizer/text normalization mismatch: decode each token piece.
     offsets: list[tuple[int, int]] = []
     chunks: list[str] = []
     cursor = 0
-
     for token_id in completion_token_ids:
         piece = _decode_single_token(tokenizer, token_id, cfg)
         start = cursor
@@ -191,24 +402,7 @@ def compute_token_char_offsets(
             clean_up_tokenization_spaces=cfg.clean_up_tokenization_spaces,
             skip_special_tokens=cfg.skip_special_tokens,
         )
-
     if reconstructed != completion_text:
-        # Best-effort fallback to fast-tokenizer offsets when possible.
-        is_fast = bool(getattr(tokenizer, "is_fast", False))
-        if is_fast:
-            try:
-                encoded = tokenizer(
-                    completion_text,
-                    add_special_tokens=False,
-                    return_offsets_mapping=True,
-                )
-                ids = encoded.get("input_ids", [])
-                mapping = encoded.get("offset_mapping", [])
-                if list(ids) == list(completion_token_ids) and len(mapping) == len(completion_token_ids):
-                    return [(int(s), int(e)) for s, e in mapping]
-            except Exception as exc:  # pragma: no cover - tokenizer dependent
-                logger.warning("offset fallback failed: %s", exc)
-
         logger.warning(
             "Token offset reconstruction mismatch. reconstructed_len=%s completion_len=%s",
             len(reconstructed),
@@ -451,80 +645,18 @@ def generate_rollouts(
         for ex in examples
     ]
 
-    original_padding_side = getattr(tokenizer, "padding_side", "right")
-    if original_padding_side != "left":
-        tokenizer.padding_side = "left"
-    try:
-        tokenized = None
-        use_chat_template = bool(getattr(tokenizer, "chat_template", None)) and hasattr(
-            tokenizer,
-            "apply_chat_template",
-        )
-        if use_chat_template:
-            try:
-                chats = [[{"role": "user", "content": prompt}] for prompt in prompt_texts]
-                chat_kwargs = (
-                    dict(gen_cfg.chat_template_kwargs)
-                    if getattr(gen_cfg, "chat_template_kwargs", None) is not None
-                    else {}
-                )
-                tokenized = tokenizer.apply_chat_template(
-                    chats,
-                    tokenize=True,
-                    add_generation_prompt=True,
-                    return_tensors="pt",
-                    padding=True,
-                    **chat_kwargs,
-                )
-            except Exception as exc:
-                logger.warning("Chat template encode failed; falling back to plain prompt encode: %s", exc)
-                tokenized = None
-
-        if tokenized is None:
-            tokenized = tokenizer(
-                prompt_texts,
-                return_tensors="pt",
-                add_special_tokens=True,
-                padding=True,
-            )
-    finally:
-        tokenizer.padding_side = original_padding_side
-
-    # `tokenizer(...)` usually returns BatchEncoding (mapping-like), while
-    # `apply_chat_template(..., return_tensors="pt")` can return Tensor.
-    if hasattr(tokenized, "keys") and ("input_ids" in tokenized):
-        input_ids = tokenized["input_ids"]
-        attention_mask = tokenized.get("attention_mask")
-    elif torch.is_tensor(tokenized):
-        input_ids = tokenized
-        attention_mask = None
-    else:
-        raise TypeError(
-            f"Unsupported tokenized output type: {type(tokenized)!r}. "
-            "Expected mapping with `input_ids` or torch.Tensor."
-        )
-
-    if not torch.is_tensor(input_ids):
-        input_ids = torch.as_tensor(input_ids, dtype=torch.long)
-    input_ids = input_ids.to(device)
-
-    if attention_mask is None:
-        if pad_token_id is None:
-            attention_mask = torch.ones_like(input_ids)
-        else:
-            attention_mask = (input_ids != int(pad_token_id)).long()
-    else:
-        if not torch.is_tensor(attention_mask):
-            attention_mask = torch.as_tensor(attention_mask, dtype=torch.long)
-        attention_mask = attention_mask.to(device)
-
+    prompt_id_rows = _encode_prompt_rows(
+        tokenizer=tokenizer,
+        prompt_texts=prompt_texts,
+        gen_cfg=gen_cfg,
+        pad_token_id=pad_token_id,
+    )
+    input_ids, attention_mask = _build_left_padded_prompt_tensors(
+        prompt_id_rows=prompt_id_rows,
+        device=device,
+        pad_token_id=pad_token_id,
+    )
     input_width = int(input_ids.shape[1])
-    input_ids_cpu = input_ids.detach().cpu()
-    attention_cpu = attention_mask.detach().cpu()
-    prompt_id_rows: list[list[int]] = []
-    for i in range(input_ids_cpu.shape[0]):
-        keep = attention_cpu[i].bool()
-        prompt_id_rows.append([int(tok) for tok in input_ids_cpu[i][keep].tolist()])
 
     do_sample = bool(gen_cfg.do_sample and gen_cfg.temperature > 0)
     logits_processor = _build_custom_logits_processors(gen_cfg, start_index=input_width)
