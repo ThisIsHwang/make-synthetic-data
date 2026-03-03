@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import json
 import logging
@@ -1187,14 +1188,24 @@ class OpenAICompatibleMQMScorer:
         sequence_scores: list[float] = []
         raw_outputs: list[str] = []
         error_spans: list[list[dict[str, Any]]] = []
-        for i in range(0, len(message_rows), max(1, int(self.cfg.batch_size))):
-            batch_messages = message_rows[i : i + max(1, int(self.cfg.batch_size))]
-            batch_samples = samples[i : i + max(1, int(self.cfg.batch_size))]
-            for sample, messages in zip(batch_samples, batch_messages):
+        max_workers = max(1, int(self.cfg.batch_size))
+        if max_workers == 1:
+            for sample, messages in zip(samples, message_rows):
                 score, raw_text = self._score_one_messages(messages)
                 sequence_scores.append(score)
                 raw_outputs.append(raw_text)
                 error_spans.append(gemba_mqm_extract_error_spans(raw_text, sample.mt))
+        else:
+            with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="mqm-scorer") as executor:
+                for i in range(0, len(message_rows), max_workers):
+                    batch_messages = message_rows[i : i + max_workers]
+                    batch_samples = samples[i : i + max_workers]
+                    futures = [executor.submit(self._score_one_messages, messages) for messages in batch_messages]
+                    batch_results = [future.result() for future in futures]
+                    for sample, (score, raw_text) in zip(batch_samples, batch_results):
+                        sequence_scores.append(score)
+                        raw_outputs.append(raw_text)
+                        error_spans.append(gemba_mqm_extract_error_spans(raw_text, sample.mt))
 
         return RewardOutput(
             sequence_scores=sequence_scores,
@@ -1237,6 +1248,12 @@ class OpenAICompatibleMQMScorer:
             "top_p": float(self.cfg.top_p),
             "max_tokens": int(self.cfg.max_tokens),
         }
+        if self.cfg.top_k is not None:
+            payload["top_k"] = int(self.cfg.top_k)
+        if self.cfg.presence_penalty is not None:
+            payload["presence_penalty"] = float(self.cfg.presence_penalty)
+        if self.cfg.repetition_penalty is not None:
+            payload["repetition_penalty"] = float(self.cfg.repetition_penalty)
         if self.cfg.stop:
             payload["stop"] = list(self.cfg.stop)
         if self.cfg.chat_template_kwargs:

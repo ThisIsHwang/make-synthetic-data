@@ -116,6 +116,9 @@ reward:
     use_reference: false
     temperature: 0.0
     top_p: 1.0
+    top_k: null
+    presence_penalty: null
+    repetition_penalty: null
     max_tokens: 1024
     stop: []
     chat_template_kwargs:

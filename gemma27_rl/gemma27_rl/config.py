@@ -142,6 +142,9 @@ class MQMConfig:
     use_reference: bool = False
     temperature: float = 0.0
     top_p: float = 1.0
+    top_k: int | None = None
+    presence_penalty: float | None = None
+    repetition_penalty: float | None = None
     max_tokens: int = 1024
     stop: list[str] = field(default_factory=list)
     chat_template_kwargs: dict[str, Any] = field(default_factory=lambda: {"enable_thinking": False})
@@ -460,6 +463,10 @@ def _validate_config(cfg: RLPostTrainConfig) -> None:
             raise ValueError("reward.mqm.stop must be a list")
         if cfg.reward.mqm.chat_template_kwargs is not None and not isinstance(cfg.reward.mqm.chat_template_kwargs, dict):
             raise ValueError("reward.mqm.chat_template_kwargs must be a dict")
+        if cfg.reward.mqm.top_k is not None and int(cfg.reward.mqm.top_k) <= 0:
+            raise ValueError("reward.mqm.top_k must be > 0 when set")
+        if cfg.reward.mqm.repetition_penalty is not None and float(cfg.reward.mqm.repetition_penalty) <= 0:
+            raise ValueError("reward.mqm.repetition_penalty must be > 0 when set")
     if cfg.data.eval_sampling_count is not None:
         if int(cfg.data.eval_sampling_count) <= 0:
             raise ValueError("data.eval_sampling_count must be > 0 when set.")
