@@ -105,7 +105,7 @@ stability:
   monitor_router_entropy: true
 
 distributed:
-  deepspeed: configs/deepspeed_zero2.json
+  deepspeed: deepspeed_zero2.json
   nccl_timeout_minutes: 120
 
 misc:
