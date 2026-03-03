@@ -65,6 +65,9 @@ echo ""
 
 # ── Install flash-attn (built from source against current torch) ──
 echo "[4/4] Installing flash-attn (source build, may take several minutes) ..."
+# flash-attn's setup.py requires wheel and setuptools at build time.
+# With --no-build-isolation these must exist in the venv.
+uv pip install --python "${PYTHON}" wheel setuptools
 uv pip install --python "${PYTHON}" \
     flash-attn --no-build-isolation --force-reinstall --no-cache
 
