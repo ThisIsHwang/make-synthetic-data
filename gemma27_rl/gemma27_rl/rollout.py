@@ -727,12 +727,6 @@ def generate_rollouts(
     rollouts: list[Rollout] = []
     decode_cfg = TokenDecodeConfig()
     policy_vocab_size = _get_model_vocab_size(policy_model)
-    if policy_vocab_size is not None:
-        _validate_item_token_ids(
-            items=[(row, []) for row in prompt_id_rows],
-            vocab_size=policy_vocab_size,
-            tag="generate_rollouts.prompt_ids",
-        )
     ref_dev = ref_device or device
     empty_completion_fallbacks = 0
     pending_policy_logprob_items: list[tuple[int, list[int], list[int]]] = []
@@ -752,6 +746,12 @@ def generate_rollouts(
         gen_cfg=gen_cfg,
         pad_token_id=pad_token_id,
     )
+    if policy_vocab_size is not None:
+        _validate_item_token_ids(
+            items=[(row, []) for row in prompt_id_rows],
+            vocab_size=policy_vocab_size,
+            tag="generate_rollouts.prompt_ids",
+        )
     input_ids, attention_mask = _build_left_padded_prompt_tensors(
         prompt_id_rows=prompt_id_rows,
         device=device,
