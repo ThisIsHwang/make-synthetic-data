@@ -29,12 +29,28 @@ def _reply(payload: dict[str, Any]) -> None:
     sys.stdout.flush()
 
 
+def _looks_like_cuda_runtime_error(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    markers = (
+        "out of memory",
+        "cuda oom",
+        "cuda error",
+        "illegal memory access",
+        "device-side assert",
+        "cublas",
+        "cudnn",
+        "acceleratorerror",
+    )
+    return any(marker in text for marker in markers)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Reference model worker")
     _ = parser.parse_args(argv)
 
     model: AutoModelForCausalLM | None = None
     device = "cpu"
+    logprob_micro_batch_size = 2
 
     for raw_line in sys.stdin:
         line = raw_line.strip()
@@ -63,6 +79,7 @@ def main(argv: list[str] | None = None) -> int:
                 dtype_raw = str(cfg_payload.get("dtype", "float32"))
                 attn_implementation = cfg_payload.get("attn_implementation")
                 device = str(cfg_payload.get("device", "cpu"))
+                logprob_micro_batch_size = max(1, int(cfg_payload.get("logprob_micro_batch_size", 2)))
 
                 kwargs: dict[str, Any] = {
                     "trust_remote_code": trust_remote_code,
@@ -119,7 +136,7 @@ def main(argv: list[str] | None = None) -> int:
                     completion_ids_int = [int(v) for v in completion_ids]
                     parsed_items.append((prompt_ids_int, completion_ids_int))
 
-                micro_batch = max(1, len(parsed_items))
+                micro_batch = max(1, min(len(parsed_items), int(logprob_micro_batch_size)))
                 while True:
                     try:
                         rows_t = compute_completion_logprobs_batch(
@@ -130,9 +147,8 @@ def main(argv: list[str] | None = None) -> int:
                         )
                         break
                     except Exception as exc:
-                        msg = str(exc).lower()
-                        is_oom = ("out of memory" in msg) or ("cuda oom" in msg)
-                        if (not is_oom) or micro_batch <= 1:
+                        is_cuda_runtime = _looks_like_cuda_runtime_error(exc)
+                        if (not is_cuda_runtime) or micro_batch <= 1:
                             raise
                         micro_batch = max(1, micro_batch // 2)
                         if torch.cuda.is_available():

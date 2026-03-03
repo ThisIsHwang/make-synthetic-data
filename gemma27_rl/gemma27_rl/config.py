@@ -33,6 +33,7 @@ class ModelConfig:
     policy_gpu_ids: list[int] = field(default_factory=list)
     reference_gpu_ids: list[int] = field(default_factory=list)
     reference_runtime: str = "worker"  # worker|in_process|cpu
+    reference_logprob_micro_batch_size: int = 2
     reference_python_executable: str | None = None
     reference_subprocess_timeout_sec: float = 600.0
     reference_worker_host: str | None = None
@@ -405,6 +406,8 @@ def _validate_config(cfg: RLPostTrainConfig) -> None:
         raise ValueError("model.reference_runtime must be worker|in_process|cpu")
     if float(cfg.model.reference_subprocess_timeout_sec) <= 0:
         raise ValueError("model.reference_subprocess_timeout_sec must be > 0.")
+    if int(cfg.model.reference_logprob_micro_batch_size) <= 0:
+        raise ValueError("model.reference_logprob_micro_batch_size must be > 0.")
     if int(cfg.rl.deepspeed_zero_stage) not in {0, 1, 2, 3}:
         raise ValueError("rl.deepspeed_zero_stage must be one of 0,1,2,3")
     if cfg.generation.chat_template_kwargs is not None and not isinstance(cfg.generation.chat_template_kwargs, dict):

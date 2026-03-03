@@ -1487,16 +1487,18 @@ def _create_reference_logprob_client(
         "dtype": _dtype_to_config_name(dtype, str(cfg.misc.dtype)),
         "attn_implementation": attn_impl,
         "device": worker_device,
+        "logprob_micro_batch_size": int(cfg.model.reference_logprob_micro_batch_size),
     }
     python_executable = cfg.model.reference_python_executable or sys.executable
     logger.info(
         "Reference worker init config: runtime=%s requested_device=%s worker_device=%s "
-        "attn=%s dtype=%s python=%s host=%s",
+        "attn=%s dtype=%s micro_batch=%s python=%s host=%s",
         cfg.model.reference_runtime,
         requested_device,
         worker_device,
         cfg_payload.get("attn_implementation"),
         cfg_payload.get("dtype"),
+        cfg_payload.get("logprob_micro_batch_size"),
         python_executable,
         remote_host or "local",
     )
