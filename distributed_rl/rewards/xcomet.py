@@ -99,6 +99,11 @@ class XCometReward(RewardModel):
 
         # --- Mode 2: In-process ---
         # Requires the ``unbabel-comet`` package (pip install unbabel-comet).
+        import sys
+        logger.warning(
+            "[XComet diag] executable=%s  prefix=%s  path=%s",
+            sys.executable, sys.prefix, sys.path,
+        )
         try:
             from comet import download_model, load_from_checkpoint
         except Exception as exc:  # pragma: no cover
