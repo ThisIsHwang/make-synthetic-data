@@ -86,15 +86,38 @@ uv pip install flash-attn --no-build-isolation
 - `deepspeed >= 0.15.4`
 - `datasets >= 2.21.0`
 
-### 2. MetricX 환경 (별도 venv)
+### 2. Reward 모델 환경 (MetricX + XComet 별도 venv)
 
-MetricX는 의존성 충돌 방지를 위해 별도 Python 환경을 사용합니다.
+MetricX / XComet은 의존성 충돌 방지를 위해 별도 Python 환경을 사용합니다.
+**셋업 스크립트 한 줄로 설치할 수 있습니다:**
 
 ```bash
-# 프로젝트 루트에서 실행
+# 프로젝트 루트에서 실행 — MetricX + XComet venv를 한번에 구축
+bash distributed_rl/scripts/setup_reward_venvs.sh
+```
+
+> **참고**: Python 3.12+에서 `unbabel-comet`이 의존하는 `pytorch_lightning`이
+> `pkg_resources`를 필요로 합니다. `uv pip install setuptools`만으로는 `pkg_resources`가
+> 제대로 노출되지 않는 uv 버그가 있어, 스크립트 내부에서 pip으로 재설치합니다.
+
+수동 설치가 필요한 경우:
+
+```bash
+# --index-strategy: PyTorch cu126 index와 PyPI 간 torchmetrics 버전 충돌 방지
+UV_STRATEGY="--index-strategy unsafe-best-match"
+
+# MetricX venv
 uv venv .venv-metrics
-uv pip install --python .venv-metrics/bin/python -r distributed_rl/requirements-metrics.txt
-# editable install 불필요: scorer_worker.py가 sys.path를 자동 설정
+uv pip install --python .venv-metrics/bin/python ${UV_STRATEGY} \
+    -r distributed_rl/requirements-metrics.txt
+
+# XComet venv
+uv venv .venv-xcomet
+uv pip install --python .venv-xcomet/bin/python ${UV_STRATEGY} \
+    -r distributed_rl/requirements-xcomet.txt
+# Python 3.12+ pkg_resources 픽스 (필수)
+uv pip install --python .venv-xcomet/bin/python pip
+.venv-xcomet/bin/python -m pip install --force-reinstall --no-deps setuptools
 ```
 
 Config의 `python_executable`은 YAML 파일 위치 기준 상대 경로입니다:
@@ -103,20 +126,6 @@ Config의 `python_executable`은 YAML 파일 위치 기준 상대 경로입니�
 reward:
   metricx:
     python_executable: ../../.venv-metrics/bin/python
-```
-
-### 3. XComet 환경 (별도 venv)
-
-```bash
-# 프로젝트 루트에서 실행
-uv venv .venv-xcomet
-uv pip install --python .venv-xcomet/bin/python -r distributed_rl/requirements-xcomet.txt
-```
-
-Config에서 `reward.xcomet.python_executable`로 경로를 지정합니다:
-```yaml
-# distributed_rl/configs/*.yaml 기준 → ../../ = 프로젝트 루트
-reward:
   xcomet:
     python_executable: ../../.venv-xcomet/bin/python
 ```
@@ -216,8 +225,8 @@ cp .env.example .env && vi .env
 uv pip install -e distributed_rl
 uv pip install flash-attn --no-build-isolation
 
-# 3. MetricX 별도 venv (위 Installation 참조)
-# 4. XComet 별도 venv (위 Installation 참조)
+# 3. Reward 모델 venv (MetricX + XComet)
+bash distributed_rl/scripts/setup_reward_venvs.sh
 ```
 
 ### 데이터셋 구조
