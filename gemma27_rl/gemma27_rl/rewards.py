@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 import select
 import subprocess
+import time
 from textwrap import dedent
 from typing import Any, Callable
 from urllib import error as urllib_error
@@ -114,6 +115,12 @@ class _ScorerSubprocessClient:
             location = f" via ssh host={self._remote_host}" if self._remote_host else ""
             raise RuntimeError(f"Failed to start {backend} scorer worker{location}: cmd={cmd}") from exc
 
+        logger.info(
+            "%s scorer worker process started (pid=%s, host=%s). waiting for init...",
+            backend,
+            getattr(self._proc, "pid", None),
+            self._remote_host or "local",
+        )
         try:
             init_resp = self.request({"type": "init", "config": config_payload})
         except Exception:
@@ -138,6 +145,7 @@ class _ScorerSubprocessClient:
         self._assert_alive()
         assert self._proc.stdin is not None
         assert self._proc.stdout is not None
+        request_type = str(payload.get("type", "request")).strip() or "request"
 
         try:
             self._proc.stdin.write(json.dumps(payload, ensure_ascii=False) + "\n")
@@ -145,9 +153,30 @@ class _ScorerSubprocessClient:
         except Exception as exc:
             raise RuntimeError(f"Failed to send request to {self._backend} scorer worker.") from exc
 
-        ready, _, _ = select.select([self._proc.stdout], [], [], self._timeout_sec)
-        if not ready:
-            raise TimeoutError(f"{self._backend} scorer worker timed out after {self._timeout_sec}s")
+        started = time.monotonic()
+        next_wait_log_sec = 30.0
+        while True:
+            elapsed = time.monotonic() - started
+            remaining = self._timeout_sec - elapsed
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"{self._backend} scorer worker timed out after {self._timeout_sec}s while waiting for {request_type}"
+                )
+            wait_slice = min(2.0, remaining)
+            ready, _, _ = select.select([self._proc.stdout], [], [], wait_slice)
+            if ready:
+                break
+            if elapsed >= next_wait_log_sec:
+                logger.info(
+                    "%s scorer worker still waiting for %s response: elapsed=%.1fs timeout=%.1fs host=%s",
+                    self._backend,
+                    request_type,
+                    elapsed,
+                    self._timeout_sec,
+                    self._remote_host or "local",
+                )
+                next_wait_log_sec += 30.0
+
         try:
             line = self._proc.stdout.readline()
         except Exception as exc:
@@ -540,6 +569,13 @@ class MetricXQEScorer:
                 "max_input_length": int(self.cfg.max_input_length),
                 "overflow_policy": self.cfg.overflow_policy,
             }
+            logger.info(
+                "Starting MetricX scorer worker init: python=%s host=%s requested_device=%s worker_device=%s",
+                self.cfg.python_executable,
+                self.cfg.worker_host or "local",
+                self.cfg.device,
+                worker_cfg_device,
+            )
             self._worker = _ScorerSubprocessClient(
                 backend="metricx",
                 python_executable=self.cfg.python_executable,
@@ -971,6 +1007,13 @@ class XCometXLScorer:
                 "device": worker_cfg_device,
                 "use_reference": bool(self.cfg.use_reference),
             }
+            logger.info(
+                "Starting xCOMET scorer worker init: python=%s host=%s requested_device=%s worker_device=%s",
+                self.cfg.python_executable,
+                self.cfg.worker_host or "local",
+                self.cfg.device,
+                worker_cfg_device,
+            )
             self._worker = _ScorerSubprocessClient(
                 backend="xcomet",
                 python_executable=self.cfg.python_executable,

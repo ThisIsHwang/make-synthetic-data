@@ -192,4 +192,15 @@ def build_worker_launch_command(
     parts.append(shlex.quote(script_path))
     parts.extend(shlex.quote(arg) for arg in args)
     remote_cmd = " ".join(parts)
-    return ["ssh", host, remote_cmd]
+    # Avoid interactive SSH prompts (host key/password) that can block worker init indefinitely.
+    return [
+        "ssh",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=15",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+        host,
+        remote_cmd,
+    ]
