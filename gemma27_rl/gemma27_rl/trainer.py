@@ -2597,7 +2597,6 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
         )
 
     if cfg.eval.run_before_train and eval_examples and start_update <= 1:
-        _dist_barrier()
         if (not use_deepspeed) or rank0:
             logger.info(
                 "starting eval (run_before_train): examples=%s metricx=%s xcomet=%s mqm=%s",
@@ -2995,7 +2994,6 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
             and eval_examples
             and update_idx % cfg.eval.eval_every_n_updates == 0
         ):
-            _dist_barrier()
             if (not use_deepspeed) or rank0:
                 logger.info(
                     "starting eval: update=%s examples=%s metricx=%s xcomet=%s mqm=%s",
@@ -3029,7 +3027,6 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
                     best_eval_score = eval_select_score
                     best_eval_update = update_idx
                     logger.info("new best eval at update=%s score=%.6f", update_idx, eval_select_score)
-            _dist_barrier()
 
         # Early-stop guard for divergence in toy runs.
         if not math.isfinite(train_stats.policy_loss):
