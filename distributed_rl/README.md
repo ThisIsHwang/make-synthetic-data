@@ -93,7 +93,9 @@ MetricX는 의존성 충돌 방지를 위해 별도 Python 환경을 사용합�
 ```bash
 # 프로젝트 루트에서 실행
 uv venv .venv-metrics
-uv pip install --python .venv-metrics/bin/python torch transformers sentencepiece pyyaml
+uv pip install --python .venv-metrics/bin/python \
+  torch transformers sentencepiece accelerate huggingface_hub pyyaml
+uv pip install --python .venv-metrics/bin/python -e distributed_rl
 ```
 
 Config의 `python_executable`은 YAML 파일 위치 기준 상대 경로입니다:
@@ -110,6 +112,7 @@ reward:
 # 프로젝트 루트에서 실행
 uv venv .venv-xcomet
 uv pip install --python .venv-xcomet/bin/python torch unbabel-comet pyyaml
+uv pip install --python .venv-xcomet/bin/python -e distributed_rl
 ```
 
 Config에서 `reward.xcomet.python_executable`로 경로를 지정합니다:
