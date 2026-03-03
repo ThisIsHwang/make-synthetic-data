@@ -76,8 +76,6 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-import yaml
-
 from .prompting import DEFAULT_TRANSLATION_PROMPT_TEMPLATE
 
 logger = logging.getLogger(__name__)
@@ -772,6 +770,8 @@ def load_config(path: str | Path) -> DistributedRLConfig:
 
     Pipeline: YAML → dict → _coerce_dataclass → path resolution → validation.
     """
+    import yaml
+
     cfg_path = Path(path)
     payload = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
     cfg = _coerce_dataclass(DistributedRLConfig, payload)
@@ -803,4 +803,6 @@ def load_config(path: str | Path) -> DistributedRLConfig:
 
 def dump_config(cfg: DistributedRLConfig, path: str | Path) -> None:
     """Serialize a config to YAML (for logging/reproducibility)."""
+    import yaml
+
     Path(path).write_text(yaml.safe_dump(asdict(cfg), sort_keys=False), encoding="utf-8")

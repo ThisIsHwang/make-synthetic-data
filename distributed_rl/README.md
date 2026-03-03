@@ -46,6 +46,7 @@ Worker Node (Multi-Node 시):
 
 ```
 hwang-post-training/            ← 프로젝트 루트 (여기서 실행)
+├── .env                       ← HF_HOME, HF_TOKEN 등 환경변수 (gitignored)
 ├── distributed_rl/
 │   ├── configs/                ← YAML config 파일들
 │   └── ...
@@ -53,13 +54,28 @@ hwang-post-training/            ← 프로젝트 루트 (여기서 실행)
 └── .venv-xcomet/               ← XComet 전용 venv (Step 3에서 생성)
 ```
 
+### 0. 환경 변수 (.env)
+
+프로젝트 루트에 `.env` 파일을 생성합니다. 학습 시작 시 자동으로 로드됩니다.
+
+```bash
+cp .env.example .env
+# .env 파일을 편집하여 실제 값 입력
+```
+
+`.env` 예시:
+```
+HF_HOME=/group-volume/huggingface
+HF_TOKEN=hf_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+```
+
 ### 1. Training 환경
 
 ```bash
 # 현재 활성 venv에 distributed_rl 패키지 설치
 uv pip install -e distributed_rl
-# 또는 requirements만 설치:
-uv pip install -r distributed_rl/requirements.txt
+# flash-attn 설치 (--no-build-isolation 필수)
+uv pip install flash-attn --no-build-isolation
 ```
 
 주요 의존성:
@@ -77,8 +93,7 @@ MetricX는 의존성 충돌 방지를 위해 별도 Python 환경을 사용합�
 ```bash
 # 프로젝트 루트에서 실행
 uv venv .venv-metrics
-uv pip install --python .venv-metrics/bin/python torch transformers sentencepiece
-# MetricX 모델은 MT5 기반이므로 추가 패키지 불필요
+uv pip install --python .venv-metrics/bin/python torch transformers sentencepiece pyyaml
 ```
 
 Config의 `python_executable`은 YAML 파일 위치 기준 상대 경로입니다:
@@ -94,7 +109,7 @@ reward:
 ```bash
 # 프로젝트 루트에서 실행
 uv venv .venv-xcomet
-uv pip install --python .venv-xcomet/bin/python torch unbabel-comet
+uv pip install --python .venv-xcomet/bin/python torch unbabel-comet pyyaml
 ```
 
 Config에서 `reward.xcomet.python_executable`로 경로를 지정합니다:
@@ -193,11 +208,12 @@ torchrun \
 ```bash
 # 프로젝트 루트 (hwang-post-training/) 에서 실행
 
-# 1. HuggingFace 토큰 설정 (gated model 접근용)
-export HF_TOKEN=<your-token>
+# 1. .env 파일 설정 (위 Installation > 환경 변수 참조)
+cp .env.example .env && vi .env
 
 # 2. Training 환경 설치
 uv pip install -e distributed_rl
+uv pip install flash-attn --no-build-isolation
 
 # 3. MetricX 별도 venv (위 Installation 참조)
 # 4. XComet 별도 venv (위 Installation 참조)

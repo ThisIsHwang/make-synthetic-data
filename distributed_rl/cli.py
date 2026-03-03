@@ -28,6 +28,26 @@ import argparse
 import logging
 import os
 import sys
+from pathlib import Path
+
+
+def _load_dotenv() -> None:
+    """Load .env file from the project root (parent of distributed_rl/)."""
+    project_root = Path(__file__).resolve().parent.parent
+    env_file = project_root / ".env"
+    if not env_file.is_file():
+        return
+    with env_file.open(encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip().strip("\"'")
+            os.environ.setdefault(key, value)
 
 
 def _setup_logging() -> None:
@@ -39,6 +59,7 @@ def _setup_logging() -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    _load_dotenv()
     _setup_logging()
 
     parser = argparse.ArgumentParser(
