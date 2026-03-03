@@ -83,6 +83,29 @@ def _serialize_chat_template_kwargs(chat_template_kwargs: dict[str, Any] | None)
         return repr(chat_template_kwargs)
 
 
+def _normalize_chat_template_kwargs(raw_kwargs: dict[str, Any] | None) -> dict[str, Any]:
+    if raw_kwargs is None:
+        return {}
+    kwargs = dict(raw_kwargs)
+    # Accept OpenAI-style container and map it to HF chat-template kwargs.
+    extra_body = kwargs.pop("extra_body", None)
+    if extra_body is not None:
+        if isinstance(extra_body, dict):
+            nested_chat_kwargs = extra_body.get("chat_template_kwargs")
+            if isinstance(nested_chat_kwargs, dict):
+                merged = dict(nested_chat_kwargs)
+            else:
+                merged = dict(extra_body)
+            merged.update(kwargs)
+            kwargs = merged
+        else:
+            logger.warning(
+                "Ignoring non-dict generation.chat_template_kwargs.extra_body (type=%s)",
+                type(extra_body).__name__,
+            )
+    return kwargs
+
+
 def _prompt_cache_limit() -> int:
     return _env_int("GEMMA27_RL_PROMPT_CACHE_SIZE", default=8192, minimum=0)
 
@@ -329,11 +352,7 @@ def _encode_prompt_rows(
         tokenizer,
         "apply_chat_template",
     )
-    chat_kwargs = (
-        dict(gen_cfg.chat_template_kwargs)
-        if getattr(gen_cfg, "chat_template_kwargs", None) is not None
-        else {}
-    )
+    chat_kwargs = _normalize_chat_template_kwargs(getattr(gen_cfg, "chat_template_kwargs", None))
     kwargs_key = _serialize_chat_template_kwargs(chat_kwargs if use_chat_template else None)
     tok_id = id(tokenizer)
 

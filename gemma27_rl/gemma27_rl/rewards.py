@@ -1337,7 +1337,9 @@ class OpenAICompatibleMQMScorer:
         if self.cfg.stop:
             payload["stop"] = list(self.cfg.stop)
         if self.cfg.chat_template_kwargs:
-            payload["chat_template_kwargs"] = dict(self.cfg.chat_template_kwargs)
+            # OpenAI-compatible servers (e.g., vLLM) commonly expect custom
+            # request fields under `extra_body`.
+            payload["extra_body"] = {"chat_template_kwargs": dict(self.cfg.chat_template_kwargs)}
         if log_io:
             try:
                 payload_text = json.dumps(payload, ensure_ascii=False)
