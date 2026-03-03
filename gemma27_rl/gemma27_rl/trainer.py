@@ -1489,6 +1489,17 @@ def _create_reference_logprob_client(
         "device": worker_device,
     }
     python_executable = cfg.model.reference_python_executable or sys.executable
+    logger.info(
+        "Reference worker init config: runtime=%s requested_device=%s worker_device=%s "
+        "attn=%s dtype=%s python=%s host=%s",
+        cfg.model.reference_runtime,
+        requested_device,
+        worker_device,
+        cfg_payload.get("attn_implementation"),
+        cfg_payload.get("dtype"),
+        python_executable,
+        remote_host or "local",
+    )
     client = ReferenceLogprobClient(
         python_executable=python_executable,
         timeout_sec=float(cfg.model.reference_subprocess_timeout_sec),
@@ -2601,8 +2612,8 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
                 tokenizer=tokenizer,
                 gen_cfg=cfg.generation,
                 device=device,
-                ref_model=ref_model if rank0 else None,
-                ref_device=ref_device if rank0 else None,
+                ref_model=None,
+                ref_device=None,
                 # In distributed mode we fill reference logprobs later in rank0 batch
                 # (`_fill_missing_reference_logprobs`). Avoid per-sample worker calls here,
                 # which are fragile under long-running CUDA workers.
@@ -2729,13 +2740,11 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
                 tokenizer=tokenizer,
                 gen_cfg=cfg.generation,
                 device=device,
-                ref_model=ref_model,
-                ref_device=ref_device,
-                ref_logprob_fn=(
-                    ref_logprob_client.score_logprobs
-                    if ref_logprob_client is not None
-                    else None
-                ),
+                # Keep rollout generation free of reference model calls; fill reference
+                # logprobs in one batched step right after rewards.
+                ref_model=None,
+                ref_device=None,
+                ref_logprob_fn=None,
                 prompt_template=cfg.prompt.template,
                 show_progress=True,
                 progress_desc=f"rollout u{update_idx}",
@@ -2751,6 +2760,16 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
                     xcomet_cache=xcomet_cache,
                     mqm_cache=mqm_cache,
                 )
+                if cfg.rl.kl_coef > 0:
+                    _ = _fill_missing_reference_logprobs(
+                        merged_rollouts=rollouts,
+                        cfg=cfg,
+                        update_idx=update_idx,
+                        ref_logprob_client=ref_logprob_client,
+                        ref_model=ref_model,
+                        ref_device=ref_device,
+                        device=device,
+                    )
             else:
                 logger.warning("No rollouts generated at update=%s; skipping step.", update_idx)
             log_rollouts = rollouts
