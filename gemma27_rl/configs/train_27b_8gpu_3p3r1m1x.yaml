@@ -3,7 +3,9 @@ model:
   reference_name_or_path: ../outputs/gemma3-27b-it-sft-fsdp
   tokenizer_name_or_path: null
   trust_remote_code: false
-  attn_implementation: auto
+  attn_implementation: flash_attention_2
+  disable_policy_flash_attention: false
+  reference_attn_implementation: sdpa
   use_fast_tokenizer: true
   reference_device: cuda:3
   # 3 GPUs for trainable policy model.

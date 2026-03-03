@@ -27,7 +27,7 @@ class ModelConfig:
     tokenizer_name_or_path: str | None = None
     trust_remote_code: bool = False
     attn_implementation: str | None = "auto"
-    disable_policy_flash_attention: bool = True
+    disable_policy_flash_attention: bool = False
     reference_attn_implementation: str | None = None
     use_fast_tokenizer: bool = True
     reference_device: str | None = None

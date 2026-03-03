@@ -3,7 +3,9 @@ model:
   reference_name_or_path: /workspace/.cache/huggingface/hub/models--Qwen--Qwen3.5-27B/snapshots/b7ca741b86de18df552fd2cc952861e04621a4bd
   tokenizer_name_or_path: null
   trust_remote_code: true
-  attn_implementation: auto
+  attn_implementation: flash_attention_2
+  disable_policy_flash_attention: false
+  reference_attn_implementation: sdpa
   use_fast_tokenizer: true
   reference_device: null
   policy_gpu_ids: [0, 1, 2, 3, 4, 5, 6, 7]
