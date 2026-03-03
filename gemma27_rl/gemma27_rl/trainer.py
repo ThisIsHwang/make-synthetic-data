@@ -1575,33 +1575,55 @@ def _prepare_rewards_and_advantages(
 
     metricx_enabled = cfg.reward.metricx.enabled and metricx_scorer is not None
     xcomet_enabled = cfg.reward.xcomet.enabled and xcomet_scorer is not None
+    mqm_enabled = cfg.reward.mqm.enabled and mqm_scorer is not None
 
     metricx_scores = [cfg.reward.metricx.offset for _ in rollouts]
     xcomet_scores = [0.0 for _ in rollouts]
+    mqm_scores = [0.0 for _ in rollouts]
     span_rows = [[] for _ in rollouts]
+    mqm_span_rows = [[] for _ in rollouts]
 
-    if metricx_enabled and xcomet_enabled:
+    enabled_scorers = sum(int(flag) for flag in (metricx_enabled, xcomet_enabled, mqm_enabled))
+    if enabled_scorers > 1:
         logger.info(
-            "reward scoring: running MetricX and xCOMET in parallel for %s rollouts",
+            "reward scoring: running scorers in parallel for %s rollouts (metricx=%s xcomet=%s mqm=%s)",
             len(rollouts),
+            metricx_enabled,
+            xcomet_enabled,
+            mqm_enabled,
         )
-        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="reward-scorer") as executor:
-            metricx_future = executor.submit(
-                _score_with_cache_metricx,
-                samples=samples,
-                scorer=metricx_scorer,
-                cache=metricx_cache,
-                use_cache=cfg.reward.cache_enabled,
-            )
-            xcomet_future = executor.submit(
-                _score_with_cache_xcomet,
-                samples=samples,
-                scorer=xcomet_scorer,
-                cache=xcomet_cache,
-                use_cache=cfg.reward.cache_enabled,
-            )
-            metricx_scores = metricx_future.result()
-            xcomet_scores, span_rows = xcomet_future.result()
+        with ThreadPoolExecutor(max_workers=enabled_scorers, thread_name_prefix="reward-scorer") as executor:
+            futures: dict[str, Any] = {}
+            if metricx_enabled:
+                futures["metricx"] = executor.submit(
+                    _score_with_cache_metricx,
+                    samples=samples,
+                    scorer=metricx_scorer,
+                    cache=metricx_cache,
+                    use_cache=cfg.reward.cache_enabled,
+                )
+            if xcomet_enabled:
+                futures["xcomet"] = executor.submit(
+                    _score_with_cache_xcomet,
+                    samples=samples,
+                    scorer=xcomet_scorer,
+                    cache=xcomet_cache,
+                    use_cache=cfg.reward.cache_enabled,
+                )
+            if mqm_enabled:
+                futures["mqm"] = executor.submit(
+                    _score_with_cache_mqm,
+                    samples=samples,
+                    scorer=mqm_scorer,
+                    cache=mqm_cache,
+                    use_cache=cfg.reward.cache_enabled and cfg.reward.mqm.enabled,
+                )
+            if "metricx" in futures:
+                metricx_scores = futures["metricx"].result()
+            if "xcomet" in futures:
+                xcomet_scores, span_rows = futures["xcomet"].result()
+            if "mqm" in futures:
+                mqm_scores, mqm_span_rows = futures["mqm"].result()
     else:
         if metricx_enabled:
             metricx_scores = _score_with_cache_metricx(
@@ -1616,6 +1638,13 @@ def _prepare_rewards_and_advantages(
                 scorer=xcomet_scorer,
                 cache=xcomet_cache,
                 use_cache=cfg.reward.cache_enabled,
+            )
+        if mqm_enabled:
+            mqm_scores, mqm_span_rows = _score_with_cache_mqm(
+                samples=samples,
+                scorer=mqm_scorer,
+                cache=mqm_cache,
+                use_cache=cfg.reward.cache_enabled and cfg.reward.mqm.enabled,
             )
 
     metricx_scores, metricx_replaced = _sanitize(metricx_scores, fallback=cfg.reward.metricx.offset)
@@ -1642,16 +1671,6 @@ def _prepare_rewards_and_advantages(
             xcomet_replaced,
         )
 
-    if cfg.reward.mqm.enabled and mqm_scorer is not None:
-        mqm_scores, mqm_span_rows = _score_with_cache_mqm(
-            samples=samples,
-            scorer=mqm_scorer,
-            cache=mqm_cache,
-            use_cache=cfg.reward.cache_enabled and cfg.reward.mqm.enabled,
-        )
-    else:
-        mqm_scores = [0.0 for _ in rollouts]
-        mqm_span_rows = [[] for _ in rollouts]
     mqm_scores, mqm_replaced = _sanitize(mqm_scores, fallback=0.0)
     if mqm_replaced > 0:
         logger.warning(

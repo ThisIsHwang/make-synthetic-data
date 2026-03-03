@@ -230,10 +230,13 @@ def evaluate_on_dataset(
     metricx_scores = [0.0 for _ in rollouts]
     metricx_rewards = [0.0 for _ in rollouts]
     xcomet_scores = [0.0 for _ in rollouts]
+    mqm_scores = [0.0 for _ in rollouts]
     spans: list[list[dict[str, Any]]] = [[] for _ in rollouts]
+    mqm_spans: list[list[dict[str, Any]]] = [[] for _ in rollouts]
 
     metricx_enabled = metricx_scorer is not None and cfg.reward.metricx.enabled
     xcomet_enabled = xcomet_scorer is not None and cfg.reward.xcomet.enabled
+    mqm_enabled = mqm_scorer is not None and cfg.reward.mqm.enabled
 
     def _score_metricx_eval() -> tuple[list[float], list[float]]:
         metricx_local_scores = metricx_scorer.score_batch(samples).sequence_scores  # type: ignore[union-attr]
@@ -274,15 +277,43 @@ def evaluate_on_dataset(
         xcomet_local_spans: list[list[dict[str, Any]]] = meta.get("error_spans", [[] for _ in rollouts])
         return xcomet_local_scores, xcomet_local_spans
 
-    if metricx_enabled and xcomet_enabled:
+    def _score_mqm_eval() -> tuple[list[float], list[list[dict[str, Any]]]]:
+        mqm_out = mqm_scorer.score_batch(samples)
+        mqm_local_scores = mqm_out.sequence_scores
+        mqm_meta = mqm_out.metadata or {}
+        mqm_local_spans: list[list[dict[str, Any]]] = mqm_meta.get("error_spans", [[] for _ in rollouts])
+        non_finite_idx = [idx for idx, value in enumerate(mqm_local_scores) if not math.isfinite(float(value))]
+        if non_finite_idx:
+            logger.warning(
+                "MQM scorer produced %s non-finite eval scores; replacing with 0.0.",
+                len(non_finite_idx),
+            )
+            for idx in non_finite_idx:
+                mqm_local_scores[idx] = 0.0
+        return mqm_local_scores, mqm_local_spans
+
+    enabled_scorers = sum(int(flag) for flag in (metricx_enabled, xcomet_enabled, mqm_enabled))
+    if enabled_scorers > 1:
         logger.info(
-            "evaluate_on_dataset: scoring metricx and xcomet in parallel..."
+            "evaluate_on_dataset: scoring in parallel (metricx=%s xcomet=%s mqm=%s)...",
+            metricx_enabled,
+            xcomet_enabled,
+            mqm_enabled,
         )
-        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="eval-scorer") as executor:
-            metricx_future = executor.submit(_score_metricx_eval)
-            xcomet_future = executor.submit(_score_xcomet_eval)
-            metricx_scores, metricx_rewards = metricx_future.result()
-            xcomet_scores, spans = xcomet_future.result()
+        with ThreadPoolExecutor(max_workers=enabled_scorers, thread_name_prefix="eval-scorer") as executor:
+            futures: dict[str, Any] = {}
+            if metricx_enabled:
+                futures["metricx"] = executor.submit(_score_metricx_eval)
+            if xcomet_enabled:
+                futures["xcomet"] = executor.submit(_score_xcomet_eval)
+            if mqm_enabled:
+                futures["mqm"] = executor.submit(_score_mqm_eval)
+            if "metricx" in futures:
+                metricx_scores, metricx_rewards = futures["metricx"].result()
+            if "xcomet" in futures:
+                xcomet_scores, spans = futures["xcomet"].result()
+            if "mqm" in futures:
+                mqm_scores, mqm_spans = futures["mqm"].result()
     else:
         if metricx_enabled:
             logger.info("evaluate_on_dataset: scoring metricx...")
@@ -290,23 +321,9 @@ def evaluate_on_dataset(
         if xcomet_enabled:
             logger.info("evaluate_on_dataset: scoring xcomet...")
             xcomet_scores, spans = _score_xcomet_eval()
-
-    mqm_scores = [0.0 for _ in rollouts]
-    mqm_spans: list[list[dict[str, Any]]] = [[] for _ in rollouts]
-    if mqm_scorer is not None and cfg.reward.mqm.enabled:
-        logger.info("evaluate_on_dataset: scoring mqm...")
-        mqm_out = mqm_scorer.score_batch(samples)
-        mqm_scores = mqm_out.sequence_scores
-        mqm_meta = mqm_out.metadata or {}
-        mqm_spans = mqm_meta.get("error_spans", mqm_spans)
-        non_finite_idx = [idx for idx, value in enumerate(mqm_scores) if not math.isfinite(float(value))]
-        if non_finite_idx:
-            logger.warning(
-                "MQM scorer produced %s non-finite eval scores; replacing with 0.0.",
-                len(non_finite_idx),
-            )
-            for idx in non_finite_idx:
-                mqm_scores[idx] = 0.0
+        if mqm_enabled:
+            logger.info("evaluate_on_dataset: scoring mqm...")
+            mqm_scores, mqm_spans = _score_mqm_eval()
     spans = [
         [
             *(spans[idx] if idx < len(spans) else []),
