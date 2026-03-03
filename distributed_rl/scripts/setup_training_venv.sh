@@ -74,8 +74,11 @@ uv pip install --python "${PYTHON}" \
 echo ""
 
 # ── Install distributed_rl as editable package ────────────────
+# --no-deps: dependencies are already installed above via requirements.txt.
+# Without this flag, setup.py's install_requires would re-resolve versions
+# and could downgrade packages (e.g. transformers, huggingface-hub).
 echo "Installing distributed_rl in editable mode ..."
-uv pip install --python "${PYTHON}" -e distributed_rl/
+uv pip install --python "${PYTHON}" --no-deps -e distributed_rl/
 echo ""
 
 # ── Verify ────────────────────────────────────────────────────
