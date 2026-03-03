@@ -106,6 +106,22 @@ def _normalize_chat_template_kwargs(raw_kwargs: dict[str, Any] | None) -> dict[s
     return kwargs
 
 
+def _build_generation_chat_kwargs(gen_cfg: GenerationConfig) -> dict[str, Any]:
+    base_kwargs = (
+        dict(gen_cfg.chat_template_kwargs)
+        if getattr(gen_cfg, "chat_template_kwargs", None) is not None
+        else {}
+    )
+    extra_body = getattr(gen_cfg, "extra_body", None)
+    if isinstance(extra_body, dict) and extra_body:
+        existing = base_kwargs.get("extra_body")
+        merged_extra = dict(extra_body)
+        if isinstance(existing, dict):
+            merged_extra.update(existing)
+        base_kwargs["extra_body"] = merged_extra
+    return _normalize_chat_template_kwargs(base_kwargs)
+
+
 def _prompt_cache_limit() -> int:
     return _env_int("GEMMA27_RL_PROMPT_CACHE_SIZE", default=8192, minimum=0)
 
@@ -352,7 +368,7 @@ def _encode_prompt_rows(
         tokenizer,
         "apply_chat_template",
     )
-    chat_kwargs = _normalize_chat_template_kwargs(getattr(gen_cfg, "chat_template_kwargs", None))
+    chat_kwargs = _build_generation_chat_kwargs(gen_cfg)
     kwargs_key = _serialize_chat_template_kwargs(chat_kwargs if use_chat_template else None)
     tok_id = id(tokenizer)
 
