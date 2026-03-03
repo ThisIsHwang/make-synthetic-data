@@ -94,7 +94,7 @@ MetricX는 의존성 충돌 방지를 위해 별도 Python 환경을 사용합�
 # 프로젝트 루트에서 실행
 uv venv .venv-metrics
 uv pip install --python .venv-metrics/bin/python -r distributed_rl/requirements-metrics.txt
-uv pip install --python .venv-metrics/bin/python --no-deps -e distributed_rl
+# editable install 불필요: scorer_worker.py가 sys.path를 자동 설정
 ```
 
 Config의 `python_executable`은 YAML 파일 위치 기준 상대 경로입니다:
@@ -111,7 +111,6 @@ reward:
 # 프로젝트 루트에서 실행
 uv venv .venv-xcomet
 uv pip install --python .venv-xcomet/bin/python -r distributed_rl/requirements-xcomet.txt
-uv pip install --python .venv-xcomet/bin/python --no-deps -e distributed_rl
 ```
 
 Config에서 `reward.xcomet.python_executable`로 경로를 지정합니다:
