@@ -23,6 +23,8 @@ from .rl_types import Example, Rollout, SampleForScoring
 
 logger = logging.getLogger(__name__)
 _EVAL_PAD_PREFIX = "__eval_pad__:"
+_EVAL_OBJECT_GROUP: Any | None = None
+_EVAL_OBJECT_GROUP_WORLD_SIZE: int = -1
 
 
 def _mean_std(values: list[float]) -> tuple[float, float]:
@@ -54,13 +56,40 @@ def _set_distributed_cuda_device() -> None:
     torch.cuda.set_device(int(local_rank_raw))
 
 
+def _get_eval_object_collective_group(rank: int, world_size: int) -> Any | None:
+    if not _distributed_ready(rank, world_size):
+        return None
+    if torch is None:
+        return None
+    backend = str(torch.distributed.get_backend()).lower()
+    if backend == "gloo":
+        return None
+
+    global _EVAL_OBJECT_GROUP, _EVAL_OBJECT_GROUP_WORLD_SIZE
+    if _EVAL_OBJECT_GROUP is not None and _EVAL_OBJECT_GROUP_WORLD_SIZE == int(world_size):
+        return _EVAL_OBJECT_GROUP
+
+    # Build a dedicated Gloo group for Python-object collectives in eval.
+    # This avoids NCCL-specific device alignment issues/deadlocks.
+    _EVAL_OBJECT_GROUP = torch.distributed.new_group(backend="gloo")
+    _EVAL_OBJECT_GROUP_WORLD_SIZE = int(world_size)
+    if rank == 0:
+        logger.info(
+            "evaluate_on_dataset: created dedicated gloo group for object collectives (world_size=%s).",
+            world_size,
+        )
+    return _EVAL_OBJECT_GROUP
+
+
 def _gather_rollouts_to_rank0(local_rollouts: list[Rollout], *, rank: int, world_size: int) -> list[Rollout]:
     if not _distributed_ready(rank, world_size):
         return local_rollouts
-    # NCCL object collectives require local rank/device alignment.
-    _set_distributed_cuda_device()
+    object_group = _get_eval_object_collective_group(rank, world_size)
+    # When falling back to default NCCL group, keep rank/device aligned.
+    if object_group is None:
+        _set_distributed_cuda_device()
     gathered: list[Any] = [None for _ in range(world_size)]
-    torch.distributed.all_gather_object(gathered, local_rollouts)
+    torch.distributed.all_gather_object(gathered, local_rollouts, group=object_group)
     if rank != 0:
         return []
     merged: list[Rollout] = []
@@ -73,9 +102,11 @@ def _gather_rollouts_to_rank0(local_rollouts: list[Rollout], *, rank: int, world
 def _broadcast_report_from_rank0(report: dict[str, Any] | None, *, rank: int, world_size: int) -> dict[str, Any] | None:
     if not _distributed_ready(rank, world_size):
         return report
-    _set_distributed_cuda_device()
+    object_group = _get_eval_object_collective_group(rank, world_size)
+    if object_group is None:
+        _set_distributed_cuda_device()
     payload: list[Any] = [report if rank == 0 else None]
-    torch.distributed.broadcast_object_list(payload, src=0)
+    torch.distributed.broadcast_object_list(payload, src=0, group=object_group)
     value = payload[0]
     return value if isinstance(value, dict) else None
 

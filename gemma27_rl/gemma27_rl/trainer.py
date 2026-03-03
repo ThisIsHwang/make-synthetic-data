@@ -662,6 +662,48 @@ def _unwrap_for_generation(model: Any) -> Any:
     return module if module is not None else model
 
 
+def _normalize_attn_impl_text(value: str | None) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _set_model_attn_implementation(model: Any, attn_impl: str | None) -> int:
+    target = _normalize_attn_impl_text(attn_impl)
+    if target is None:
+        return 0
+    root = _unwrap_for_generation(model)
+    visited_cfg: set[int] = set()
+    changed = 0
+
+    modules = [root]
+    modules.extend(list(getattr(root, "modules", lambda: [])()))
+    for module in modules:
+        cfg_obj = getattr(module, "config", None)
+        if cfg_obj is None:
+            continue
+        cfg_id = id(cfg_obj)
+        if cfg_id in visited_cfg:
+            continue
+        visited_cfg.add(cfg_id)
+        for attr in ("_attn_implementation", "attn_implementation"):
+            if not hasattr(cfg_obj, attr):
+                continue
+            try:
+                current = getattr(cfg_obj, attr)
+            except Exception:
+                continue
+            if str(current) == target:
+                continue
+            try:
+                setattr(cfg_obj, attr, target)
+                changed += 1
+            except Exception:
+                continue
+    return changed
+
+
 def _parse_cuda_index(device: str | None) -> int | None:
     if not device:
         return None
@@ -2302,6 +2344,49 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
         train_model, _ = _deepspeed_initialize(cfg, policy_model)
     policy_eval_model = _unwrap_for_generation(train_model)
 
+    requested_policy_attn = _normalize_attn_impl_text(cfg.model.attn_implementation)
+    requested_policy_attn_norm = str(requested_policy_attn or "").strip().lower()
+    if requested_policy_attn_norm == "auto":
+        requested_policy_attn = None
+        requested_policy_attn_norm = ""
+
+    # Qwen + DeepSpeed runs have been more stable with SDPA in generation paths
+    # and FA2 in update/backward paths.
+    if requested_policy_attn_norm == "flash_attention_2":
+        rollout_attn_impl = "sdpa"
+        update_attn_impl = "flash_attention_2"
+    else:
+        rollout_attn_impl = requested_policy_attn
+        update_attn_impl = requested_policy_attn
+
+    if rank0 and rollout_attn_impl and update_attn_impl and rollout_attn_impl != update_attn_impl:
+        logger.info(
+            "Policy attn split enabled for stability: rollout/eval=%s, update=%s",
+            rollout_attn_impl,
+            update_attn_impl,
+        )
+
+    last_runtime_attn: str | None = None
+
+    def _set_policy_runtime_attn(target_attn: str | None, phase: str) -> None:
+        nonlocal last_runtime_attn
+        target = _normalize_attn_impl_text(target_attn)
+        if target is None:
+            return
+        if last_runtime_attn == target:
+            return
+        changed_train = _set_model_attn_implementation(train_model, target)
+        changed_eval = _set_model_attn_implementation(policy_eval_model, target)
+        last_runtime_attn = target
+        if rank0:
+            logger.info(
+                "Policy runtime attn set for %s: target=%s changed(train=%s eval=%s)",
+                phase,
+                target,
+                changed_train,
+                changed_eval,
+            )
+
     ref_model: AutoModelForCausalLM | None = None
     ref_device: str | None = None
     ref_logprob_client: ReferenceLogprobClient | None = None
@@ -2494,6 +2579,7 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
         )
 
     def _run_eval_once(*, collect_outputs: bool, show_progress: bool) -> dict[str, Any]:
+        _set_policy_runtime_attn(rollout_attn_impl, phase="eval")
         return evaluate_on_dataset(
             examples=eval_examples,
             policy_model=policy_eval_model,
@@ -2511,6 +2597,7 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
         )
 
     if cfg.eval.run_before_train and eval_examples and start_update <= 1:
+        _dist_barrier()
         if (not use_deepspeed) or rank0:
             logger.info(
                 "starting eval (run_before_train): examples=%s metricx=%s xcomet=%s mqm=%s",
@@ -2616,6 +2703,7 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
             local_examples = [train_examples[i] for i in local_indices]
 
             _set_rollout_sampling_seed(cfg.misc.seed + update_idx + (rank * 1009))
+            _set_policy_runtime_attn(rollout_attn_impl, phase="rollout")
             local_rollouts = generate_rollouts(
                 examples=local_examples,
                 policy_model=policy_eval_model,
@@ -2744,6 +2832,7 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
             batch_indices = train_indices[train_cursor:batch_end]
             train_cursor = batch_end
             batch_examples = [train_examples[i] for i in batch_indices]
+            _set_policy_runtime_attn(rollout_attn_impl, phase="rollout")
             rollouts = generate_rollouts(
                 examples=batch_examples,
                 policy_model=policy_eval_model,
@@ -2790,6 +2879,7 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
             continue
 
         step_stats = []
+        _set_policy_runtime_attn(update_attn_impl, phase="update")
         for _ in range(max(1, cfg.rl.ppo_epochs)):
             step_stats.append(
                 update_policy(
@@ -2905,6 +2995,7 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
             and eval_examples
             and update_idx % cfg.eval.eval_every_n_updates == 0
         ):
+            _dist_barrier()
             if (not use_deepspeed) or rank0:
                 logger.info(
                     "starting eval: update=%s examples=%s metricx=%s xcomet=%s mqm=%s",
@@ -2938,6 +3029,7 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
                     best_eval_score = eval_select_score
                     best_eval_update = update_idx
                     logger.info("new best eval at update=%s score=%.6f", update_idx, eval_select_score)
+            _dist_barrier()
 
         # Early-stop guard for divergence in toy runs.
         if not math.isfinite(train_stats.policy_loss):
