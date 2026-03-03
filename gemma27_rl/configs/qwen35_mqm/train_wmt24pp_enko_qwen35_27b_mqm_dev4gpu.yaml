@@ -3,7 +3,8 @@ model:
   reference_name_or_path: Qwen/Qwen3.5-27B-Instruct
   tokenizer_name_or_path: null
   trust_remote_code: true
-  attn_implementation: flash_attention_2
+  attn_implementation: sdpa
+  disable_policy_flash_attention: true
   use_fast_tokenizer: true
   reference_device: cpu
   policy_gpu_ids: [0, 1, 2]

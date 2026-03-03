@@ -1382,6 +1382,14 @@ def _load_policy_model(
     model_name_or_path: str | None = None,
 ) -> AutoModelForCausalLM:
     dtype, attn_impl = _resolve_model_dtype_and_attn(cfg, device)
+    if cfg.model.disable_policy_flash_attention:
+        attn_text = str(attn_impl or "").strip().lower()
+        if attn_text == "flash_attention_2":
+            logger.warning(
+                "Policy flash_attention_2 is disabled by model.disable_policy_flash_attention=true; "
+                "falling back to sdpa for training stability."
+            )
+            attn_impl = "sdpa"
 
     kwargs: dict[str, Any] = {
         "trust_remote_code": cfg.model.trust_remote_code,

@@ -27,6 +27,7 @@ class ModelConfig:
     tokenizer_name_or_path: str | None = None
     trust_remote_code: bool = False
     attn_implementation: str | None = "auto"
+    disable_policy_flash_attention: bool = True
     reference_attn_implementation: str | None = None
     use_fast_tokenizer: bool = True
     reference_device: str | None = None
@@ -406,6 +407,8 @@ def _validate_config(cfg: RLPostTrainConfig) -> None:
         raise ValueError("model.reference_runtime must be worker|in_process|cpu")
     if float(cfg.model.reference_subprocess_timeout_sec) <= 0:
         raise ValueError("model.reference_subprocess_timeout_sec must be > 0.")
+    if not isinstance(cfg.model.disable_policy_flash_attention, bool):
+        raise ValueError("model.disable_policy_flash_attention must be a bool.")
     if int(cfg.model.reference_logprob_micro_batch_size) <= 0:
         raise ValueError("model.reference_logprob_micro_batch_size must be > 0.")
     if int(cfg.rl.deepspeed_zero_stage) not in {0, 1, 2, 3}:
