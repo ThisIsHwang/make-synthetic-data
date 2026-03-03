@@ -41,6 +41,47 @@ def _is_rank0_process() -> bool:
     return int(rank_raw) == 0
 
 
+def _resolve_model_vocab_size(model: nn.Module) -> int | None:
+    getter = getattr(model, "get_input_embeddings", None)
+    if callable(getter):
+        try:
+            emb = getter()
+            size = int(getattr(emb, "num_embeddings", 0) or 0)
+            if size > 0:
+                return size
+        except Exception:
+            pass
+    cfg_obj = getattr(model, "config", None)
+    try:
+        size = int(getattr(cfg_obj, "vocab_size", 0) or 0)
+    except Exception:
+        size = 0
+    return size if size > 0 else None
+
+
+def _validate_rollout_token_ids(
+    *,
+    rollout: Rollout,
+    vocab_size: int | None,
+) -> None:
+    if vocab_size is None or vocab_size <= 0:
+        return
+    for field_name, ids in (
+        ("prompt_input_ids", rollout.prompt_input_ids),
+        ("completion_token_ids", rollout.completion_token_ids),
+    ):
+        if not ids:
+            continue
+        low = min(int(v) for v in ids)
+        high = max(int(v) for v in ids)
+        if low < 0 or high >= vocab_size:
+            raise ValueError(
+                "Token id out of vocab range before policy forward: "
+                f"example_id={rollout.example_id} field={field_name} min={low} max={high} vocab_size={vocab_size}. "
+                "Tokenizer/model mismatch is likely."
+            )
+
+
 def _token_logprobs_and_entropy(
     logits: torch.Tensor,
     prompt_len: int,
@@ -108,6 +149,8 @@ def update_policy(
     if optimizer is None and not use_engine_step:
         raise ValueError("optimizer is required unless policy_model is a DeepSpeed-like engine.")
 
+    vocab_size = _resolve_model_vocab_size(policy_model)
+
     if use_engine_step:
         zero_grad_fn = getattr(policy_model, "zero_grad", None)
         if callable(zero_grad_fn):
@@ -137,6 +180,7 @@ def update_policy(
     debug_loss_logged = 0
 
     for rollout, adv_row in zip(rollouts, advantages):
+        _validate_rollout_token_ids(rollout=rollout, vocab_size=vocab_size)
         input_ids = torch.tensor(
             [rollout.prompt_input_ids + rollout.completion_token_ids],
             device=device,
