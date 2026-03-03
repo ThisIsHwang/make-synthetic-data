@@ -473,6 +473,7 @@ def run_training(cfg: DistributedRLConfig) -> None:
 
     model = AutoModelForCausalLM.from_pretrained(
         cfg.model.policy_name_or_path,
+        tie_word_embeddings=False,
         **model_kwargs,
     )
 
@@ -501,6 +502,7 @@ def run_training(cfg: DistributedRLConfig) -> None:
         cfg.model.policy_name_or_path,
         use_fast=cfg.model.use_fast_tokenizer,
         trust_remote_code=cfg.model.trust_remote_code,
+        padding_side="left",
     )
     # Ensure pad_token is set.  Many models (GPT-style) don't have one,
     # which causes errors during batch padding.  Using eos_token is the
