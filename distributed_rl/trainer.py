@@ -469,6 +469,16 @@ def run_training(cfg: DistributedRLConfig) -> None:
         "torch_dtype": "auto",  # Auto-select dtype from model config
     }
     if cfg.model.attn_implementation and cfg.model.attn_implementation != "auto":
+        if cfg.model.attn_implementation == "flash_attention_2":
+            try:
+                import flash_attn  # noqa: F401
+            except ImportError as exc:
+                raise RuntimeError(
+                    "flash_attention_2 requested but flash-attn is not importable. "
+                    "This is usually caused by an ABI mismatch after reinstalling PyTorch. "
+                    "Rebuild flash-attn against the current PyTorch:\n"
+                    "  pip install flash-attn --no-build-isolation --force-reinstall"
+                ) from exc
         model_kwargs["attn_implementation"] = cfg.model.attn_implementation
 
     model = AutoModelForCausalLM.from_pretrained(

@@ -63,13 +63,23 @@ uv pip install --python "${PYTHON}" \
     -r distributed_rl/requirements.txt
 echo ""
 
-# ── Install flash-attn ────────────────────────────────────────
-echo "[4/4] Installing flash-attn ..."
+# ── Install flash-attn (built from source against current torch) ──
+echo "[4/4] Installing flash-attn (source build, may take several minutes) ..."
 uv pip install --python "${PYTHON}" \
-    flash-attn --no-build-isolation || {
-  echo "  WARNING: flash-attn install failed (requires matching CUDA toolkit + gcc)."
-  echo "  Training will fall back to sdpa attention. You can retry manually:"
-  echo "    uv pip install --python ${PYTHON} flash-attn --no-build-isolation"
+    flash-attn --no-build-isolation --force-reinstall --no-cache
+
+# Verify flash-attn actually loads with the current torch ABI
+"${PYTHON}" -c "from flash_attn import flash_attn_func; print('  flash-attn import: OK')" || {
+  echo ""
+  echo "ERROR: flash-attn installed but failed to import (ABI mismatch)."
+  echo "  Possible causes:"
+  echo "    1. CUDA toolkit version mismatch (check: nvcc --version)"
+  echo "    2. gcc/g++ version incompatibility"
+  echo "    3. Pre-built wheel was used instead of source build"
+  echo ""
+  echo "  Try manually:"
+  echo "    uv pip install --python ${PYTHON} flash-attn --no-build-isolation --force-reinstall --no-cache --no-binary flash-attn"
+  exit 1
 }
 echo ""
 
@@ -87,12 +97,7 @@ echo "=== Verifying ==="
 "${PYTHON}" -c "import transformers; print(f'  transformers {transformers.__version__}')"
 "${PYTHON}" -c "import trl; print(f'  trl {trl.__version__}')"
 "${PYTHON}" -c "import deepspeed; print(f'  deepspeed {deepspeed.__version__}')"
-"${PYTHON}" -c "
-try:
-    from flash_attn import flash_attn_func; print('  flash-attn: OK')
-except ImportError:
-    print('  flash-attn: NOT INSTALLED (will use sdpa)')
-"
+"${PYTHON}" -c "from flash_attn import flash_attn_func; print('  flash-attn: OK')"
 echo ""
 echo "=== Done ==="
 echo "Training python: ${PROJECT_ROOT}/${PYTHON}"
