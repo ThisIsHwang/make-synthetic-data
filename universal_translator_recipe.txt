@@ -1,0 +1,6 @@
+LangGraph를 사용하여 번역 정확도와 번역 일관성이 요구되는 번역 multi-agent를 구축할거야. 구체적인 설계도는 다음과 같아.
+
+1. Agent 구성
+  1) Translation Policy Constructor: 사용자가 도메인에 대한 설명, 번역 가이드라인, Glossary, Examples (source-only or parallel data) 중 일부가 주어졌을 경우, 이를 파싱하여 Translation Policy를 정립하는 agent. 또한 Translator agent를 위한 system prompt를 작성하는 agent이기도 함. Translation Policy는 다른 agent에게 공유되나, write할 권한은 Translation Policy Constructor에게만 있습니다.
+  2) Translator: Translation Policy Constructor로부터 제공받은 system prompt를 이용하여 번역을 수행하는 agent. 사용자로부터는 source text, target language code를 제공받습니다. 
+  3) Evaluator: Translator agent가 번역한 결과를 받아, Translation Policy를 준수했는지와 더불어 fluency, naturalness, accuracy를 scoring하는 agent
