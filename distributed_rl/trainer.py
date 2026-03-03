@@ -258,11 +258,27 @@ def build_grpo_config(cfg: DistributedRLConfig) -> Any:
 
     # --- Asymmetric clipping (MiniRL, arxiv 2512.01374 Section 3.2) ---
     # Paper recommends ε_high=0.27, ε_low=0.2 instead of symmetric ε=0.2.
-    # TRL >= 0.29.0 supports these as separate GRPOConfig parameters.
-    if cfg.stability.epsilon_high > 0:
-        grpo_kwargs["epsilon_high"] = cfg.stability.epsilon_high
+    # TRL parameter mapping: epsilon = lower bound, epsilon_high = upper bound.
+    # epsilon_high requires TRL >= 0.29.0.
     if cfg.stability.epsilon_low > 0:
-        grpo_kwargs["epsilon_low"] = cfg.stability.epsilon_low
+        grpo_kwargs["epsilon"] = cfg.stability.epsilon_low
+
+    if cfg.stability.epsilon_high > 0:
+        _has_eps_high = False
+        try:
+            from trl import __version__ as _trl_ver
+            _major, _minor = (int(x) for x in _trl_ver.split(".")[:2])
+            _has_eps_high = _major > 0 or _minor >= 29
+        except Exception:
+            pass
+
+        if _has_eps_high:
+            grpo_kwargs["epsilon_high"] = cfg.stability.epsilon_high
+        else:
+            logger.warning(
+                "epsilon_high requires TRL >= 0.29.0 (installed: %s). Ignored.",
+                _trl_ver if '_trl_ver' in dir() else "unknown",
+            )
 
     return GRPOConfig(**grpo_kwargs)
 
@@ -433,7 +449,7 @@ def run_training(cfg: DistributedRLConfig) -> None:
             logger.warning(
                 "TRL %s detected. Upgrade to >= 0.29.0 for: "
                 "(1) no length normalization (MiniRL recommendation), "
-                "(2) asymmetric epsilon_high/epsilon_low support.",
+                "(2) asymmetric epsilon_high support.",
                 _trl_ver,
             )
     except Exception:
