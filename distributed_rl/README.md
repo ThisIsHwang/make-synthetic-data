@@ -110,7 +110,7 @@ reward:
 단일 GPU에서 작은 모델로 동작을 확인합니다:
 
 ```bash
-python3 -m distributed_rl --config configs/train_toy.yaml
+python3 -m distributed_rl --config distributed_rl/configs/train_toy.yaml
 ```
 
 ## Single-Node Multi-GPU (8 GPUs)
@@ -123,7 +123,7 @@ python3 -m distributed_rl --config configs/train_toy.yaml
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 torchrun \
     --nproc_per_node=6 \
     -m distributed_rl \
-    --config configs/qwen35_moe_8gpu.yaml
+    --config distributed_rl/configs/qwen35_moe_8gpu.yaml
 ```
 
 ### Gemma-27B Dense
@@ -132,7 +132,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 torchrun \
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 torchrun \
     --nproc_per_node=6 \
     -m distributed_rl \
-    --config configs/gemma27b_8gpu.yaml
+    --config distributed_rl/configs/gemma27b_8gpu.yaml
 ```
 
 `CUDA_VISIBLE_DEVICES=0,1,2,3,4,5`로 학습 프로세스의 GPU를 제한합니다. Reward 모델은 subprocess로 실행되며, 별도로 GPU 6/7에 접근합니다 (config의 `reward.metricx.gpu_id`, `reward.xcomet.gpu_id`).
@@ -154,7 +154,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 torchrun \
     --master_addr=$MASTER_ADDR \
     --master_port=$MASTER_PORT \
     -m distributed_rl \
-    --config configs/qwen35_moe_8gpu.yaml
+    --config distributed_rl/configs/qwen35_moe_8gpu.yaml
 ```
 
 ### Node 1 (Worker)
@@ -172,7 +172,7 @@ torchrun \
     --master_addr=$MASTER_ADDR \
     --master_port=$MASTER_PORT \
     -m distributed_rl \
-    --config configs/qwen35_moe_8gpu.yaml
+    --config distributed_rl/configs/qwen35_moe_8gpu.yaml
 ```
 
 총 학습 rank 수: 6 (Node 0) + 8 (Node 1) = **14 ranks**. Effective batch size = 14 x `per_device_train_batch_size` x `gradient_accumulation_steps`.
@@ -245,10 +245,10 @@ data:
 
 ### Step 1: Toy Config으로 동작 확인
 
-단일 GPU에서 작은 모델(Qwen2-0.5B)로 파이프라인이 정상 동작하는지 확인합니다. `configs/train_toy.yaml`은 WMT24pp 64개 샘플로 10 step만 학습합니다.
+단일 GPU에서 작은 모델(Qwen2-0.5B)로 파이프라인이 정상 동작하는지 확인합니다. `distributed_rl/configs/train_toy.yaml`은 WMT24pp 64개 샘플로 10 step만 학습합니다.
 
 ```bash
-python3 -m distributed_rl --config configs/train_toy.yaml
+python3 -m distributed_rl --config distributed_rl/configs/train_toy.yaml
 ```
 
 확인 사항:
@@ -265,7 +265,7 @@ MoE 모델은 `output_router_logits: true`와 `router_aux_loss_coef`로 expert c
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 torchrun \
     --nproc_per_node=6 \
     -m distributed_rl \
-    --config configs/qwen35_moe_8gpu.yaml
+    --config distributed_rl/configs/qwen35_moe_8gpu.yaml
 ```
 
 주요 하이퍼파라미터 (`configs/qwen35_moe_8gpu.yaml`):
@@ -291,7 +291,7 @@ Dense 모델은 MoE 설정이 불필요합니다.
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 torchrun \
     --nproc_per_node=6 \
     -m distributed_rl \
-    --config configs/gemma27b_8gpu.yaml
+    --config distributed_rl/configs/gemma27b_8gpu.yaml
 ```
 
 Gemma-27B와 Qwen3.5-35B의 config 차이:

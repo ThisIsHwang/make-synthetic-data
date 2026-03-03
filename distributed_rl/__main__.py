@@ -4,7 +4,7 @@ Why this file exists:
   When you run ``python -m distributed_rl``, Python executes this ``__main__.py``.
   Both ``torchrun`` and ``deepspeed`` launchers also invoke modules this way:
 
-    torchrun --nproc_per_node=6 -m distributed_rl --config configs/foo.yaml
+    torchrun --nproc_per_node=6 -m distributed_rl --config distributed_rl/configs/foo.yaml
 
   ``torchrun`` spawns N worker processes, each running this file.  Each process
   gets its own ``LOCAL_RANK`` and ``RANK`` environment variables set automatically
