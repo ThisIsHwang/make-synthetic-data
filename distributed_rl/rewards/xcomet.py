@@ -104,6 +104,22 @@ class XCometReward(RewardModel):
             "[XComet diag] executable=%s  prefix=%s  path=%s",
             sys.executable, sys.prefix, sys.path,
         )
+        # Diagnose pkg_resources / setuptools availability
+        try:
+            import setuptools
+            logger.warning("[XComet diag] setuptools=%s loc=%s", setuptools.__version__, setuptools.__file__)
+        except Exception as e:
+            logger.warning("[XComet diag] setuptools import FAILED: %s", e)
+        try:
+            import pkg_resources
+            logger.warning("[XComet diag] pkg_resources OK loc=%s", pkg_resources.__file__)
+        except Exception as e:
+            logger.warning("[XComet diag] pkg_resources import FAILED: %s", e)
+        try:
+            import pytorch_lightning
+            logger.warning("[XComet diag] pytorch_lightning=%s loc=%s", pytorch_lightning.__version__, pytorch_lightning.__file__)
+        except Exception as e:
+            logger.warning("[XComet diag] pytorch_lightning import FAILED: %s", e)
         try:
             from comet import download_model, load_from_checkpoint
         except Exception as exc:  # pragma: no cover
