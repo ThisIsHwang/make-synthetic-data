@@ -1336,6 +1336,27 @@ def _resolve_model_dtype_and_attn(
     return dtype, None
 
 
+def _resolve_reference_attn_implementation(
+    cfg: RLPostTrainConfig,
+    requested_device: str,
+    base_attn_impl: str | None,
+) -> str | None:
+    override_raw = cfg.model.reference_attn_implementation
+    if override_raw is not None and str(override_raw).strip():
+        return str(override_raw).strip()
+
+    device_text = str(requested_device).strip().lower()
+    if not device_text.startswith("cuda"):
+        return base_attn_impl
+
+    # Reference logprob scoring is latency-insensitive versus policy generation,
+    # and FA2 kernel crashes are much harder to recover from than slower SDPA.
+    base_text = str(base_attn_impl or "").strip().lower()
+    if base_text in {"", "auto", "flash_attention_2"}:
+        return "sdpa"
+    return base_attn_impl
+
+
 def _load_causal_lm(
     model_name_or_path: str,
     kwargs: dict[str, Any],
@@ -1400,6 +1421,7 @@ def _load_reference_model(cfg: RLPostTrainConfig, default_device: str) -> tuple[
         ref_device = resolve_device(cfg.model.reference_device or default_device)
 
     dtype, attn_impl = _resolve_model_dtype_and_attn(cfg, ref_device)
+    attn_impl = _resolve_reference_attn_implementation(cfg, ref_device, attn_impl)
 
     kwargs: dict[str, Any] = {
         "trust_remote_code": cfg.model.trust_remote_code,
@@ -1416,6 +1438,9 @@ def _load_reference_model(cfg: RLPostTrainConfig, default_device: str) -> tuple[
         gpu_ids=reference_gpu_ids[:1],
         component_name="reference",
     )
+    cfg_obj = getattr(model, "config", None)
+    if cfg_obj is not None and getattr(cfg_obj, "use_cache", None):
+        cfg_obj.use_cache = False
     model.eval()
     for p in model.parameters():
         p.requires_grad = False
@@ -1440,6 +1465,7 @@ def _create_reference_logprob_client(
             requested_device = resolve_device(cfg.model.reference_device or default_device)
 
     dtype, attn_impl = _resolve_model_dtype_and_attn(cfg, requested_device)
+    attn_impl = _resolve_reference_attn_implementation(cfg, requested_device, attn_impl)
     worker_device = requested_device
     worker_env_overrides: dict[str, str] | None = collect_huggingface_worker_env() or None
     remote_host = _effective_worker_host(cfg.model.reference_worker_host, cfg.misc.aux_worker_host)

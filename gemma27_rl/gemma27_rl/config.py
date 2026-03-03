@@ -27,6 +27,7 @@ class ModelConfig:
     tokenizer_name_or_path: str | None = None
     trust_remote_code: bool = False
     attn_implementation: str | None = "auto"
+    reference_attn_implementation: str | None = None
     use_fast_tokenizer: bool = True
     reference_device: str | None = None
     policy_gpu_ids: list[int] = field(default_factory=list)

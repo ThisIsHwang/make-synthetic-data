@@ -75,6 +75,9 @@ def main(argv: list[str] | None = None) -> int:
 
                 model = AutoModelForCausalLM.from_pretrained(model_name_or_path, **kwargs)
                 model.to(device)
+                cfg_obj = getattr(model, "config", None)
+                if cfg_obj is not None and getattr(cfg_obj, "use_cache", None):
+                    cfg_obj.use_cache = False
                 model.eval()
                 for p in model.parameters():
                     p.requires_grad = False
