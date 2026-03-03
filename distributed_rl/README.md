@@ -93,11 +93,7 @@ MetricX는 의존성 충돌 방지를 위해 별도 Python 환경을 사용합�
 ```bash
 # 프로젝트 루트에서 실행
 uv venv .venv-metrics
-uv pip install --python .venv-metrics/bin/python \
-  torch transformers sentencepiece accelerate huggingface_hub pyyaml
-# --no-deps: distributed_rl의 전체 의존성(trl, deepspeed 등)이
-# torch를 덮어쓰는 것을 방지. scorer_worker.py가 sys.path를 자동 설정하므로
-# 패키지 소스 접근에는 문제없음.
+uv pip install --python .venv-metrics/bin/python -r distributed_rl/requirements-metrics.txt
 uv pip install --python .venv-metrics/bin/python --no-deps -e distributed_rl
 ```
 
@@ -114,7 +110,7 @@ reward:
 ```bash
 # 프로젝트 루트에서 실행
 uv venv .venv-xcomet
-uv pip install --python .venv-xcomet/bin/python torch unbabel-comet pyyaml
+uv pip install --python .venv-xcomet/bin/python -r distributed_rl/requirements-xcomet.txt
 uv pip install --python .venv-xcomet/bin/python --no-deps -e distributed_rl
 ```
 
