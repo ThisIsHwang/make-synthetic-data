@@ -101,6 +101,7 @@ class ScorerSubprocessClient:
         env.pop("CUDA_VISIBLE_DEVICES", None)
         env.pop("VIRTUAL_ENV", None)
         env.pop("PYTHONHOME", None)
+        env.pop("PYTHONPATH", None)
 
         # Spawn the subprocess with stdin/stdout pipes for JSON communication.
         # stderr is inherited (goes to the same terminal/log as the parent).
