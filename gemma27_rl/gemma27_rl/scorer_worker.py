@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 from pathlib import Path
 import sys
@@ -23,6 +24,20 @@ _ensure_repo_import_path()
 from gemma27_rl.config import MetricXConfig, XCometConfig  # noqa: E402
 from gemma27_rl.rewards import MetricXQEScorer, XCometXLScorer  # noqa: E402
 from gemma27_rl.rl_types import SampleForScoring  # noqa: E402
+
+logger = logging.getLogger(__name__)
+
+
+def _configure_worker_logging() -> None:
+    if logging.getLogger().handlers:
+        return
+    level_name = str(os.environ.get("GEMMA27_RL_WORKER_LOG_LEVEL", "INFO")).upper()
+    level = getattr(logging, level_name, logging.INFO)
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s | %(levelname)s | scorer_worker | %(message)s",
+        stream=sys.stderr,
+    )
 
 
 def _reply(payload: dict[str, Any]) -> None:
@@ -59,6 +74,7 @@ def _runtime_info() -> dict[str, Any]:
 
 
 def main(argv: list[str] | None = None) -> int:
+    _configure_worker_logging()
     parser = argparse.ArgumentParser(description="External scorer worker")
     parser.add_argument("--backend", required=True, choices=["metricx", "xcomet"])
     args = parser.parse_args(argv)
@@ -83,15 +99,27 @@ def main(argv: list[str] | None = None) -> int:
                 cfg_payload = req.get("config") or {}
                 if not isinstance(cfg_payload, dict):
                     raise ValueError("init.config must be an object")
+                logger.info("init request received: backend=%s", args.backend)
 
                 if args.backend == "metricx":
                     cfg_payload["python_executable"] = None
+                    logger.info(
+                        "initializing MetricX scorer: model=%s device=%s",
+                        cfg_payload.get("model_name"),
+                        cfg_payload.get("device"),
+                    )
                     cfg = MetricXConfig(**cfg_payload)
                     scorer = MetricXQEScorer(cfg=cfg)
                 else:
                     cfg_payload["python_executable"] = None
+                    logger.info(
+                        "initializing xCOMET scorer: model=%s device=%s",
+                        cfg_payload.get("model_name"),
+                        cfg_payload.get("device"),
+                    )
                     cfg = XCometConfig(**cfg_payload)
                     scorer = XCometXLScorer(cfg=cfg)
+                logger.info("init complete: backend=%s", args.backend)
                 _reply({"ok": True, "runtime": _runtime_info()})
                 continue
 

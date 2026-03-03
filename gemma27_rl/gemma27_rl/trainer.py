@@ -2194,6 +2194,21 @@ def _compute_eval_selection_score(report: dict[str, Any], cfg: RLPostTrainConfig
     return float(metricx_term + xcomet_term + mqm_term)
 
 
+def _should_enable_xcomet_runtime(cfg: RLPostTrainConfig) -> bool:
+    if not bool(cfg.reward.xcomet.enabled):
+        return False
+    effective_weight = float(cfg.reward.w_xcomet_seq) * float(cfg.reward.xcomet_seq_scale)
+    if abs(effective_weight) <= 0.0:
+        logger.info(
+            "xCOMET scorer disabled at runtime because effective xcomet weight is zero "
+            "(w_xcomet_seq=%.6f xcomet_seq_scale=%.6f).",
+            float(cfg.reward.w_xcomet_seq),
+            float(cfg.reward.xcomet_seq_scale),
+        )
+        return False
+    return True
+
+
 def run_metric_only_eval(cfg: RLPostTrainConfig) -> dict[str, Any]:
     set_seed(cfg.misc.seed)
     hf_token = resolve_huggingface_token(
@@ -2240,7 +2255,8 @@ def run_metric_only_eval(cfg: RLPostTrainConfig) -> dict[str, Any]:
         cfg.reward.mqm.target_lang = cfg.data.default_tgt_lang
 
     metricx_scorer = MetricXQEScorer(cfg.reward.metricx) if cfg.reward.metricx.enabled else None
-    xcomet_scorer = XCometXLScorer(cfg.reward.xcomet) if cfg.reward.xcomet.enabled else None
+    xcomet_runtime_enabled = _should_enable_xcomet_runtime(cfg)
+    xcomet_scorer = XCometXLScorer(cfg.reward.xcomet) if xcomet_runtime_enabled else None
     mqm_scorer = OpenAICompatibleMQMScorer(cfg.reward.mqm) if cfg.reward.mqm.enabled else None
 
     report = evaluate_on_dataset(
@@ -2350,11 +2366,12 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
         requested_policy_attn = None
         requested_policy_attn_norm = ""
 
-    # Qwen + DeepSpeed runs have been more stable with SDPA in generation paths
-    # and FA2 in update/backward paths.
+    # Qwen + DeepSpeed runs have shown FA2 kernel instability in update/backward
+    # for some environments. Keep FA2 for rollout/eval generation, and use SDPA
+    # for update to avoid illegal-memory-access crashes in training steps.
     if requested_policy_attn_norm == "flash_attention_2":
-        rollout_attn_impl = "sdpa"
-        update_attn_impl = "flash_attention_2"
+        rollout_attn_impl = "flash_attention_2"
+        update_attn_impl = "sdpa"
     else:
         rollout_attn_impl = requested_policy_attn
         update_attn_impl = requested_policy_attn
@@ -2444,8 +2461,9 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
     metricx_scorer = (
         MetricXQEScorer(cfg.reward.metricx) if cfg.reward.metricx.enabled and ((not use_deepspeed) or rank0) else None
     )
+    xcomet_runtime_enabled = _should_enable_xcomet_runtime(cfg)
     xcomet_scorer = (
-        XCometXLScorer(cfg.reward.xcomet) if cfg.reward.xcomet.enabled and ((not use_deepspeed) or rank0) else None
+        XCometXLScorer(cfg.reward.xcomet) if xcomet_runtime_enabled and ((not use_deepspeed) or rank0) else None
     )
     mqm_scorer = (
         OpenAICompatibleMQMScorer(cfg.reward.mqm)
@@ -2602,7 +2620,7 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
                 "starting eval (run_before_train): examples=%s metricx=%s xcomet=%s mqm=%s",
                 len(eval_examples),
                 bool(metricx_scorer is not None and cfg.reward.metricx.enabled),
-                bool(xcomet_scorer is not None and cfg.reward.xcomet.enabled),
+                bool(xcomet_scorer is not None and xcomet_runtime_enabled),
                 bool(mqm_scorer is not None and cfg.reward.mqm.enabled),
             )
         report = _run_eval_once(
@@ -3000,7 +3018,7 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
                     update_idx,
                     len(eval_examples),
                     bool(metricx_scorer is not None and cfg.reward.metricx.enabled),
-                    bool(xcomet_scorer is not None and cfg.reward.xcomet.enabled),
+                    bool(xcomet_scorer is not None and xcomet_runtime_enabled),
                     bool(mqm_scorer is not None and cfg.reward.mqm.enabled),
                 )
             report = _run_eval_once(

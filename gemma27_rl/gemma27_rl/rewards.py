@@ -1039,11 +1039,22 @@ class XCometXLScorer:
                 "XCometXLScorer requires unbabel-comet>=2.2.0. Install it before running RL."
             ) from exc
 
+        logger.info(
+            "xCOMET loading start: model=%s device=%s batch_size=%s use_reference=%s",
+            self.cfg.model_name,
+            self._device,
+            self.cfg.batch_size,
+            self.cfg.use_reference,
+        )
         model_path = download_model(self.cfg.model_name)
+        logger.info("xCOMET model path resolved/downloaded: %s", model_path)
         self._model = load_from_checkpoint(model_path)
+        logger.info("xCOMET checkpoint loaded: %s", self.cfg.model_name)
         if self._device.startswith("cuda") and torch is not None:
+            logger.info("xCOMET moving model to device: %s", self._device)
             self._model.to(torch.device(self._device))
         self._model.eval()
+        logger.info("xCOMET model ready on device: %s", self._device)
 
     def score_batch(self, samples: list[SampleForScoring]) -> RewardOutput:
         if not samples:

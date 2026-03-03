@@ -215,13 +215,6 @@ def evaluate_on_dataset(
             getattr(gen_cfg, "do_sample", None),
         )
     gen_cfg.do_sample = False
-    if float(getattr(gen_cfg, "temperature", 0.0)) != 0.0:
-        logger.warning(
-            "Eval enforces temperature=0.0; overriding temperature=%s -> 0.0.",
-            getattr(gen_cfg, "temperature", None),
-        )
-    gen_cfg.temperature = 0.0
-
     shard_eval = bool(distributed_eval_shard and distributed_world_size > 1)
     if shard_eval:
         local_examples, pad_count = _pad_eval_shard_examples(
