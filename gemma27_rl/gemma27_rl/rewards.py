@@ -42,6 +42,27 @@ from .utils import (
 logger = logging.getLogger(__name__)
 
 
+def _temporarily_unset_proxy_env() -> Callable[[], None]:
+    keys = (
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    )
+    backup: dict[str, str] = {}
+    for key in keys:
+        if key in os.environ:
+            backup[key] = os.environ.pop(key)
+
+    def _restore() -> None:
+        for key, value in backup.items():
+            os.environ[key] = value
+
+    return _restore
+
+
 class _ScorerSubprocessClient:
     def __init__(
         self,
@@ -1233,8 +1254,13 @@ class OpenAICompatibleMQMScorer:
 
         try:
             timeout = float(self.cfg.timeout_s or self.cfg.timeout_sec)
-            with urllib_request.urlopen(req, timeout=timeout) as resp:
-                resp_body = resp.read().decode("utf-8")
+            restore_proxy_env = _temporarily_unset_proxy_env()
+            try:
+                opener = urllib_request.build_opener(urllib_request.ProxyHandler({}))
+                with opener.open(req, timeout=timeout) as resp:
+                    resp_body = resp.read().decode("utf-8")
+            finally:
+                restore_proxy_env()
         except urllib_error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
             raise RuntimeError(f"MQM API HTTPError status={exc.code} body={detail}") from exc
