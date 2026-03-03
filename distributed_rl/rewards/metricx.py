@@ -55,13 +55,19 @@ from .subprocess_client import ScorerSubprocessClient
 
 try:
     import torch
-except Exception:  # pragma: no cover
+except Exception as _torch_err:  # pragma: no cover
     torch = None  # type: ignore[assignment]
+    _torch_import_error = _torch_err
+else:
+    _torch_import_error = None
 
 try:
     from transformers import AutoTokenizer
-except Exception:  # pragma: no cover
+except Exception as _tf_err:  # pragma: no cover
     AutoTokenizer = None  # type: ignore[assignment]
+    _transformers_import_error = _tf_err
+else:
+    _transformers_import_error = None
 
 logger = logging.getLogger(__name__)
 
@@ -180,8 +186,8 @@ class MetricXReward(RewardModel):
                 f"  sys.path = {sys.path}\n"
                 f"  VIRTUAL_ENV = {os.environ.get('VIRTUAL_ENV', '(not set)')}\n"
                 f"  PYTHONHOME = {os.environ.get('PYTHONHOME', '(not set)')}\n"
-                f"  torch = {torch}\n"
-                f"  AutoTokenizer = {AutoTokenizer}"
+                f"  torch import error = {_torch_import_error!r}\n"
+                f"  transformers import error = {_transformers_import_error!r}"
             )
 
         from .metricx_model import MT5ForRegression
