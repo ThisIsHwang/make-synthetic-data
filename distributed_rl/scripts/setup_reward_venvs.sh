@@ -37,13 +37,6 @@ echo "[2/2] Setting up XComet venv (.venv-xcomet) ..."
 uv venv .venv-xcomet
 uv pip install --python .venv-xcomet/bin/python ${UV_INDEX_STRATEGY} \
     -r distributed_rl/requirements-xcomet.txt
-
-# Fix: uv installs setuptools but doesn't properly expose pkg_resources
-# on Python 3.12+. pytorch_lightning (dep of unbabel-comet) needs it.
-# Workaround: install pip into the venv, then use pip to reinstall setuptools.
-echo "  Fixing pkg_resources for Python 3.12+ ..."
-uv pip install --python .venv-xcomet/bin/python pip
-.venv-xcomet/bin/python -m pip install --force-reinstall --no-deps setuptools -q
 echo "  XComet venv ready."
 
 # ── Verify ────────────────────────────────────────────────────

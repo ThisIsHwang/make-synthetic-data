@@ -1,5 +1,5 @@
 --extra-index-url https://download.pytorch.org/whl/cu126
 torch>=2.6.0,<3.0.0
-setuptools>=70.0.0
+setuptools>=70.0.0,<81.0.0
 unbabel-comet>=2.2.0
 PyYAML>=6.0.1

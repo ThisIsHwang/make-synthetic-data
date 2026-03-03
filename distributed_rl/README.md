@@ -96,9 +96,9 @@ MetricX / XComet은 의존성 충돌 방지를 위해 별도 Python 환경을 �
 bash distributed_rl/scripts/setup_reward_venvs.sh
 ```
 
-> **참고**: Python 3.12+에서 `unbabel-comet`이 의존하는 `pytorch_lightning`이
-> `pkg_resources`를 필요로 합니다. `uv pip install setuptools`만으로는 `pkg_resources`가
-> 제대로 노출되지 않는 uv 버그가 있어, 스크립트 내부에서 pip으로 재설치합니다.
+> **참고**: `unbabel-comet`이 의존하는 `pytorch_lightning` 1.x가 `pkg_resources`를
+> 필요로 합니다. `setuptools>=81`에서 `pkg_resources`가 제거되었으므로
+> `requirements-xcomet.txt`에서 `setuptools<81`로 제한하고 있습니다.
 
 수동 설치가 필요한 경우:
 
@@ -115,9 +115,6 @@ uv pip install --python .venv-metrics/bin/python ${UV_STRATEGY} \
 uv venv .venv-xcomet
 uv pip install --python .venv-xcomet/bin/python ${UV_STRATEGY} \
     -r distributed_rl/requirements-xcomet.txt
-# Python 3.12+ pkg_resources 픽스 (필수)
-uv pip install --python .venv-xcomet/bin/python pip
-.venv-xcomet/bin/python -m pip install --force-reinstall --no-deps setuptools
 ```
 
 Config의 `python_executable`은 YAML 파일 위치 기준 상대 경로입니다:
