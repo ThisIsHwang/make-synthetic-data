@@ -72,6 +72,7 @@ Ref: TRL GRPOConfig — https://huggingface.co/docs/trl/grpo_trainer#trl.GRPOCon
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -659,6 +660,10 @@ def _resolve_command_or_path(value: str | None, base_dir: Path) -> str | None:
 
     Bare commands like "python" are returned as-is (found via PATH).
     Paths like "../../.venv-metrics/bin/python" are resolved relative to base_dir.
+
+    IMPORTANT: Uses os.path.abspath (not Path.resolve) to preserve symlinks.
+    Venv executables like .venv-metrics/bin/python are symlinks to the base
+    Python; resolving them would lose the venv context (pyvenv.cfg lookup fails).
     """
     if value is None:
         return None
@@ -671,7 +676,7 @@ def _resolve_command_or_path(value: str | None, base_dir: Path) -> str | None:
     path = Path(text).expanduser()
     if path.is_absolute():
         return str(path)
-    return str((base_dir / path).resolve())
+    return os.path.abspath(str(base_dir / path))
 
 
 # ---------------------------------------------------------------------------
