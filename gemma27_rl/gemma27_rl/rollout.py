@@ -110,6 +110,82 @@ def _looks_like_cuda_oom(exc: BaseException) -> bool:
     return ("out of memory" in text) or ("cuda oom" in text)
 
 
+def _resolve_model_vocab_size(model: PreTrainedModel) -> int | None:
+    try:
+        emb = model.get_input_embeddings()
+    except Exception:
+        emb = None
+    if emb is not None and hasattr(emb, "num_embeddings"):
+        try:
+            return int(emb.num_embeddings)
+        except Exception:
+            pass
+    cfg = getattr(model, "config", None)
+    if cfg is not None and hasattr(cfg, "vocab_size"):
+        try:
+            return int(cfg.vocab_size)
+        except Exception:
+            pass
+    return None
+
+
+def _validate_token_ids_in_vocab(
+    token_ids: list[int],
+    *,
+    vocab_size: int | None,
+    context: str,
+) -> None:
+    if vocab_size is None or vocab_size <= 0 or not token_ids:
+        return
+    low = min(token_ids)
+    high = max(token_ids)
+    if low < 0 or high >= vocab_size:
+        raise ValueError(
+            f"{context} token id out of vocab range: min={low} max={high} vocab_size={vocab_size}. "
+            "Policy/reference tokenizer or model vocab may be mismatched."
+        )
+
+
+def _get_model_vocab_size(model: PreTrainedModel) -> int | None:
+    getter = getattr(model, "get_input_embeddings", None)
+    if callable(getter):
+        try:
+            embeddings = getter()
+            size = int(getattr(embeddings, "num_embeddings", 0) or 0)
+            if size > 0:
+                return size
+        except Exception:
+            pass
+    config_obj = getattr(model, "config", None)
+    try:
+        size = int(getattr(config_obj, "vocab_size", 0) or 0)
+    except Exception:
+        size = 0
+    return size if size > 0 else None
+
+
+def _validate_item_token_ids(
+    *,
+    items: list[tuple[list[int], list[int]]],
+    vocab_size: int | None,
+    tag: str,
+) -> None:
+    if not items or vocab_size is None or vocab_size <= 0:
+        return
+
+    for item_idx, (prompt_ids, completion_ids) in enumerate(items):
+        for field_name, ids in (("prompt_input_ids", prompt_ids), ("completion_token_ids", completion_ids)):
+            for pos, tok in enumerate(ids):
+                token_id = int(tok)
+                if 0 <= token_id < vocab_size:
+                    continue
+                raise ValueError(
+                    f"{tag}: token id out of range for model vocab_size={vocab_size} "
+                    f"(item={item_idx}, field={field_name}, position={pos}, token_id={token_id}). "
+                    "Tokenizer/model mismatch is likely."
+                )
+
+
 def _compute_logprobs_batch_with_backoff(
     model: PreTrainedModel,
     items: list[tuple[list[int], list[int]]],
@@ -485,6 +561,15 @@ def compute_completion_logprobs(
 
     if len(prompt_input_ids) == 0:
         raise ValueError("prompt_input_ids must be non-empty")
+    vocab_size = _resolve_model_vocab_size(model)
+    _validate_token_ids_in_vocab(prompt_input_ids, vocab_size=vocab_size, context="prompt_input_ids")
+    _validate_token_ids_in_vocab(completion_token_ids, vocab_size=vocab_size, context="completion_token_ids")
+
+    _validate_item_token_ids(
+        items=[([int(v) for v in prompt_input_ids], [int(v) for v in completion_token_ids])],
+        vocab_size=_get_model_vocab_size(model),
+        tag="compute_completion_logprobs",
+    )
 
     model_device = next(model.parameters()).device
     target_device = str(model_device)
@@ -534,15 +619,24 @@ def compute_completion_logprobs_batch(
         )
 
     parsed_items: list[tuple[list[int], list[int]]] = []
+    vocab_size = _resolve_model_vocab_size(model)
     for prompt_input_ids, completion_token_ids in items:
         if len(prompt_input_ids) == 0:
             raise ValueError("prompt_input_ids must be non-empty")
+        _validate_token_ids_in_vocab(prompt_input_ids, vocab_size=vocab_size, context="prompt_input_ids")
+        _validate_token_ids_in_vocab(completion_token_ids, vocab_size=vocab_size, context="completion_token_ids")
         parsed_items.append(
             (
                 [int(v) for v in prompt_input_ids],
                 [int(v) for v in completion_token_ids],
             )
         )
+
+    _validate_item_token_ids(
+        items=parsed_items,
+        vocab_size=_get_model_vocab_size(model),
+        tag="compute_completion_logprobs_batch",
+    )
 
     step = int(micro_batch_size or len(parsed_items))
     step = max(1, min(step, len(parsed_items)))

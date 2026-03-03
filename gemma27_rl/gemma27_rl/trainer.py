@@ -463,6 +463,20 @@ def _dtype_to_config_name(dtype: Any, fallback: str) -> str:
     return fallback
 
 
+def _looks_like_cuda_runtime_fault(text: str) -> bool:
+    lowered = str(text).lower()
+    markers = (
+        "illegal memory access",
+        "device-side assert",
+        "cuda error",
+        "acceleratorerror",
+        "cublas",
+        "cudnn",
+        "driver shutting down",
+    )
+    return any(marker in lowered for marker in markers)
+
+
 class ReferenceLogprobClient:
     def __init__(
         self,
@@ -476,23 +490,30 @@ class ReferenceLogprobClient:
     ) -> None:
         self._timeout_sec = float(timeout_sec)
         self._remote_host = str(remote_host).strip() if remote_host else ""
-        worker_script = Path(__file__).resolve().with_name("reference_worker.py")
-        if not worker_script.exists():
-            raise FileNotFoundError(f"reference worker script not found: {worker_script}")
+        self._python_executable = python_executable
+        self._config_payload = dict(config_payload)
+        self._env_overrides = dict(env_overrides or {})
+        self._remote_workdir = remote_workdir
+        self._worker_script = Path(__file__).resolve().with_name("reference_worker.py")
+        if not self._worker_script.exists():
+            raise FileNotFoundError(f"reference worker script not found: {self._worker_script}")
+        self._proc = None
+        self._start_worker()
 
+    def _start_worker(self) -> None:
         env = dict(os.environ)
         for key in ("LOCAL_RANK", "RANK", "WORLD_SIZE", "MASTER_ADDR", "MASTER_PORT"):
             env.pop(key, None)
-        if env_overrides and not self._remote_host:
-            for key, value in env_overrides.items():
+        if self._env_overrides and not self._remote_host:
+            for key, value in self._env_overrides.items():
                 env[str(key)] = str(value)
 
         cmd = build_worker_launch_command(
-            python_executable=python_executable,
-            worker_script=worker_script,
+            python_executable=self._python_executable,
+            worker_script=self._worker_script,
             remote_host=self._remote_host or None,
-            remote_workdir=remote_workdir,
-            remote_env=env_overrides if self._remote_host else None,
+            remote_workdir=self._remote_workdir,
+            remote_env=self._env_overrides if self._remote_host else None,
         )
         try:
             self._proc = subprocess.Popen(
@@ -509,13 +530,18 @@ class ReferenceLogprobClient:
             raise RuntimeError(f"Failed to start reference worker{location}: cmd={cmd}") from exc
 
         try:
-            init_resp = self.request({"type": "init", "config": config_payload})
+            init_resp = self.request({"type": "init", "config": self._config_payload})
         except Exception:
             self.close()
             raise
         if not bool(init_resp.get("ok", False)):
             self.close()
             raise RuntimeError(f"reference worker init failed: {init_resp.get('error', 'unknown error')}")
+
+    def _restart_worker(self, reason: str) -> None:
+        logger.warning("Restarting reference worker after CUDA/runtime fault: %s", reason)
+        self.close()
+        self._start_worker()
 
     def _assert_alive(self) -> None:
         if self._proc.poll() is not None:
@@ -562,28 +588,48 @@ class ReferenceLogprobClient:
             }
             for prompt_ids, completion_ids in items
         ]
-        resp = self.request(
-            {
-                "type": "score_batch",
-                "items": payload_items,
-            }
-        )
-        if not bool(resp.get("ok", False)):
-            raise RuntimeError(f"reference worker score_batch failed: {resp.get('error', 'unknown error')}")
-        rows_raw = resp.get("logprobs_rows", [])
-        if not isinstance(rows_raw, list):
-            raise RuntimeError("reference worker score_batch returned invalid logprobs_rows payload")
-        rows: list[list[float]] = []
-        for row in rows_raw:
-            if not isinstance(row, list):
-                rows.append([])
-                continue
-            rows.append([float(v) for v in row])
-        if len(rows) != len(items):
-            raise RuntimeError(
-                f"reference worker score_batch size mismatch: requested={len(items)} returned={len(rows)}"
-            )
-        return rows
+        payload = {
+            "type": "score_batch",
+            "items": payload_items,
+        }
+        last_error = ""
+        for attempt in range(2):
+            try:
+                resp = self.request(payload)
+            except Exception as exc:
+                err = f"{type(exc).__name__}: {exc}"
+                if attempt == 0 and _looks_like_cuda_runtime_fault(err):
+                    self._restart_worker(err)
+                    continue
+                raise
+
+            if not bool(resp.get("ok", False)):
+                err = str(resp.get("error", "unknown error"))
+                tb = str(resp.get("traceback") or "").strip()
+                if tb:
+                    err = f"{err}\nworker_traceback:\n{tb}"
+                last_error = err
+                if attempt == 0 and _looks_like_cuda_runtime_fault(err):
+                    self._restart_worker(err)
+                    continue
+                raise RuntimeError(f"reference worker score_batch failed: {err}")
+
+            rows_raw = resp.get("logprobs_rows", [])
+            if not isinstance(rows_raw, list):
+                raise RuntimeError("reference worker score_batch returned invalid logprobs_rows payload")
+            rows: list[list[float]] = []
+            for row in rows_raw:
+                if not isinstance(row, list):
+                    rows.append([])
+                    continue
+                rows.append([float(v) for v in row])
+            if len(rows) != len(items):
+                raise RuntimeError(
+                    f"reference worker score_batch size mismatch: requested={len(items)} returned={len(rows)}"
+                )
+            return rows
+
+        raise RuntimeError(f"reference worker score_batch failed after restart: {last_error or 'unknown error'}")
 
     def close(self) -> None:
         if getattr(self, "_proc", None) is None:
@@ -1826,33 +1872,80 @@ def _fill_missing_reference_logprobs(
 
     if ref_logprob_client is not None:
         batch_chunk = _env_int("GEMMA27_RL_REF_FILL_CHUNK", default=16, minimum=1)
-        requests = [
+        requests: list[tuple[int, tuple[list[int], list[int]]]] = [
             (
-                merged_rollouts[i].prompt_input_ids,
-                merged_rollouts[i].completion_token_ids,
+                i,
+                (
+                    merged_rollouts[i].prompt_input_ids,
+                    merged_rollouts[i].completion_token_ids,
+                ),
             )
             for i in missing_idx
         ]
-        responses: list[list[float]] = []
+        responses_by_idx: dict[int, list[float]] = {}
         batch_calls = 0
-        for start in range(0, len(requests), batch_chunk):
-            chunk = requests[start:start + batch_chunk]
-            responses.extend(ref_logprob_client.score_logprobs_batch(chunk))
-            batch_calls += 1
-        if len(responses) != len(missing_idx):
-            raise RuntimeError(
-                "reference score_batch result size mismatch while filling missing logprobs"
-            )
-        for idx, row in zip(missing_idx, responses):
-            merged_rollouts[idx].ref_logprobs = [float(v) for v in row]
+        cursor = 0
+        while cursor < len(requests):
+            remaining = len(requests) - cursor
+            chunk_size = min(batch_chunk, remaining)
+            chunk = requests[cursor:cursor + chunk_size]
+            try:
+                chunk_rows = ref_logprob_client.score_logprobs_batch([pair for _, pair in chunk])
+                batch_calls += 1
+            except Exception as exc:
+                if chunk_size > 1:
+                    batch_chunk = max(1, chunk_size // 2)
+                    logger.warning(
+                        "Reference score_batch failed at update=%s; reducing chunk size to %s and retrying. error=%s",
+                        update_idx,
+                        batch_chunk,
+                        exc,
+                    )
+                    continue
+                bad_idx = chunk[0][0]
+                logger.error(
+                    "Reference score failed for one rollout at update=%s idx=%s; skipping KL for this sample. error=%s",
+                    update_idx,
+                    bad_idx,
+                    exc,
+                )
+                cursor += 1
+                continue
+
+            if len(chunk_rows) != len(chunk):
+                logger.warning(
+                    "reference score_batch returned mismatched size at update=%s requested=%s got=%s; retrying with smaller chunks.",
+                    update_idx,
+                    len(chunk),
+                    len(chunk_rows),
+                )
+                if chunk_size > 1:
+                    batch_chunk = max(1, chunk_size // 2)
+                    continue
+                cursor += 1
+                continue
+
+            for (rollout_idx, _), row in zip(chunk, chunk_rows):
+                responses_by_idx[rollout_idx] = [float(v) for v in row]
+            cursor += chunk_size
+
+        filled = 0
+        for idx in missing_idx:
+            row = responses_by_idx.get(idx)
+            if row is None:
+                continue
+            merged_rollouts[idx].ref_logprobs = row
+            filled += 1
+
         logger.info(
-            "Filled reference logprobs on rank0 for %s gathered rollouts at update=%s (batch_calls=%s chunk=%s).",
+            "Filled reference logprobs on rank0 for %s/%s gathered rollouts at update=%s (batch_calls=%s chunk=%s).",
+            filled,
             len(missing_idx),
             update_idx,
             batch_calls,
             batch_chunk,
         )
-        return len(missing_idx)
+        return filled
 
     if ref_model is not None:
         for idx in missing_idx:
@@ -2484,11 +2577,10 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
                 device=device,
                 ref_model=ref_model if rank0 else None,
                 ref_device=ref_device if rank0 else None,
-                ref_logprob_fn=(
-                    ref_logprob_client.score_logprobs
-                    if (rank0 and ref_logprob_client is not None)
-                    else None
-                ),
+                # In distributed mode we fill reference logprobs later in rank0 batch
+                # (`_fill_missing_reference_logprobs`). Avoid per-sample worker calls here,
+                # which are fragile under long-running CUDA workers.
+                ref_logprob_fn=None,
                 prompt_template=cfg.prompt.template,
                 show_progress=bool(rank0),
                 progress_desc=f"rollout u{update_idx}",
