@@ -172,6 +172,12 @@ def evaluate_on_dataset(
             else:
                 logger.warning("Ignoring unknown eval.generation_overrides key: %s", key)
         logger.info("evaluate_on_dataset: applied eval generation overrides: %s", eval_overrides)
+    if int(getattr(gen_cfg, "num_samples_per_prompt", 1)) != 1:
+        logger.warning(
+            "Eval always uses one sample per prompt; overriding num_samples_per_prompt=%s -> 1.",
+            getattr(gen_cfg, "num_samples_per_prompt", None),
+        )
+        gen_cfg.num_samples_per_prompt = 1
 
     shard_eval = bool(distributed_eval_shard and distributed_world_size > 1)
     if shard_eval:
@@ -215,13 +221,23 @@ def evaluate_on_dataset(
             len(local_rollouts),
         )
         logger.info("evaluate_on_dataset: gather begin rank=%s", distributed_rank)
-    rollouts = _gather_rollouts_to_rank0(
-        local_rollouts,
-        rank=distributed_rank,
-        world_size=distributed_world_size,
-    )
-    if shard_eval:
+        rollouts = _gather_rollouts_to_rank0(
+            local_rollouts,
+            rank=distributed_rank,
+            world_size=distributed_world_size,
+        )
         logger.info("evaluate_on_dataset: gather done rank=%s merged_rollouts=%s", distributed_rank, len(rollouts))
+    else:
+        # Non-sharded distributed eval runs generation on all ranks for ZeRO/NCCL safety,
+        # but report/scoring must use only one copy of each example (rank0 local results).
+        rollouts = local_rollouts if distributed_rank == 0 else []
+        if distributed_world_size > 1 and distributed_rank == 0:
+            logger.info(
+                "evaluate_on_dataset: non-sharded distributed eval; using rank0 local rollouts only "
+                "(rollouts=%s, world_size=%s).",
+                len(rollouts),
+                distributed_world_size,
+            )
     if (not shard_eval) or distributed_rank == 0:
         logger.info("evaluate_on_dataset: rollout complete rollouts=%s", len(rollouts))
 
