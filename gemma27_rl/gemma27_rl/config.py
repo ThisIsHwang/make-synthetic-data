@@ -95,8 +95,6 @@ class GenerationConfig:
     # OpenAI-style repetition controls (applied via custom logits processor).
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
-    # OpenAI-compatible extension payload; mapped into chat-template kwargs in rollout/eval.
-    extra_body: dict[str, Any] = field(default_factory=dict)
     chat_template_kwargs: dict[str, Any] = field(default_factory=lambda: {"enable_thinking": False})
 
 
@@ -417,8 +415,6 @@ def _validate_config(cfg: RLPostTrainConfig) -> None:
         raise ValueError("rl.deepspeed_zero_stage must be one of 0,1,2,3")
     if cfg.generation.chat_template_kwargs is not None and not isinstance(cfg.generation.chat_template_kwargs, dict):
         raise ValueError("generation.chat_template_kwargs must be a dict")
-    if cfg.generation.extra_body is not None and not isinstance(cfg.generation.extra_body, dict):
-        raise ValueError("generation.extra_body must be a dict")
     if cfg.eval.generation_overrides is not None and not isinstance(cfg.eval.generation_overrides, dict):
         raise ValueError("eval.generation_overrides must be a dict")
     if not isinstance(cfg.eval.distributed_shard, bool):

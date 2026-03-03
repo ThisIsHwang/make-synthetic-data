@@ -123,43 +123,12 @@ def _serialize_chat_template_kwargs(chat_template_kwargs: dict[str, Any] | None)
         return repr(chat_template_kwargs)
 
 
-def _normalize_chat_template_kwargs(raw_kwargs: dict[str, Any] | None) -> dict[str, Any]:
-    if raw_kwargs is None:
-        return {}
-    kwargs = dict(raw_kwargs)
-    # Accept OpenAI-style container and map it to HF chat-template kwargs.
-    extra_body = kwargs.pop("extra_body", None)
-    if extra_body is not None:
-        if isinstance(extra_body, dict):
-            nested_chat_kwargs = extra_body.get("chat_template_kwargs")
-            if isinstance(nested_chat_kwargs, dict):
-                merged = dict(nested_chat_kwargs)
-            else:
-                merged = dict(extra_body)
-            merged.update(kwargs)
-            kwargs = merged
-        else:
-            logger.warning(
-                "Ignoring non-dict generation.chat_template_kwargs.extra_body (type=%s)",
-                type(extra_body).__name__,
-            )
-    return kwargs
-
-
 def _build_generation_chat_kwargs(gen_cfg: GenerationConfig) -> dict[str, Any]:
-    base_kwargs = (
+    return (
         dict(gen_cfg.chat_template_kwargs)
         if getattr(gen_cfg, "chat_template_kwargs", None) is not None
         else {}
     )
-    extra_body = getattr(gen_cfg, "extra_body", None)
-    if isinstance(extra_body, dict) and extra_body:
-        existing = base_kwargs.get("extra_body")
-        merged_extra = dict(extra_body)
-        if isinstance(existing, dict):
-            merged_extra.update(existing)
-        base_kwargs["extra_body"] = merged_extra
-    return _normalize_chat_template_kwargs(base_kwargs)
 
 
 def _prompt_cache_limit() -> int:
