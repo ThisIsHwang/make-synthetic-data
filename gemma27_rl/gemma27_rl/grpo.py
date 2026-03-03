@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+from typing import Any
 
 import torch
 import torch.nn.functional as F
@@ -57,6 +58,39 @@ def _resolve_model_vocab_size(model: nn.Module) -> int | None:
     except Exception:
         size = 0
     return size if size > 0 else None
+
+
+def _safe_token_texts(tokenizer: Any, token_id: int) -> tuple[str, str]:
+    token_piece = ""
+    decoded_piece = ""
+    if tokenizer is None:
+        return token_piece, decoded_piece
+
+    try:
+        converter = getattr(tokenizer, "convert_ids_to_tokens", None)
+        if callable(converter):
+            converted = converter([int(token_id)])
+            if isinstance(converted, list) and converted:
+                token_piece = str(converted[0])
+            elif isinstance(converted, str):
+                token_piece = converted
+    except Exception:
+        token_piece = ""
+
+    try:
+        decoder = getattr(tokenizer, "decode", None)
+        if callable(decoder):
+            decoded = decoder(
+                [int(token_id)],
+                skip_special_tokens=False,
+                clean_up_tokenization_spaces=False,
+            )
+            if isinstance(decoded, str):
+                decoded_piece = decoded
+    except Exception:
+        decoded_piece = ""
+
+    return token_piece, decoded_piece
 
 
 def _validate_rollout_token_ids(
@@ -132,6 +166,7 @@ def update_policy(
     optimizer: torch.optim.Optimizer | None,
     rl_cfg: RLConfig,
     device: str,
+    tokenizer: Any | None = None,
 ) -> TrainStats:
     if len(rollouts) != len(advantages):
         raise ValueError("rollouts and advantages length mismatch")
@@ -170,12 +205,14 @@ def update_policy(
     total_clip = 0.0
     total_entropy = 0.0
     total_ref_kl = 0.0
-    debug_loss_trace = _is_rank0_process() and (
+    debug_loss_all_ranks = _env_flag("GEMMA27_RL_DEBUG_LOSS_ALL_RANKS", default=False)
+    debug_loss_trace = (debug_loss_all_ranks or _is_rank0_process()) and (
         _env_flag("GEMMA27_RL_DEBUG_LOSS_TRACE", default=False)
         or _env_flag("GEMMA27_RL_DEBUG_SPAN_LOSS", default=False)
     )
     debug_loss_max_rollouts = _env_int("GEMMA27_RL_DEBUG_LOSS_MAX_ROLLOUTS", default=1, minimum=1)
     debug_loss_max_tokens = _env_int("GEMMA27_RL_DEBUG_LOSS_MAX_TOKENS", default=256, minimum=1)
+    debug_loss_max_input_tokens = _env_int("GEMMA27_RL_DEBUG_LOSS_MAX_INPUT_TOKENS", default=0, minimum=0)
     debug_loss_only_nonzero_adv = _env_flag("GEMMA27_RL_DEBUG_LOSS_ONLY_NONZERO_ADV", default=False)
     debug_loss_logged = 0
 
@@ -238,12 +275,64 @@ def update_policy(
             total_entropy += float(ent.detach().sum().item())
 
         if debug_loss_trace and debug_loss_logged < debug_loss_max_rollouts:
+            prompt_len = len(rollout.prompt_input_ids)
+            completion_len = len(rollout.completion_token_ids)
+            full_ids = [int(v) for v in (rollout.prompt_input_ids + rollout.completion_token_ids)]
+            loss_token_count = int(per_token_loss.numel())
+            special_ids = set()
+            if tokenizer is not None:
+                try:
+                    special_ids = {int(v) for v in list(getattr(tokenizer, "all_special_ids", []) or [])}
+                except Exception:
+                    special_ids = set()
+
             logger.info(
-                "[loss-debug] example_id=%s tokens=%s algorithm=%s",
+                "[loss-debug] example_id=%s algorithm=%s prompt_tokens=%s completion_tokens=%s full_input_tokens=%s loss_tokens=%s",
                 rollout.example_id,
-                int(per_token_loss.numel()),
                 rl_cfg.algorithm,
+                prompt_len,
+                completion_len,
+                len(full_ids),
+                loss_token_count,
             )
+            printed_input = 0
+            for in_pos, tok_id in enumerate(full_ids):
+                if debug_loss_max_input_tokens > 0 and printed_input >= debug_loss_max_input_tokens:
+                    break
+                if in_pos < prompt_len:
+                    role = "prompt"
+                    loss_idx = -1
+                    predictor_pos = -1
+                else:
+                    completion_idx = in_pos - prompt_len
+                    if completion_idx < loss_token_count:
+                        role = "completion(loss)"
+                        loss_idx = completion_idx
+                        predictor_pos = (prompt_len - 1) + completion_idx
+                    else:
+                        role = "completion(no_loss)"
+                        loss_idx = -1
+                        predictor_pos = -1
+                token_piece, decoded_piece = _safe_token_texts(tokenizer, tok_id)
+                logger.info(
+                    "[loss-debug][input] pos=%03d id=%s special=%s role=%s loss_idx=%s predictor_pos=%s token=%r decoded=%r",
+                    in_pos,
+                    tok_id,
+                    bool(tok_id in special_ids),
+                    role,
+                    loss_idx,
+                    predictor_pos,
+                    token_piece,
+                    decoded_piece,
+                )
+                printed_input += 1
+            if debug_loss_max_input_tokens > 0 and len(full_ids) > printed_input:
+                logger.info(
+                    "[loss-debug][input] token rows truncated: printed=%s total=%s",
+                    printed_input,
+                    len(full_ids),
+                )
+
             printed = 0
             non_zero_adv = 0
             for tok_idx in range(int(per_token_loss.numel())):
@@ -255,11 +344,14 @@ def update_policy(
                 if printed >= debug_loss_max_tokens:
                     break
                 tok_id = int(rollout.completion_token_ids[tok_idx]) if tok_idx < len(rollout.completion_token_ids) else -1
+                token_piece, decoded_piece = _safe_token_texts(tokenizer, tok_id)
                 if ref_lp is not None and tok_idx < int(ref_lp.numel()):
                     logger.info(
-                        "[loss-debug] tok[%03d] id=%s old_lp=%.6f new_lp=%.6f ref_lp=%.6f adv=%.6f ratio=%.6f clipped=%.6f policy=%.6f kl=%.6f entropy=%.6f total=%.6f",
+                        "[loss-debug] tok[%03d] id=%s token=%r decoded=%r old_lp=%.6f new_lp=%.6f ref_lp=%.6f adv=%.6f ratio=%.6f clipped=%.6f policy=%.6f kl=%.6f entropy=%.6f total=%.6f",
                         tok_idx,
                         tok_id,
+                        token_piece,
+                        decoded_piece,
                         float(old_lp[tok_idx].detach().item()),
                         float(new_lp[tok_idx].detach().item()),
                         float(ref_lp[tok_idx].detach().item()),
@@ -273,9 +365,11 @@ def update_policy(
                     )
                 else:
                     logger.info(
-                        "[loss-debug] tok[%03d] id=%s old_lp=%.6f new_lp=%.6f adv=%.6f ratio=%.6f clipped=%.6f policy=%.6f kl=%.6f entropy=%.6f total=%.6f",
+                        "[loss-debug] tok[%03d] id=%s token=%r decoded=%r old_lp=%.6f new_lp=%.6f adv=%.6f ratio=%.6f clipped=%.6f policy=%.6f kl=%.6f entropy=%.6f total=%.6f",
                         tok_idx,
                         tok_id,
+                        token_piece,
+                        decoded_piece,
                         float(old_lp[tok_idx].detach().item()),
                         float(new_lp[tok_idx].detach().item()),
                         adv_i,

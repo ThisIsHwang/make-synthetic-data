@@ -74,6 +74,46 @@ def _env_int(name: str, default: int, minimum: int = 1) -> int:
     return max(minimum, value)
 
 
+def _is_rank0_process() -> bool:
+    rank_raw = os.environ.get("RANK")
+    if rank_raw is None:
+        return True
+    if not rank_raw.isdigit():
+        return True
+    return int(rank_raw) == 0
+
+
+def _truncate_for_log(text: str, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars] + f"...[truncated {len(text) - max_chars} chars]"
+
+
+def _safe_convert_ids_to_tokens(tokenizer: PreTrainedTokenizerBase, token_ids: list[int]) -> list[str]:
+    try:
+        converter = getattr(tokenizer, "convert_ids_to_tokens", None)
+        if callable(converter):
+            out = converter([int(v) for v in token_ids])
+            if isinstance(out, list):
+                return [str(v) for v in out]
+            if isinstance(out, str):
+                return [out]
+    except Exception:
+        pass
+    return []
+
+
+def _safe_decode_ids_with_specials(tokenizer: PreTrainedTokenizerBase, token_ids: list[int]) -> str:
+    try:
+        return tokenizer.decode(
+            [int(v) for v in token_ids],
+            skip_special_tokens=False,
+            clean_up_tokenization_spaces=False,
+        )
+    except Exception:
+        return ""
+
+
 def _serialize_chat_template_kwargs(chat_template_kwargs: dict[str, Any] | None) -> str:
     if not chat_template_kwargs:
         return "{}"
@@ -781,6 +821,32 @@ def generate_rollouts(
         gen_cfg=gen_cfg,
         pad_token_id=pad_token_id,
     )
+    raw_io_log_enabled = _env_flag("GEMMA27_RL_LOG_RAW_IO", default=False)
+    raw_io_log_all_ranks = _env_flag("GEMMA27_RL_LOG_RAW_IO_ALL_RANKS", default=False)
+    raw_io_max_chars = _env_int("GEMMA27_RL_LOG_RAW_IO_MAX_CHARS", default=20000, minimum=256)
+    raw_io_max_rows = _env_int("GEMMA27_RL_LOG_RAW_IO_MAX_ROWS", default=0, minimum=0)
+    should_log_raw_io = raw_io_log_enabled and (raw_io_log_all_ranks or _is_rank0_process())
+    raw_phase = str(progress_desc or "rollout")
+    if should_log_raw_io:
+        for ex_idx, ex in enumerate(examples):
+            if raw_io_max_rows > 0 and ex_idx >= raw_io_max_rows:
+                break
+            prompt_ids = prompt_id_rows[ex_idx] if ex_idx < len(prompt_id_rows) else []
+            prompt_tokens = _safe_convert_ids_to_tokens(tokenizer, prompt_ids)
+            prompt_decoded_with_specials = _safe_decode_ids_with_specials(tokenizer, prompt_ids)
+            logger.info(
+                "[raw-io][%s][input] ex_idx=%s example_id=%s src=%r ref=%r prompt=%r prompt_ids=%s prompt_tokens=%s "
+                "prompt_decoded_with_specials=%r",
+                raw_phase,
+                ex_idx,
+                ex.example_id,
+                _truncate_for_log(ex.src_text, raw_io_max_chars),
+                _truncate_for_log(ex.ref_text, raw_io_max_chars),
+                _truncate_for_log(prompt_texts[ex_idx], raw_io_max_chars),
+                _truncate_for_log(json.dumps(prompt_ids, ensure_ascii=False), raw_io_max_chars),
+                _truncate_for_log(json.dumps(prompt_tokens, ensure_ascii=False), raw_io_max_chars),
+                _truncate_for_log(prompt_decoded_with_specials, raw_io_max_chars),
+            )
     if policy_vocab_size is not None:
         _validate_item_token_ids(
             items=[(row, []) for row in prompt_id_rows],
@@ -844,7 +910,8 @@ def generate_rollouts(
             prompt_ids = prompt_id_rows[ex_idx]
 
             full_ids = seq.detach().cpu().tolist()
-            completion_raw_ids = full_ids[input_width:]
+            completion_untrimmed_ids = [int(v) for v in full_ids[input_width:]]
+            completion_raw_ids = list(completion_untrimmed_ids)
             completion_raw_ids = _trim_completion_ids(
                 completion_raw_ids,
                 eos_token_ids=eos_token_ids,
@@ -873,6 +940,38 @@ def generate_rollouts(
                     skip_special_tokens=True,
                     clean_up_tokenization_spaces=False,
                 )
+            if should_log_raw_io:
+                output_row_idx = len(rollouts)
+                if raw_io_max_rows <= 0 or output_row_idx < raw_io_max_rows:
+                    completion_untrimmed_tokens = _safe_convert_ids_to_tokens(tokenizer, completion_untrimmed_ids)
+                    completion_untrimmed_decoded = _safe_decode_ids_with_specials(tokenizer, completion_untrimmed_ids)
+                    completion_raw_tokens = _safe_convert_ids_to_tokens(tokenizer, completion_raw_ids)
+                    completion_raw_decoded = _safe_decode_ids_with_specials(tokenizer, completion_raw_ids)
+                    completion_tokens = _safe_convert_ids_to_tokens(tokenizer, completion_ids)
+                    completion_decoded = _safe_decode_ids_with_specials(tokenizer, completion_ids)
+                    logger.info(
+                        "[raw-io][%s][output] row_idx=%s seq_idx=%s ex_idx=%s sample_idx=%s example_id=%s "
+                        "completion_untrimmed_ids=%s completion_untrimmed_tokens=%s completion_untrimmed_decoded_with_specials=%r "
+                        "completion_raw_ids=%s completion_raw_tokens=%s completion_raw_decoded_with_specials=%r "
+                        "completion_raw_text=%r completion_ids=%s completion_tokens=%s completion_decoded_with_specials=%r completion_text=%r",
+                        raw_phase,
+                        output_row_idx,
+                        seq_idx,
+                        ex_idx,
+                        (seq_idx % num_return),
+                        ex.example_id,
+                        _truncate_for_log(json.dumps(completion_untrimmed_ids, ensure_ascii=False), raw_io_max_chars),
+                        _truncate_for_log(json.dumps(completion_untrimmed_tokens, ensure_ascii=False), raw_io_max_chars),
+                        _truncate_for_log(completion_untrimmed_decoded, raw_io_max_chars),
+                        _truncate_for_log(json.dumps(completion_raw_ids, ensure_ascii=False), raw_io_max_chars),
+                        _truncate_for_log(json.dumps(completion_raw_tokens, ensure_ascii=False), raw_io_max_chars),
+                        _truncate_for_log(completion_raw_decoded, raw_io_max_chars),
+                        _truncate_for_log(raw_text, raw_io_max_chars),
+                        _truncate_for_log(json.dumps(completion_ids, ensure_ascii=False), raw_io_max_chars),
+                        _truncate_for_log(json.dumps(completion_tokens, ensure_ascii=False), raw_io_max_chars),
+                        _truncate_for_log(completion_decoded, raw_io_max_chars),
+                        _truncate_for_log(completion_text, raw_io_max_chars),
+                    )
             if policy_vocab_size is not None:
                 _validate_token_ids_in_vocab(
                     completion_ids,

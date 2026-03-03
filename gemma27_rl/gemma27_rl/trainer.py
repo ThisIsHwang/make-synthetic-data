@@ -2906,6 +2906,7 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
                     optimizer=optimizer,
                     rl_cfg=cfg.rl,
                     device=device,
+                    tokenizer=tokenizer,
                 )
             )
         train_stats = step_stats[-1]

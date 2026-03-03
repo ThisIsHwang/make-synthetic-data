@@ -27,6 +27,55 @@ _EVAL_OBJECT_GROUP: Any | None = None
 _EVAL_OBJECT_GROUP_WORLD_SIZE: int = -1
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _env_int(name: str, default: int, minimum: int = 1) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return max(minimum, int(default))
+    try:
+        value = int(raw.strip())
+    except Exception:
+        return max(minimum, int(default))
+    return max(minimum, value)
+
+
+def _truncate_for_log(text: str, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars] + f"...[truncated {len(text) - max_chars} chars]"
+
+
+def _safe_convert_ids_to_tokens(tokenizer: PreTrainedTokenizerBase, token_ids: list[int]) -> list[str]:
+    try:
+        converter = getattr(tokenizer, "convert_ids_to_tokens", None)
+        if callable(converter):
+            out = converter([int(v) for v in token_ids])
+            if isinstance(out, list):
+                return [str(v) for v in out]
+            if isinstance(out, str):
+                return [out]
+    except Exception:
+        pass
+    return []
+
+
+def _safe_decode_ids_with_specials(tokenizer: PreTrainedTokenizerBase, token_ids: list[int]) -> str:
+    try:
+        return tokenizer.decode(
+            [int(v) for v in token_ids],
+            skip_special_tokens=False,
+            clean_up_tokenization_spaces=False,
+        )
+    except Exception:
+        return ""
+
+
 def _mean_std(values: list[float]) -> tuple[float, float]:
     if not values:
         return 0.0, 0.0
@@ -411,6 +460,35 @@ def evaluate_on_dataset(
         "avg_completion_len": float(avg_completion_len),
         "num_eval_rollouts": len(rollouts),
     }
+
+    raw_io_log_enabled = _env_flag("GEMMA27_RL_LOG_RAW_IO", default=False)
+    raw_io_max_chars = _env_int("GEMMA27_RL_LOG_RAW_IO_MAX_CHARS", default=20000, minimum=256)
+    raw_io_max_rows = _env_int("GEMMA27_RL_LOG_RAW_IO_MAX_ROWS", default=0, minimum=0)
+    if raw_io_log_enabled:
+        for idx, rollout in enumerate(rollouts):
+            if raw_io_max_rows > 0 and idx >= raw_io_max_rows:
+                break
+            span_row = spans[idx] if idx < len(spans) else []
+            completion_ids = [int(v) for v in list(rollout.completion_token_ids or [])]
+            completion_tokens = _safe_convert_ids_to_tokens(tokenizer, completion_ids)
+            completion_decoded_with_specials = _safe_decode_ids_with_specials(tokenizer, completion_ids)
+            logger.info(
+                "[raw-io][eval][scored] idx=%s example_id=%s src=%r ref=%r mt=%r metricx=%.6f metricx_reward=%.6f "
+                "xcomet=%.6f mqm=%.6f completion_ids=%s completion_tokens=%s completion_decoded_with_specials=%r spans=%s",
+                idx,
+                rollout.example_id,
+                _truncate_for_log(rollout.src_text, raw_io_max_chars),
+                _truncate_for_log(rollout.ref_text, raw_io_max_chars),
+                _truncate_for_log(rollout.completion_text, raw_io_max_chars),
+                float(metricx_scores[idx]) if idx < len(metricx_scores) else 0.0,
+                float(metricx_rewards[idx]) if idx < len(metricx_rewards) else 0.0,
+                float(xcomet_scores[idx]) if idx < len(xcomet_scores) else 0.0,
+                float(mqm_scores[idx]) if idx < len(mqm_scores) else 0.0,
+                _truncate_for_log(str(completion_ids), raw_io_max_chars),
+                _truncate_for_log(str(completion_tokens), raw_io_max_chars),
+                _truncate_for_log(completion_decoded_with_specials, raw_io_max_chars),
+                _truncate_for_log(str(span_row), raw_io_max_chars),
+            )
 
     if collect_outputs:
         rows: list[dict[str, Any]] = []
