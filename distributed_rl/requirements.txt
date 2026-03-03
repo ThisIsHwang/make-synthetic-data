@@ -1,4 +1,6 @@
-torch>=2.6.0,<3.0.0
+# torch is installed separately by setup_training_venv.sh with the correct
+# CUDA index.  Do NOT add torch here — uv would re-resolve it from PyPI
+# and overwrite the CUDA-specific build (e.g. cu126 → cu128).
 transformers>=5.2.0
 trl>=0.15.0
 accelerate>=0.34.0
