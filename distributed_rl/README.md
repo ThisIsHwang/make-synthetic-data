@@ -42,13 +42,24 @@ Worker Node (Multi-Node 시):
 
 ## Installation
 
+> 모든 명령어는 **프로젝트 루트** (`hwang-post-training/`)에서 실행합니다.
+
+```
+hwang-post-training/            ← 프로젝트 루트 (여기서 실행)
+├── distributed_rl/
+│   ├── configs/                ← YAML config 파일들
+│   └── ...
+├── .venv-metrics/              ← MetricX 전용 venv (Step 2에서 생성)
+└── .venv-xcomet/               ← XComet 전용 venv (Step 3에서 생성)
+```
+
 ### 1. Training 환경
 
 ```bash
-cd distributed_rl
-pip install -e .
+# 현재 활성 venv에 distributed_rl 패키지 설치
+uv pip install -e distributed_rl
 # 또는 requirements만 설치:
-pip install -r requirements.txt
+uv pip install -r distributed_rl/requirements.txt
 ```
 
 주요 의존성:
@@ -64,15 +75,15 @@ pip install -r requirements.txt
 MetricX는 의존성 충돌 방지를 위해 별도 Python 환경을 사용합니다.
 
 ```bash
-python -m venv .venv-metrics
-source .venv-metrics/bin/activate
-pip install torch transformers sentencepiece
+# 프로젝트 루트에서 실행
+uv venv .venv-metrics
+uv pip install --python .venv-metrics/bin/python torch transformers sentencepiece
 # MetricX 모델은 MT5 기반이므로 추가 패키지 불필요
-deactivate
 ```
 
-Config에서 `reward.metricx.python_executable`로 경로를 지정합니다:
+Config의 `python_executable`은 YAML 파일 위치 기준 상대 경로입니다:
 ```yaml
+# distributed_rl/configs/*.yaml 기준 → ../../ = 프로젝트 루트
 reward:
   metricx:
     python_executable: ../../.venv-metrics/bin/python
@@ -81,14 +92,14 @@ reward:
 ### 3. XComet 환경 (별도 venv)
 
 ```bash
-python -m venv .venv-xcomet
-source .venv-xcomet/bin/activate
-pip install torch unbabel-comet
-deactivate
+# 프로젝트 루트에서 실행
+uv venv .venv-xcomet
+uv pip install --python .venv-xcomet/bin/python torch unbabel-comet
 ```
 
 Config에서 `reward.xcomet.python_executable`로 경로를 지정합니다:
 ```yaml
+# distributed_rl/configs/*.yaml 기준 → ../../ = 프로젝트 루트
 reward:
   xcomet:
     python_executable: ../../.venv-xcomet/bin/python
@@ -180,12 +191,13 @@ torchrun \
 ### 사전 준비
 
 ```bash
+# 프로젝트 루트 (hwang-post-training/) 에서 실행
+
 # 1. HuggingFace 토큰 설정 (gated model 접근용)
 export HF_TOKEN=<your-token>
 
 # 2. Training 환경 설치
-cd distributed_rl
-pip install -e .
+uv pip install -e distributed_rl
 
 # 3. MetricX 별도 venv (위 Installation 참조)
 # 4. XComet 별도 venv (위 Installation 참조)
@@ -382,7 +394,6 @@ training:
 ## Tests
 
 ```bash
-cd distributed_rl
-pip install pytest pyyaml
-pytest tests/ -v
+uv pip install pytest pyyaml
+pytest distributed_rl/tests/ -v
 ```
