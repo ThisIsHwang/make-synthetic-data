@@ -173,7 +173,16 @@ class MetricXReward(RewardModel):
         # --- Mode 2: In-process ---
         # Load the model directly (used inside scorer_worker.py or for testing).
         if torch is None or AutoTokenizer is None:
-            raise RuntimeError("MetricX in-process mode requires torch + transformers.")
+            import sys
+            raise RuntimeError(
+                f"MetricX in-process mode requires torch + transformers.\n"
+                f"  sys.executable = {sys.executable}\n"
+                f"  sys.path = {sys.path}\n"
+                f"  VIRTUAL_ENV = {os.environ.get('VIRTUAL_ENV', '(not set)')}\n"
+                f"  PYTHONHOME = {os.environ.get('PYTHONHOME', '(not set)')}\n"
+                f"  torch = {torch}\n"
+                f"  AutoTokenizer = {AutoTokenizer}"
+            )
 
         from .metricx_model import MT5ForRegression
 
