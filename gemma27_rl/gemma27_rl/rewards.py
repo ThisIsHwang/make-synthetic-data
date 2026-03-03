@@ -44,6 +44,30 @@ from .utils import (
 logger = logging.getLogger(__name__)
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _env_int(name: str, default: int, minimum: int = 1) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return max(minimum, int(default))
+    try:
+        value = int(raw.strip())
+    except Exception:
+        return max(minimum, int(default))
+    return max(minimum, value)
+
+
+def _truncate_for_log(text: str, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars] + f"...[truncated {len(text) - max_chars} chars]"
+
+
 def _temporarily_unset_proxy_env() -> Callable[[], None]:
     keys = (
         "HTTP_PROXY",
@@ -1295,6 +1319,8 @@ class OpenAICompatibleMQMScorer:
         if self._chat_url is None:
             raise RuntimeError("MQM scorer chat URL is not set.")
 
+        log_io = _env_flag("GEMMA27_RL_LOG_MQM_IO", default=False)
+        log_max_chars = _env_int("GEMMA27_RL_LOG_MQM_IO_MAX_CHARS", default=20000, minimum=256)
         payload = {
             "model": self.cfg.model_name,
             "messages": messages,
@@ -1312,6 +1338,16 @@ class OpenAICompatibleMQMScorer:
             payload["stop"] = list(self.cfg.stop)
         if self.cfg.chat_template_kwargs:
             payload["chat_template_kwargs"] = dict(self.cfg.chat_template_kwargs)
+        if log_io:
+            try:
+                payload_text = json.dumps(payload, ensure_ascii=False)
+            except Exception:
+                payload_text = repr(payload)
+            logger.info(
+                "[mqm-io] request url=%s payload=%s",
+                self._chat_url,
+                _truncate_for_log(payload_text, log_max_chars),
+            )
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
         req = urllib_request.Request(
@@ -1330,12 +1366,25 @@ class OpenAICompatibleMQMScorer:
                 opener = urllib_request.build_opener(urllib_request.ProxyHandler({}))
                 with opener.open(req, timeout=timeout) as resp:
                     resp_body = resp.read().decode("utf-8")
+                    if log_io:
+                        logger.info(
+                            "[mqm-io] response_body=%s",
+                            _truncate_for_log(resp_body, log_max_chars),
+                        )
             finally:
                 restore_proxy_env()
         except urllib_error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
+            if log_io:
+                logger.error(
+                    "[mqm-io] http_error status=%s body=%s",
+                    exc.code,
+                    _truncate_for_log(detail, log_max_chars),
+                )
             raise RuntimeError(f"MQM API HTTPError status={exc.code} body={detail}") from exc
         except urllib_error.URLError as exc:
+            if log_io:
+                logger.error("[mqm-io] url_error=%s", exc)
             raise RuntimeError(f"MQM API URLError: {exc}") from exc
 
         try:
@@ -1352,6 +1401,11 @@ class OpenAICompatibleMQMScorer:
             if isinstance(msg, dict):
                 content = msg.get("content")
                 if isinstance(content, str):
+                    if log_io:
+                        logger.info(
+                            "[mqm-io] parsed_content=%s",
+                            _truncate_for_log(content, log_max_chars),
+                        )
                     return content
                 if isinstance(content, list):
                     text_parts = []
@@ -1359,9 +1413,20 @@ class OpenAICompatibleMQMScorer:
                         if isinstance(item, dict) and isinstance(item.get("text"), str):
                             text_parts.append(item["text"])
                     if text_parts:
-                        return "\n".join(text_parts)
+                        joined = "\n".join(text_parts)
+                        if log_io:
+                            logger.info(
+                                "[mqm-io] parsed_content=%s",
+                                _truncate_for_log(joined, log_max_chars),
+                            )
+                        return joined
             text = first.get("text")
             if isinstance(text, str):
+                if log_io:
+                    logger.info(
+                        "[mqm-io] parsed_content=%s",
+                        _truncate_for_log(text, log_max_chars),
+                    )
                 return text
 
         raise RuntimeError("MQM API response format is unsupported.")
