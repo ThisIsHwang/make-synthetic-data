@@ -80,7 +80,7 @@ uv pip install flash-attn --no-build-isolation
 
 주요 의존성:
 - `torch >= 2.6.0`
-- `transformers >= 4.57.0`
+- `transformers >= 5.2.0`
 - `trl >= 0.15.0`
 - `accelerate >= 0.34.0`
 - `deepspeed >= 0.15.4`
