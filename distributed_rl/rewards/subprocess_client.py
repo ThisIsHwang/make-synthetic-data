@@ -91,15 +91,16 @@ class ScorerSubprocessClient:
 
         cmd = [python_executable, str(worker_script), "--backend", backend]
 
-        # --- CRITICAL: Remove CUDA_VISIBLE_DEVICES ---
-        # The parent process (torchrun worker) has CUDA_VISIBLE_DEVICES=0,1,2,3,4,5
-        # which means it can only see GPUs 0-5.  But the reward model needs GPU 6 or 7.
-        # By removing this env var, the subprocess can see ALL physical GPUs.
-        #
-        # The worker then uses ``torch.device(f"cuda:{gpu_id}")`` where gpu_id
-        # is the PHYSICAL GPU index (6 or 7), not the CUDA-visible index.
+        # --- CRITICAL: Clean subprocess environment ---
+        # 1. Remove CUDA_VISIBLE_DEVICES so the subprocess can see ALL GPUs.
+        #    The parent (torchrun) restricts to GPUs 0-5, but the reward model
+        #    needs GPU 6 or 7.
+        # 2. Remove VIRTUAL_ENV / PYTHONHOME so the subprocess uses its own
+        #    venv's site-packages (not the parent training venv's).
         env = os.environ.copy()
         env.pop("CUDA_VISIBLE_DEVICES", None)
+        env.pop("VIRTUAL_ENV", None)
+        env.pop("PYTHONHOME", None)
 
         # Spawn the subprocess with stdin/stdout pipes for JSON communication.
         # stderr is inherited (goes to the same terminal/log as the parent).
