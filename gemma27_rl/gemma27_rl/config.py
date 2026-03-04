@@ -158,12 +158,46 @@ class MQMConfig:
 
 
 @dataclass
+class ESAConfig:
+    enabled: bool = False
+    base_url: str | None = None
+    model_name: str = "qwen3.5-397b-instruct"
+    api_key: str | None = None
+    api_key_env: str = "OPENAI_API_KEY"
+    source_lang: str = "English"
+    target_lang: str = "Korean"
+    timeout_sec: float = 120.0
+    timeout_s: float | None = None
+    max_retries: int = 3
+    batch_size: int = 1
+    use_reference: bool = False
+    temperature: float = 0.0
+    top_p: float = 1.0
+    top_k: int | None = None
+    presence_penalty: float | None = None
+    repetition_penalty: float | None = None
+    max_tokens_error_spans: int = 1024
+    max_tokens_score: int = 256
+    stop: list[str] = field(default_factory=list)
+    chat_template_kwargs: dict[str, Any] = field(default_factory=lambda: {"enable_thinking": False})
+    use_fewshot: bool = True
+    score_min: float = 0.0
+    score_max: float = 100.0
+    scale_to_unit_interval: bool = False
+    error_policy: str = "raise"  # raise|zero
+
+
+@dataclass
 class RewardConfig:
     w_metricx: float = 1.0
     w_xcomet_seq: float = 0.0
     xcomet_seq_scale: float = 1.0
     w_mqm_seq: float = 0.0
     mqm_seq_scale: float = 1.0
+    # GEMBA-ESA returns 0..100. Default scale maps it to 0..25 so that
+    # w_esa_seq=0.2 has similar magnitude to common MQM setup (w_mqm_seq=0.2).
+    w_esa_seq: float = 0.2
+    esa_seq_scale: float = 0.25
     severity_weights: dict[str, float] = field(
         default_factory=lambda: {
             "MINOR": -1.0,
@@ -180,6 +214,7 @@ class RewardConfig:
     metricx: MetricXConfig = field(default_factory=MetricXConfig)
     xcomet: XCometConfig = field(default_factory=XCometConfig)
     mqm: MQMConfig = field(default_factory=MQMConfig)
+    esa: ESAConfig = field(default_factory=ESAConfig)
 
 
 @dataclass
@@ -451,10 +486,17 @@ def _validate_config(cfg: RLPostTrainConfig) -> None:
             continue
         if not str(raw).strip():
             raise ValueError(f"{field_name} must not be empty when set.")
-    if not cfg.reward.metricx.enabled and not cfg.reward.xcomet.enabled and not cfg.reward.mqm.enabled:
+    if (
+        not cfg.reward.metricx.enabled
+        and not cfg.reward.xcomet.enabled
+        and not cfg.reward.mqm.enabled
+        and not cfg.reward.esa.enabled
+    ):
         raise ValueError("At least one reward model must be enabled.")
     if cfg.reward.mqm.error_policy not in {"raise", "zero"}:
         raise ValueError("reward.mqm.error_policy must be raise|zero")
+    if cfg.reward.esa.error_policy not in {"raise", "zero"}:
+        raise ValueError("reward.esa.error_policy must be raise|zero")
     if cfg.reward.mqm.enabled:
         if not cfg.reward.mqm.base_url or not str(cfg.reward.mqm.base_url).strip():
             raise ValueError("reward.mqm.base_url must be set when reward.mqm.enabled=true")
@@ -474,6 +516,31 @@ def _validate_config(cfg: RLPostTrainConfig) -> None:
             raise ValueError("reward.mqm.top_k must be > 0 when set")
         if cfg.reward.mqm.repetition_penalty is not None and float(cfg.reward.mqm.repetition_penalty) <= 0:
             raise ValueError("reward.mqm.repetition_penalty must be > 0 when set")
+    if cfg.reward.esa.enabled:
+        if not cfg.reward.esa.base_url or not str(cfg.reward.esa.base_url).strip():
+            raise ValueError("reward.esa.base_url must be set when reward.esa.enabled=true")
+        if float(cfg.reward.esa.score_max) <= float(cfg.reward.esa.score_min):
+            raise ValueError("reward.esa.score_max must be greater than reward.esa.score_min")
+        if int(cfg.reward.esa.max_retries) < 0:
+            raise ValueError("reward.esa.max_retries must be >= 0")
+        if float(cfg.reward.esa.timeout_s or cfg.reward.esa.timeout_sec) <= 0:
+            raise ValueError("reward.esa.timeout_s/timeout_sec must be > 0")
+        if int(cfg.reward.esa.batch_size) <= 0:
+            raise ValueError("reward.esa.batch_size must be > 0")
+        if int(cfg.reward.esa.max_tokens_error_spans) <= 0:
+            raise ValueError("reward.esa.max_tokens_error_spans must be > 0")
+        if int(cfg.reward.esa.max_tokens_score) <= 0:
+            raise ValueError("reward.esa.max_tokens_score must be > 0")
+        if not isinstance(cfg.reward.esa.stop, list):
+            raise ValueError("reward.esa.stop must be a list")
+        if cfg.reward.esa.chat_template_kwargs is not None and not isinstance(cfg.reward.esa.chat_template_kwargs, dict):
+            raise ValueError("reward.esa.chat_template_kwargs must be a dict")
+        if cfg.reward.esa.top_k is not None and int(cfg.reward.esa.top_k) <= 0:
+            raise ValueError("reward.esa.top_k must be > 0 when set")
+        if cfg.reward.esa.repetition_penalty is not None and float(cfg.reward.esa.repetition_penalty) <= 0:
+            raise ValueError("reward.esa.repetition_penalty must be > 0 when set")
+        if not isinstance(cfg.reward.esa.use_fewshot, bool):
+            raise ValueError("reward.esa.use_fewshot must be a bool")
     if cfg.data.eval_sampling_count is not None:
         if int(cfg.data.eval_sampling_count) <= 0:
             raise ValueError("data.eval_sampling_count must be > 0 when set.")

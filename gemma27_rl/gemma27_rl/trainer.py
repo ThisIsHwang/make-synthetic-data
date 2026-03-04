@@ -37,6 +37,7 @@ from .data import load_examples
 from .eval import evaluate_on_dataset
 from .grpo import update_policy
 from .rewards import (
+    OpenAICompatibleESAScorer,
     OpenAICompatibleMQMScorer,
     MetricXQEScorer,
     XCometXLScorer,
@@ -1680,15 +1681,45 @@ def _score_with_cache_mqm(
     return scores, spans
 
 
+def _score_with_cache_esa(
+    samples: list[SampleForScoring],
+    scorer: OpenAICompatibleESAScorer,
+    cache: dict[tuple[str, str, str], float],
+    use_cache: bool,
+) -> list[float]:
+    out = [0.0 for _ in samples]
+    uncached: list[SampleForScoring] = []
+    uncached_idx: list[int] = []
+
+    for idx, sample in enumerate(samples):
+        key = (sample.src, sample.mt, (sample.ref or "") if scorer.cfg.use_reference else "")
+        if use_cache and key in cache:
+            out[idx] = float(cache[key])
+        else:
+            uncached.append(sample)
+            uncached_idx.append(idx)
+
+    if uncached:
+        scores = scorer.score_batch(uncached).sequence_scores
+        for idx, score, sample in zip(uncached_idx, scores, uncached):
+            out[idx] = float(score)
+            if use_cache:
+                cache[(sample.src, sample.mt, (sample.ref or "") if scorer.cfg.use_reference else "")] = float(score)
+
+    return out
+
+
 def _prepare_rewards_and_advantages(
     rollouts: list[Rollout],
     cfg: RLPostTrainConfig,
     metricx_scorer: MetricXQEScorer | None,
     xcomet_scorer: XCometXLScorer | None,
     mqm_scorer: OpenAICompatibleMQMScorer | None,
+    esa_scorer: OpenAICompatibleESAScorer | None,
     metricx_cache: dict[tuple[str, str, str], float],
     xcomet_cache: dict[tuple[str, str, str], tuple[float, list[dict[str, Any]]]],
     mqm_cache: dict[tuple[str, str, str], tuple[float, list[dict[str, Any]]]],
+    esa_cache: dict[tuple[str, str, str], float],
 ) -> tuple[list[list[float]], dict[str, float], dict[str, float]]:
     def _sanitize(values: list[float], fallback: float) -> tuple[list[float], int]:
         out: list[float] = []
@@ -1711,21 +1742,24 @@ def _prepare_rewards_and_advantages(
     metricx_enabled = cfg.reward.metricx.enabled and metricx_scorer is not None
     xcomet_enabled = cfg.reward.xcomet.enabled and xcomet_scorer is not None
     mqm_enabled = cfg.reward.mqm.enabled and mqm_scorer is not None
+    esa_enabled = cfg.reward.esa.enabled and esa_scorer is not None
 
     metricx_scores = [cfg.reward.metricx.offset for _ in rollouts]
     xcomet_scores = [0.0 for _ in rollouts]
     mqm_scores = [0.0 for _ in rollouts]
+    esa_scores = [0.0 for _ in rollouts]
     span_rows = [[] for _ in rollouts]
     mqm_span_rows = [[] for _ in rollouts]
 
-    enabled_scorers = sum(int(flag) for flag in (metricx_enabled, xcomet_enabled, mqm_enabled))
+    enabled_scorers = sum(int(flag) for flag in (metricx_enabled, xcomet_enabled, mqm_enabled, esa_enabled))
     if enabled_scorers > 1:
         logger.info(
-            "reward scoring: running scorers in parallel for %s rollouts (metricx=%s xcomet=%s mqm=%s)",
+            "reward scoring: running scorers in parallel for %s rollouts (metricx=%s xcomet=%s mqm=%s esa=%s)",
             len(rollouts),
             metricx_enabled,
             xcomet_enabled,
             mqm_enabled,
+            esa_enabled,
         )
         with ThreadPoolExecutor(max_workers=enabled_scorers, thread_name_prefix="reward-scorer") as executor:
             futures: dict[str, Any] = {}
@@ -1753,12 +1787,22 @@ def _prepare_rewards_and_advantages(
                     cache=mqm_cache,
                     use_cache=cfg.reward.cache_enabled and cfg.reward.mqm.enabled,
                 )
+            if esa_enabled:
+                futures["esa"] = executor.submit(
+                    _score_with_cache_esa,
+                    samples=samples,
+                    scorer=esa_scorer,
+                    cache=esa_cache,
+                    use_cache=cfg.reward.cache_enabled and cfg.reward.esa.enabled,
+                )
             if "metricx" in futures:
                 metricx_scores = futures["metricx"].result()
             if "xcomet" in futures:
                 xcomet_scores, span_rows = futures["xcomet"].result()
             if "mqm" in futures:
                 mqm_scores, mqm_span_rows = futures["mqm"].result()
+            if "esa" in futures:
+                esa_scores = futures["esa"].result()
     else:
         if metricx_enabled:
             metricx_scores = _score_with_cache_metricx(
@@ -1780,6 +1824,13 @@ def _prepare_rewards_and_advantages(
                 scorer=mqm_scorer,
                 cache=mqm_cache,
                 use_cache=cfg.reward.cache_enabled and cfg.reward.mqm.enabled,
+            )
+        if esa_enabled:
+            esa_scores = _score_with_cache_esa(
+                samples=samples,
+                scorer=esa_scorer,
+                cache=esa_cache,
+                use_cache=cfg.reward.cache_enabled and cfg.reward.esa.enabled,
             )
 
     metricx_scores, metricx_replaced = _sanitize(metricx_scores, fallback=cfg.reward.metricx.offset)
@@ -1812,6 +1863,12 @@ def _prepare_rewards_and_advantages(
             "MQM scorer produced %s non-finite scores; replaced with fallback 0.0.",
             mqm_replaced,
         )
+    esa_scores, esa_replaced = _sanitize(esa_scores, fallback=0.0)
+    if esa_replaced > 0:
+        logger.warning(
+            "ESA scorer produced %s non-finite scores; replaced with fallback 0.0.",
+            esa_replaced,
+        )
     span_rows = [
         [
             *(span_rows[idx] if idx < len(span_rows) else []),
@@ -1830,6 +1887,9 @@ def _prepare_rewards_and_advantages(
         mqm_scores=mqm_scores,
         w_mqm_seq=cfg.reward.w_mqm_seq,
         mqm_seq_scale=cfg.reward.mqm_seq_scale,
+        esa_scores=esa_scores,
+        w_esa_seq=cfg.reward.w_esa_seq,
+        esa_seq_scale=cfg.reward.esa_seq_scale,
     )
 
     token_reward_rows: list[list[float]] = []
@@ -1921,6 +1981,7 @@ def _prepare_rewards_and_advantages(
     metricx_r_m, metricx_r_s = _mean_std(metricx_rewards)
     xcomet_m, xcomet_s = _mean_std(xcomet_scores)
     mqm_m, mqm_s = _mean_std(mqm_scores)
+    esa_m, esa_s = _mean_std(esa_scores)
 
     reward_stats = {
         "metricx_score_mean": metricx_m,
@@ -1931,6 +1992,8 @@ def _prepare_rewards_and_advantages(
         "xcomet_score_std": xcomet_s,
         "mqm_score_mean": mqm_m,
         "mqm_score_std": mqm_s,
+        "esa_score_mean": esa_m,
+        "esa_score_std": esa_s,
         "token_rewards_mean": token_reward_m,
         "token_rewards_std": token_reward_s,
         "token_rewards_non_zero_ratio": float(non_zero_token_ratio),
@@ -2192,7 +2255,12 @@ def _compute_eval_selection_score(report: dict[str, Any], cfg: RLPostTrainConfig
         * float(cfg.reward.w_mqm_seq)
         * float(cfg.reward.mqm_seq_scale)
     )
-    return float(metricx_term + xcomet_term + mqm_term)
+    esa_term = (
+        float(report.get("esa_score_mean", 0.0))
+        * float(cfg.reward.w_esa_seq)
+        * float(cfg.reward.esa_seq_scale)
+    )
+    return float(metricx_term + xcomet_term + mqm_term + esa_term)
 
 
 def _should_enable_xcomet_runtime(cfg: RLPostTrainConfig) -> bool:
@@ -2254,11 +2322,16 @@ def run_metric_only_eval(cfg: RLPostTrainConfig) -> dict[str, Any]:
         cfg.reward.mqm.source_lang = cfg.data.default_src_lang
     if not (cfg.reward.mqm.target_lang or "").strip():
         cfg.reward.mqm.target_lang = cfg.data.default_tgt_lang
+    if not (cfg.reward.esa.source_lang or "").strip():
+        cfg.reward.esa.source_lang = cfg.data.default_src_lang
+    if not (cfg.reward.esa.target_lang or "").strip():
+        cfg.reward.esa.target_lang = cfg.data.default_tgt_lang
 
     metricx_scorer = MetricXQEScorer(cfg.reward.metricx) if cfg.reward.metricx.enabled else None
     xcomet_runtime_enabled = _should_enable_xcomet_runtime(cfg)
     xcomet_scorer = XCometXLScorer(cfg.reward.xcomet) if xcomet_runtime_enabled else None
     mqm_scorer = OpenAICompatibleMQMScorer(cfg.reward.mqm) if cfg.reward.mqm.enabled else None
+    esa_scorer = OpenAICompatibleESAScorer(cfg.reward.esa) if cfg.reward.esa.enabled else None
 
     report = evaluate_on_dataset(
         examples=eval_examples,
@@ -2269,6 +2342,7 @@ def run_metric_only_eval(cfg: RLPostTrainConfig) -> dict[str, Any]:
         metricx_scorer=metricx_scorer,
         xcomet_scorer=xcomet_scorer,
         mqm_scorer=mqm_scorer,
+        esa_scorer=esa_scorer,
         show_progress=True,
     )
     logger.info("Eval report: %s", report)
@@ -2462,6 +2536,10 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
         cfg.reward.mqm.source_lang = cfg.data.default_src_lang
     if not (cfg.reward.mqm.target_lang or "").strip():
         cfg.reward.mqm.target_lang = cfg.data.default_tgt_lang
+    if not (cfg.reward.esa.source_lang or "").strip():
+        cfg.reward.esa.source_lang = cfg.data.default_src_lang
+    if not (cfg.reward.esa.target_lang or "").strip():
+        cfg.reward.esa.target_lang = cfg.data.default_tgt_lang
 
     metricx_scorer = (
         MetricXQEScorer(cfg.reward.metricx) if cfg.reward.metricx.enabled and ((not use_deepspeed) or rank0) else None
@@ -2473,6 +2551,11 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
     mqm_scorer = (
         OpenAICompatibleMQMScorer(cfg.reward.mqm)
         if cfg.reward.mqm.enabled and ((not use_deepspeed) or rank0)
+        else None
+    )
+    esa_scorer = (
+        OpenAICompatibleESAScorer(cfg.reward.esa)
+        if cfg.reward.esa.enabled and ((not use_deepspeed) or rank0)
         else None
     )
 
@@ -2687,6 +2770,7 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
             metricx_scorer=metricx_scorer,
             xcomet_scorer=xcomet_scorer,
             mqm_scorer=mqm_scorer,
+            esa_scorer=esa_scorer,
             collect_outputs=collect_outputs,
             show_progress=show_progress,
             distributed_eval_shard=distributed_eval_shard,
@@ -2697,11 +2781,12 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
     if cfg.eval.run_before_train and eval_examples and start_update <= 1:
         if (not use_deepspeed) or rank0:
             logger.info(
-                "starting eval (run_before_train): examples=%s metricx=%s xcomet=%s mqm=%s",
+                "starting eval (run_before_train): examples=%s metricx=%s xcomet=%s mqm=%s esa=%s",
                 len(eval_examples),
                 bool(metricx_scorer is not None and cfg.reward.metricx.enabled),
                 bool(xcomet_scorer is not None and xcomet_runtime_enabled),
                 bool(mqm_scorer is not None and cfg.reward.mqm.enabled),
+                bool(esa_scorer is not None and cfg.reward.esa.enabled),
             )
         report = _run_eval_once(
             collect_outputs=bool(cfg.logging.save_eval_outputs and ((not use_deepspeed) or rank0)),
@@ -2715,11 +2800,12 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
             if cfg.logging.save_eval_outputs:
                 _log_eval_rows(update_idx=0, eval_rows=eval_rows)
             logger.info(
-                "finished eval (run_before_train): update=0 model_select_score=%.6f metricx=%.4f xcomet=%.4f mqm=%.4f",
+                "finished eval (run_before_train): update=0 model_select_score=%.6f metricx=%.4f xcomet=%.4f mqm=%.4f esa=%.4f",
                 float(eval_select_score),
                 float(report.get("metricx_score_mean", 0.0)),
                 float(report.get("xcomet_score_mean", 0.0)),
                 float(report.get("mqm_score_mean", 0.0)),
+                float(report.get("esa_score_mean", 0.0)),
             )
         _sync_and_save_best_checkpoint(eval_select_score if rank0 else None, update_idx=0)
         _dist_barrier()
@@ -2732,6 +2818,7 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
     metricx_cache: dict[tuple[str, str, str], float] = {}
     xcomet_cache: dict[tuple[str, str, str], tuple[float, list[dict[str, Any]]]] = {}
     mqm_cache: dict[tuple[str, str, str], tuple[float, list[dict[str, Any]]]] = {}
+    esa_cache: dict[tuple[str, str, str], float] = {}
     rng = random.Random(cfg.misc.seed)
     train_indices = list(range(len(train_examples)))
     rng.shuffle(train_indices)
@@ -2840,9 +2927,11 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
                             metricx_scorer=metricx_scorer,
                             xcomet_scorer=xcomet_scorer,
                             mqm_scorer=mqm_scorer,
+                            esa_scorer=esa_scorer,
                             metricx_cache=metricx_cache,
                             xcomet_cache=xcomet_cache,
                             mqm_cache=mqm_cache,
+                            esa_cache=esa_cache,
                         )
                         ref_fill_future = None
                         if cfg.rl.kl_coef > 0:
@@ -2948,9 +3037,11 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
                     metricx_scorer=metricx_scorer,
                     xcomet_scorer=xcomet_scorer,
                     mqm_scorer=mqm_scorer,
+                    esa_scorer=esa_scorer,
                     metricx_cache=metricx_cache,
                     xcomet_cache=xcomet_cache,
                     mqm_cache=mqm_cache,
+                    esa_cache=esa_cache,
                 )
                 if cfg.rl.kl_coef > 0:
                     _ = _fill_missing_reference_logprobs(
@@ -3015,7 +3106,7 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
                 )
 
             logger.info(
-                "update=%s loss=%.6f len=%.2f metricx=%.4f±%.4f xcomet=%.4f±%.4f mqm=%.4f±%.4f token_nonzero=%.4f A(raw)=%.4f/%.4f A(norm)=%.4f/%.4f",
+                "update=%s loss=%.6f len=%.2f metricx=%.4f±%.4f xcomet=%.4f±%.4f mqm=%.4f±%.4f esa=%.4f±%.4f token_nonzero=%.4f A(raw)=%.4f/%.4f A(norm)=%.4f/%.4f",
                 update_idx,
                 train_stats.policy_loss,
                 payload["rollout_avg_completion_len"],
@@ -3025,6 +3116,8 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
                 payload["xcomet_score_std"],
                 payload["mqm_score_mean"],
                 payload["mqm_score_std"],
+                payload["esa_score_mean"],
+                payload["esa_score_std"],
                 payload["token_rewards_non_zero_ratio"],
                 payload["adv_raw_mean"],
                 payload["adv_raw_std"],
@@ -3091,12 +3184,13 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
         ):
             if (not use_deepspeed) or rank0:
                 logger.info(
-                    "starting eval: update=%s examples=%s metricx=%s xcomet=%s mqm=%s",
+                    "starting eval: update=%s examples=%s metricx=%s xcomet=%s mqm=%s esa=%s",
                     update_idx,
                     len(eval_examples),
                     bool(metricx_scorer is not None and cfg.reward.metricx.enabled),
                     bool(xcomet_scorer is not None and xcomet_runtime_enabled),
                     bool(mqm_scorer is not None and cfg.reward.mqm.enabled),
+                    bool(esa_scorer is not None and cfg.reward.esa.enabled),
                 )
             report = _run_eval_once(
                 collect_outputs=bool(cfg.logging.save_eval_outputs and ((not use_deepspeed) or rank0)),
@@ -3110,12 +3204,13 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
                 if cfg.logging.save_eval_outputs:
                     _log_eval_rows(update_idx=update_idx, eval_rows=eval_rows)
                 logger.info(
-                    "finished eval: update=%s model_select_score=%.6f metricx=%.4f xcomet=%.4f mqm=%.4f",
+                    "finished eval: update=%s model_select_score=%.6f metricx=%.4f xcomet=%.4f mqm=%.4f esa=%.4f",
                     update_idx,
                     float(eval_select_score),
                     float(report.get("metricx_score_mean", 0.0)),
                     float(report.get("xcomet_score_mean", 0.0)),
                     float(report.get("mqm_score_mean", 0.0)),
+                    float(report.get("esa_score_mean", 0.0)),
                 )
             _sync_and_save_best_checkpoint(eval_select_score if rank0 else None, update_idx=update_idx)
 

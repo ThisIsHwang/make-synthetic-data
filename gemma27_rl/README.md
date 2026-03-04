@@ -49,7 +49,10 @@ Qwen3.5 + MQM 전용 예시: `configs/qwen35_mqm/`
 - `data.eval_sampling_ratio`: `eval_sampling_count`가 없을 때 dev(eval) 분할 비율
   (`data.eval_sampling_seed` + `data.id_field` 기반 해시로 고정 분할)
 - `generation.num_samples_per_prompt`: GRPO group 크기
-- `reward.metricx.*`, `reward.xcomet.*`, `reward.mqm.*`
+- `reward.metricx.*`, `reward.xcomet.*`, `reward.mqm.*`, `reward.esa.*`
+- `reward.esa.*`: OpenAI-compatible LLM 기반 GEMBA-ESA scalar 점수(0~100) 보상
+- ESA를 MQM과 비슷한 기여도로 시작하려면 `reward.w_esa_seq: 0.2`,
+  `reward.esa_seq_scale: 0.25` 권장 (실효: `ESA*0.05`, 즉 0~100 -> 0~5)
 - `reward.metricx.python_executable`: MetricX를 별도 uv 환경 파이썬으로 실행할 때 지정
 - `reward.xcomet.python_executable`: xCOMET을 별도 uv 환경 파이썬으로 실행할 때 지정
 - `misc.aux_worker_host`: reference/MetricX/xCOMET을 올릴 전용 aux 노드 host (SSH 접속 가능해야 함)

@@ -30,7 +30,7 @@ except Exception as exc:  # pragma: no cover - optional during lightweight tests
     _TRANSFORMERS_IMPORT_ERROR = exc
     AutoTokenizer = None  # type: ignore[assignment]
 
-from .config import MQMConfig, MetricXConfig, XCometConfig
+from .config import ESAConfig, MQMConfig, MetricXConfig, XCometConfig
 from .rl_types import RewardOutput, SampleForScoring
 from .utils import (
     build_worker_launch_command,
@@ -537,6 +537,242 @@ def build_gemba_mqm_messages(
             ),
         },
     ]
+
+
+GEMBA_ESA_SYSTEM_PROMPT = (
+    "Your task is to identify machine translation errors and assess the quality of the translation."
+)
+
+GEMBA_ESA_USER_TASK_PROMPT = (
+    "Based on the source segment and machine translation surrounded with triple backticks, identify "
+    "error types in the translation and classify them. The categories of errors are: accuracy "
+    "(addition, mistranslation, omission, untranslated text), fluency (character encoding, grammar, "
+    "inconsistency, punctuation, register, spelling), style (awkward), terminology (inappropriate for "
+    "context, inconsistent use), non-translation, other, or no-error.\n"
+    "Each error is classified as one of two categories: major or minor. Major errors disrupt the flow "
+    "and make the understandability of text difficult or impossible. Minor errors are errors that do "
+    "not disrupt the flow significantly and what the text is trying to say is still understandable."
+)
+
+GEMBA_ESA_FEWSHOT_ASSISTANT_1 = dedent(
+    """\
+    Major:
+    accuracy/mistranslation - "involvement"
+    accuracy/omission - "the account holder"
+    Minor:
+    fluency/grammar - "wäre"
+    fluency/register - "dir"
+    """
+).strip()
+
+GEMBA_ESA_FEWSHOT_ASSISTANT_2 = dedent(
+    """\
+    Major:
+    accuracy/addition - "ve Vídni"
+    accuracy/omission - "the stop-start"
+    Minor:
+    terminology/inappropriate for context - "partaje"
+    """
+).strip()
+
+GEMBA_ESA_FEWSHOT_ASSISTANT_3 = dedent(
+    """\
+    Major:
+    accuracy/addition - "of high-speed rail"
+    accuracy/mistranslation - "go to the reviews"
+    Minor:
+    style/awkward - "etc.,"
+    """
+).strip()
+
+GEMBA_ESA_RANKING_PROMPT_TEMPLATE = (
+    "Given the translation from {source_lang} to {target_lang} and the annotated error spans, "
+    "assign a score on a continuous scale from 0 to 100. The scale has following reference points: "
+    '0="No meaning preserved", 33="Some meaning preserved", '
+    '66="Most meaning preserved and few grammar mistakes", '
+    'up to 100="Perfect meaning and grammar".\n\n'
+    "Score the following translation from {source_lang} source:\n"
+    "```{source_seg}```\n"
+    "{target_lang} translation:\n"
+    "```{target_seg}```\n"
+    "Annotated error spans:\n"
+    "```{error_spans}```\n"
+    "Score (0-100):"
+)
+
+_ESA_SCORE_PATTERNS: tuple[str, ...] = (
+    r"score\s*(?:\(\s*0\s*-\s*100\s*\))?\s*[:=]\s*(-?\d+(?:\.\d+)?)",
+    r"(-?\d+(?:\.\d+)?)\s*/\s*100",
+    r"(-?\d+(?:\.\d+)?)",
+)
+
+
+def _gemba_esa_error_user_message(
+    *,
+    source_lang: str,
+    target_lang: str,
+    source_seg: str,
+    target_seg: str,
+) -> str:
+    return (
+        f"{source_lang} source:\n"
+        f"```{source_seg}```\n"
+        f"{target_lang} translation:\n"
+        f"```{target_seg}```\n\n"
+        f"{GEMBA_ESA_USER_TASK_PROMPT}"
+    )
+
+
+def build_gemba_esa_error_messages(
+    *,
+    source_lang: str,
+    target_lang: str,
+    source_seg: str,
+    target_seg: str,
+    use_fewshot: bool = True,
+) -> list[dict[str, str]]:
+    messages: list[dict[str, str]] = [{"role": "system", "content": GEMBA_ESA_SYSTEM_PROMPT}]
+    if use_fewshot:
+        messages.extend(
+            [
+                {"role": "user", "content": _gemba_esa_error_user_message(
+                    source_lang="English",
+                    target_lang="German",
+                    source_seg=(
+                        "I do apologise about this, we must gain permission from the account holder to discuss "
+                        "an order with another person, I apologise if this was done previously, however, I would "
+                        "not be able to discuss this with yourself without the account holders permission."
+                    ),
+                    target_seg=(
+                        "Ich entschuldige mich dafür, wir müssen die Erlaubnis einholen, um eine Bestellung mit "
+                        "einer anderen Person zu besprechen. Ich entschuldige mich, falls dies zuvor geschehen "
+                        "wäre, aber ohne die Erlaubnis des Kontoinhabers wäre ich nicht in der Lage, dies mit dir "
+                        "involvement."
+                    ),
+                )},
+                {"role": "assistant", "content": GEMBA_ESA_FEWSHOT_ASSISTANT_1},
+                {"role": "user", "content": _gemba_esa_error_user_message(
+                    source_lang="English",
+                    target_lang="Czech",
+                    source_seg=(
+                        "Talks have resumed in Vienna to try to revive the nuclear pact, with both sides trying "
+                        "to gauge the prospects of success after the latest exchanges in the stop-start negotiations."
+                    ),
+                    target_seg=(
+                        "Ve Vídni se ve Vídni obnovily rozhovory o oživení jaderného paktu, přičemž obě partaje "
+                        "se snaží posoudit vyhlídky na úspěch po posledních výměnách v jednáních."
+                    ),
+                )},
+                {"role": "assistant", "content": GEMBA_ESA_FEWSHOT_ASSISTANT_2},
+                {"role": "user", "content": _gemba_esa_error_user_message(
+                    source_lang="Chinese",
+                    target_lang="English",
+                    source_seg=(
+                        "大众点评乌鲁木齐家居卖场频道为您提供高铁居然之家地址，电话，营业时间等最新商户信息，找装修公司，就上大众点评"
+                    ),
+                    target_seg=(
+                        "Urumqi Home Furnishing Store Channel provides you with the latest business information "
+                        "such as the address, telephone number, business hours, etc., of high-speed rail, and "
+                        "find a decoration company, and go to the reviews."
+                    ),
+                )},
+                {"role": "assistant", "content": GEMBA_ESA_FEWSHOT_ASSISTANT_3},
+            ]
+        )
+    messages.append(
+        {
+            "role": "user",
+            "content": _gemba_esa_error_user_message(
+                source_lang=source_lang,
+                target_lang=target_lang,
+                source_seg=source_seg,
+                target_seg=target_seg,
+            ),
+        }
+    )
+    return messages
+
+
+def gemba_esa_parse_errors(model_output: str) -> dict[str, list[str]]:
+    errors: dict[str, list[str]] = {"major": [], "minor": []}
+    level: str | None = None
+
+    for raw_line in str(model_output).splitlines():
+        line = raw_line.strip()
+        line_l = line.lower()
+        if (not line) or ("no-error" in line_l) or ("no error" in line_l):
+            continue
+        if line_l == "major:":
+            level = "major"
+            continue
+        if line_l == "minor:":
+            level = "minor"
+            continue
+        if level is None:
+            continue
+        if "non-translation" in line_l:
+            errors["major"].append(line)
+        else:
+            errors[level].append(line)
+    return errors
+
+
+def gemba_esa_format_error_spans(model_output: str | None) -> str:
+    if model_output is None:
+        return "no-error"
+    parsed = gemba_esa_parse_errors(model_output)
+    lines: list[str] = []
+    if parsed["major"]:
+        lines.append("Major:")
+        lines.extend(parsed["major"])
+    if parsed["minor"]:
+        lines.append("Minor:")
+        lines.extend(parsed["minor"])
+    if not lines:
+        return "no-error"
+    return "\n".join(lines)
+
+
+def gemba_esa_parse_score(model_output: str | None) -> float | None:
+    if model_output is None:
+        return None
+    text = str(model_output)
+    for pattern in _ESA_SCORE_PATTERNS[:2]:
+        found = re.search(pattern, text, flags=re.IGNORECASE)
+        if found:
+            try:
+                value = float(found.group(1))
+            except Exception:
+                value = math.nan
+            if math.isfinite(value):
+                return value
+    all_numbers = re.findall(_ESA_SCORE_PATTERNS[2], text, flags=re.IGNORECASE)
+    for raw in reversed(all_numbers):
+        try:
+            value = float(raw)
+        except Exception:
+            continue
+        if math.isfinite(value):
+            return value
+    return None
+
+
+def build_gemba_esa_ranking_messages(
+    *,
+    source_lang: str,
+    target_lang: str,
+    source_seg: str,
+    target_seg: str,
+    error_spans: str,
+) -> list[dict[str, str]]:
+    prompt = GEMBA_ESA_RANKING_PROMPT_TEMPLATE.format(
+        source_lang=source_lang,
+        target_lang=target_lang,
+        source_seg=source_seg,
+        target_seg=target_seg,
+        error_spans=error_spans or "no-error",
+    )
+    return [{"role": "user", "content": prompt}]
 
 
 def metricx_qe_input(src: str, mt: str) -> str:
@@ -1430,6 +1666,252 @@ class OpenAICompatibleMQMScorer:
                 return text
 
         raise RuntimeError("MQM API response format is unsupported.")
+
+    def _scale_score(self, score: float) -> float:
+        lo = float(self.cfg.score_min)
+        hi = float(self.cfg.score_max)
+        clipped = min(max(float(score), lo), hi)
+        if not self.cfg.scale_to_unit_interval:
+            return clipped
+        return (clipped - lo) / max(1e-8, hi - lo)
+
+
+@dataclass
+class OpenAICompatibleESAScorer:
+    cfg: ESAConfig
+    predict_fn: Callable[[list[SampleForScoring]], list[float]] | None = None
+
+    def __post_init__(self) -> None:
+        self._chat_url: str | None = None
+        self._api_key: str | None = None
+        if self.predict_fn is not None or not self.cfg.enabled:
+            return
+
+        if not self.cfg.base_url or not str(self.cfg.base_url).strip():
+            raise ValueError("ESA scorer requires cfg.base_url when enabled.")
+        self._chat_url = self._resolve_chat_url(self.cfg.base_url)
+
+        if self.cfg.api_key and str(self.cfg.api_key).strip():
+            self._api_key = str(self.cfg.api_key).strip()
+        else:
+            env_name = (self.cfg.api_key_env or "OPENAI_API_KEY").strip()
+            self._api_key = os.environ.get(env_name) or os.environ.get("OPENAI_API_KEY")
+            if self._api_key and self._api_key.strip():
+                self._api_key = self._api_key.strip()
+            else:
+                self._api_key = None
+
+    @staticmethod
+    def _resolve_chat_url(base_url: str) -> str:
+        url = str(base_url).strip().rstrip("/")
+        if not url:
+            raise ValueError("ESA base_url must not be empty.")
+        if url.endswith("/chat/completions"):
+            return url
+        if url.endswith("/v1"):
+            return f"{url}/chat/completions"
+        return f"{url}/v1/chat/completions"
+
+    def score_batch(self, samples: list[SampleForScoring]) -> RewardOutput:
+        if not samples:
+            return RewardOutput(sequence_scores=[], metadata={"raw_error_outputs": [], "raw_score_outputs": []})
+
+        if self.predict_fn is not None:
+            scores = [float(v) for v in self.predict_fn(samples)]
+            return RewardOutput(
+                sequence_scores=scores,
+                metadata={"raw_error_outputs": ["" for _ in samples], "raw_score_outputs": ["" for _ in samples]},
+            )
+
+        if self._chat_url is None:
+            raise RuntimeError("OpenAICompatibleESAScorer is not initialized.")
+
+        sequence_scores: list[float] = []
+        raw_error_outputs: list[str] = []
+        raw_score_outputs: list[str] = []
+        max_workers = max(1, int(self.cfg.batch_size))
+        if max_workers == 1:
+            for sample in samples:
+                score, raw_error_text, raw_score_text = self._score_one_sample(sample)
+                sequence_scores.append(score)
+                raw_error_outputs.append(raw_error_text)
+                raw_score_outputs.append(raw_score_text)
+        else:
+            with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="esa-scorer") as executor:
+                for i in range(0, len(samples), max_workers):
+                    batch_samples = samples[i : i + max_workers]
+                    futures = [executor.submit(self._score_one_sample, sample) for sample in batch_samples]
+                    batch_results = [future.result() for future in futures]
+                    for score, raw_error_text, raw_score_text in batch_results:
+                        sequence_scores.append(score)
+                        raw_error_outputs.append(raw_error_text)
+                        raw_score_outputs.append(raw_score_text)
+
+        return RewardOutput(
+            sequence_scores=sequence_scores,
+            metadata={"raw_error_outputs": raw_error_outputs, "raw_score_outputs": raw_score_outputs},
+        )
+
+    def _score_one_sample(self, sample: SampleForScoring) -> tuple[float, str, str]:
+        retries = max(0, int(self.cfg.max_retries))
+        last_exc: Exception | None = None
+        for attempt in range(retries + 1):
+            try:
+                raw_error_text = self._call_openai_compatible_api(
+                    build_gemba_esa_error_messages(
+                        source_lang=self.cfg.source_lang,
+                        target_lang=self.cfg.target_lang,
+                        source_seg=sample.src,
+                        target_seg=sample.mt,
+                        use_fewshot=bool(self.cfg.use_fewshot),
+                    ),
+                    max_tokens=int(self.cfg.max_tokens_error_spans),
+                )
+                normalized_error_spans = gemba_esa_format_error_spans(raw_error_text)
+                raw_score_text = self._call_openai_compatible_api(
+                    build_gemba_esa_ranking_messages(
+                        source_lang=self.cfg.source_lang,
+                        target_lang=self.cfg.target_lang,
+                        source_seg=sample.src,
+                        target_seg=sample.mt,
+                        error_spans=normalized_error_spans,
+                    ),
+                    max_tokens=int(self.cfg.max_tokens_score),
+                )
+                raw_score = gemba_esa_parse_score(raw_score_text)
+                if raw_score is None:
+                    raise RuntimeError("GEMBA-ESA score parse returned None.")
+                scaled = self._scale_score(float(raw_score))
+                return float(scaled), raw_error_text, raw_score_text
+            except Exception as exc:
+                last_exc = exc
+                if attempt < retries:
+                    continue
+                break
+
+        try:
+            raise RuntimeError("ESA API scoring failed.") from last_exc
+        except Exception as exc:
+            if self.cfg.error_policy == "zero":
+                logger.warning("ESA API scoring failed; fallback score=0.0 due to error_policy=zero: %s", exc)
+                return 0.0, "", ""
+            raise
+
+    def _call_openai_compatible_api(self, messages: list[dict[str, str]], *, max_tokens: int) -> str:
+        if self._chat_url is None:
+            raise RuntimeError("ESA scorer chat URL is not set.")
+
+        log_io = _env_flag("GEMMA27_RL_LOG_ESA_IO", default=False)
+        log_max_chars = _env_int("GEMMA27_RL_LOG_ESA_IO_MAX_CHARS", default=20000, minimum=256)
+        payload = {
+            "model": self.cfg.model_name,
+            "messages": messages,
+            "temperature": float(self.cfg.temperature),
+            "top_p": float(self.cfg.top_p),
+            "max_tokens": int(max_tokens),
+        }
+        if self.cfg.top_k is not None:
+            payload["top_k"] = int(self.cfg.top_k)
+        if self.cfg.presence_penalty is not None:
+            payload["presence_penalty"] = float(self.cfg.presence_penalty)
+        if self.cfg.repetition_penalty is not None:
+            payload["repetition_penalty"] = float(self.cfg.repetition_penalty)
+        if self.cfg.stop:
+            payload["stop"] = list(self.cfg.stop)
+        if self.cfg.chat_template_kwargs:
+            payload["chat_template_kwargs"] = dict(self.cfg.chat_template_kwargs)
+        if log_io:
+            try:
+                payload_text = json.dumps(payload, ensure_ascii=False)
+            except Exception:
+                payload_text = repr(payload)
+            logger.info(
+                "[esa-io] request url=%s payload=%s",
+                self._chat_url,
+                _truncate_for_log(payload_text, log_max_chars),
+            )
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+        req = urllib_request.Request(
+            self._chat_url,
+            data=body,
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        if self._api_key:
+            req.add_header("Authorization", f"Bearer {self._api_key}")
+
+        try:
+            timeout = float(self.cfg.timeout_s or self.cfg.timeout_sec)
+            restore_proxy_env = _temporarily_unset_proxy_env()
+            try:
+                opener = urllib_request.build_opener(urllib_request.ProxyHandler({}))
+                with opener.open(req, timeout=timeout) as resp:
+                    resp_body = resp.read().decode("utf-8")
+                    if log_io:
+                        logger.info(
+                            "[esa-io] response_body=%s",
+                            _truncate_for_log(resp_body, log_max_chars),
+                        )
+            finally:
+                restore_proxy_env()
+        except urllib_error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            if log_io:
+                logger.error(
+                    "[esa-io] http_error status=%s body=%s",
+                    exc.code,
+                    _truncate_for_log(detail, log_max_chars),
+                )
+            raise RuntimeError(f"ESA API HTTPError status={exc.code} body={detail}") from exc
+        except urllib_error.URLError as exc:
+            if log_io:
+                logger.error("[esa-io] url_error=%s", exc)
+            raise RuntimeError(f"ESA API URLError: {exc}") from exc
+
+        try:
+            parsed = json.loads(resp_body)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("ESA API response is not valid JSON.") from exc
+
+        choices = parsed.get("choices")
+        if not isinstance(choices, list) or not choices:
+            raise RuntimeError("ESA API response has no choices.")
+        first = choices[0]
+        if isinstance(first, dict):
+            msg = first.get("message")
+            if isinstance(msg, dict):
+                content = msg.get("content")
+                if isinstance(content, str):
+                    if log_io:
+                        logger.info(
+                            "[esa-io] parsed_content=%s",
+                            _truncate_for_log(content, log_max_chars),
+                        )
+                    return content
+                if isinstance(content, list):
+                    text_parts = []
+                    for item in content:
+                        if isinstance(item, dict) and isinstance(item.get("text"), str):
+                            text_parts.append(item["text"])
+                    if text_parts:
+                        joined = "\n".join(text_parts)
+                        if log_io:
+                            logger.info(
+                                "[esa-io] parsed_content=%s",
+                                _truncate_for_log(joined, log_max_chars),
+                            )
+                        return joined
+            text = first.get("text")
+            if isinstance(text, str):
+                if log_io:
+                    logger.info(
+                        "[esa-io] parsed_content=%s",
+                        _truncate_for_log(text, log_max_chars),
+                    )
+                return text
+
+        raise RuntimeError("ESA API response format is unsupported.")
 
     def _scale_score(self, score: float) -> float:
         lo = float(self.cfg.score_min)

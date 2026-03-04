@@ -17,7 +17,13 @@ except Exception:  # pragma: no cover - optional for lightweight tests
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
 from .config import GenerationConfig, RLPostTrainConfig
-from .rewards import OpenAICompatibleMQMScorer, MetricXQEScorer, XCometXLScorer, metricx_score_to_reward
+from .rewards import (
+    OpenAICompatibleESAScorer,
+    OpenAICompatibleMQMScorer,
+    MetricXQEScorer,
+    XCometXLScorer,
+    metricx_score_to_reward,
+)
 from .rollout import generate_rollouts
 from .rl_types import Example, Rollout, SampleForScoring
 
@@ -215,6 +221,7 @@ def evaluate_on_dataset(
     metricx_scorer: MetricXQEScorer | None = None,
     xcomet_scorer: XCometXLScorer | None = None,
     mqm_scorer: OpenAICompatibleMQMScorer | None = None,
+    esa_scorer: OpenAICompatibleESAScorer | None = None,
     collect_outputs: bool = False,
     show_progress: bool = False,
     distributed_eval_shard: bool = False,
@@ -227,6 +234,8 @@ def evaluate_on_dataset(
             "metricx_reward_mean": 0.0,
             "xcomet_score_mean": 0.0,
             "mqm_score_mean": 0.0,
+            "esa_score_mean": 0.0,
+            "esa_score_std": 0.0,
             "avg_span_count": 0.0,
             "severity_counts": {},
             "avg_completion_len": 0.0,
@@ -332,12 +341,14 @@ def evaluate_on_dataset(
     metricx_rewards = [0.0 for _ in rollouts]
     xcomet_scores = [0.0 for _ in rollouts]
     mqm_scores = [0.0 for _ in rollouts]
+    esa_scores = [0.0 for _ in rollouts]
     spans: list[list[dict[str, Any]]] = [[] for _ in rollouts]
     mqm_spans: list[list[dict[str, Any]]] = [[] for _ in rollouts]
 
     metricx_enabled = metricx_scorer is not None and cfg.reward.metricx.enabled
     xcomet_enabled = xcomet_scorer is not None and cfg.reward.xcomet.enabled
     mqm_enabled = mqm_scorer is not None and cfg.reward.mqm.enabled
+    esa_enabled = esa_scorer is not None and cfg.reward.esa.enabled
 
     def _score_metricx_eval() -> tuple[list[float], list[float]]:
         metricx_local_scores = metricx_scorer.score_batch(samples).sequence_scores  # type: ignore[union-attr]
@@ -393,13 +404,27 @@ def evaluate_on_dataset(
                 mqm_local_scores[idx] = 0.0
         return mqm_local_scores, mqm_local_spans
 
-    enabled_scorers = sum(int(flag) for flag in (metricx_enabled, xcomet_enabled, mqm_enabled))
+    def _score_esa_eval() -> list[float]:
+        esa_out = esa_scorer.score_batch(samples)
+        esa_local_scores = esa_out.sequence_scores
+        non_finite_idx = [idx for idx, value in enumerate(esa_local_scores) if not math.isfinite(float(value))]
+        if non_finite_idx:
+            logger.warning(
+                "ESA scorer produced %s non-finite eval scores; replacing with 0.0.",
+                len(non_finite_idx),
+            )
+            for idx in non_finite_idx:
+                esa_local_scores[idx] = 0.0
+        return esa_local_scores
+
+    enabled_scorers = sum(int(flag) for flag in (metricx_enabled, xcomet_enabled, mqm_enabled, esa_enabled))
     if enabled_scorers > 1:
         logger.info(
-            "evaluate_on_dataset: scoring in parallel (metricx=%s xcomet=%s mqm=%s)...",
+            "evaluate_on_dataset: scoring in parallel (metricx=%s xcomet=%s mqm=%s esa=%s)...",
             metricx_enabled,
             xcomet_enabled,
             mqm_enabled,
+            esa_enabled,
         )
         with ThreadPoolExecutor(max_workers=enabled_scorers, thread_name_prefix="eval-scorer") as executor:
             futures: dict[str, Any] = {}
@@ -409,12 +434,16 @@ def evaluate_on_dataset(
                 futures["xcomet"] = executor.submit(_score_xcomet_eval)
             if mqm_enabled:
                 futures["mqm"] = executor.submit(_score_mqm_eval)
+            if esa_enabled:
+                futures["esa"] = executor.submit(_score_esa_eval)
             if "metricx" in futures:
                 metricx_scores, metricx_rewards = futures["metricx"].result()
             if "xcomet" in futures:
                 xcomet_scores, spans = futures["xcomet"].result()
             if "mqm" in futures:
                 mqm_scores, mqm_spans = futures["mqm"].result()
+            if "esa" in futures:
+                esa_scores = futures["esa"].result()
     else:
         if metricx_enabled:
             logger.info("evaluate_on_dataset: scoring metricx...")
@@ -425,6 +454,9 @@ def evaluate_on_dataset(
         if mqm_enabled:
             logger.info("evaluate_on_dataset: scoring mqm...")
             mqm_scores, mqm_spans = _score_mqm_eval()
+        if esa_enabled:
+            logger.info("evaluate_on_dataset: scoring esa...")
+            esa_scores = _score_esa_eval()
     spans = [
         [
             *(spans[idx] if idx < len(spans) else []),
@@ -444,6 +476,7 @@ def evaluate_on_dataset(
     metricx_r_m, metricx_r_s = _mean_std(metricx_rewards)
     xcomet_m, xcomet_s = _mean_std(xcomet_scores)
     mqm_m, mqm_s = _mean_std(mqm_scores)
+    esa_m, esa_s = _mean_std(esa_scores)
     avg_completion_len = mean([len(r.completion_token_ids) for r in rollouts]) if rollouts else 0.0
 
     report = {
@@ -455,6 +488,8 @@ def evaluate_on_dataset(
         "xcomet_score_std": xcomet_s,
         "mqm_score_mean": mqm_m,
         "mqm_score_std": mqm_s,
+        "esa_score_mean": esa_m,
+        "esa_score_std": esa_s,
         "avg_span_count": mean(span_counts) if span_counts else 0.0,
         "severity_counts": dict(severity),
         "avg_completion_len": float(avg_completion_len),
@@ -474,7 +509,7 @@ def evaluate_on_dataset(
             completion_decoded_with_specials = _safe_decode_ids_with_specials(tokenizer, completion_ids)
             logger.info(
                 "[raw-io][eval][scored] idx=%s example_id=%s src=%r ref=%r mt=%r metricx=%.6f metricx_reward=%.6f "
-                "xcomet=%.6f mqm=%.6f completion_ids=%s completion_tokens=%s completion_decoded_with_specials=%r spans=%s",
+                "xcomet=%.6f mqm=%.6f esa=%.6f completion_ids=%s completion_tokens=%s completion_decoded_with_specials=%r spans=%s",
                 idx,
                 rollout.example_id,
                 _truncate_for_log(rollout.src_text, raw_io_max_chars),
@@ -484,6 +519,7 @@ def evaluate_on_dataset(
                 float(metricx_rewards[idx]) if idx < len(metricx_rewards) else 0.0,
                 float(xcomet_scores[idx]) if idx < len(xcomet_scores) else 0.0,
                 float(mqm_scores[idx]) if idx < len(mqm_scores) else 0.0,
+                float(esa_scores[idx]) if idx < len(esa_scores) else 0.0,
                 _truncate_for_log(str(completion_ids), raw_io_max_chars),
                 _truncate_for_log(str(completion_tokens), raw_io_max_chars),
                 _truncate_for_log(completion_decoded_with_specials, raw_io_max_chars),
@@ -505,6 +541,7 @@ def evaluate_on_dataset(
                     "metricx_reward": float(metricx_rewards[idx]) if idx < len(metricx_rewards) else 0.0,
                     "xcomet_score": float(xcomet_scores[idx]) if idx < len(xcomet_scores) else 0.0,
                     "mqm_score": float(mqm_scores[idx]) if idx < len(mqm_scores) else 0.0,
+                    "esa_score": float(esa_scores[idx]) if idx < len(esa_scores) else 0.0,
                     "span_count": len(span_row),
                     "error_spans": span_row,
                 }
@@ -523,9 +560,10 @@ def evaluate_on_dataset(
             report = synced
 
     logger.info(
-        "evaluate_on_dataset: done metricx=%.4f xcomet=%.4f mqm=%.4f",
+        "evaluate_on_dataset: done metricx=%.4f xcomet=%.4f mqm=%.4f esa=%.4f",
         float(report.get("metricx_score_mean", 0.0)),
         float(report.get("xcomet_score_mean", 0.0)),
         float(report.get("mqm_score_mean", 0.0)),
+        float(report.get("esa_score_mean", 0.0)),
     )
     return report
