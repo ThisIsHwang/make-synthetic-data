@@ -59,6 +59,7 @@ from .utils import (
 
 
 logger = logging.getLogger(__name__)
+_ESA_ALL_ZERO_WARNED = False
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -1221,6 +1222,7 @@ def _append_rollout_jsonl(
                 "metricx_score_mean_batch": reward_stats.get("metricx_score_mean", 0.0),
                 "xcomet_score_mean_batch": reward_stats.get("xcomet_score_mean", 0.0),
                 "mqm_score_mean_batch": reward_stats.get("mqm_score_mean", 0.0),
+                "esa_score_mean_batch": reward_stats.get("esa_score_mean", 0.0),
                 "token_rewards_non_zero_ratio_batch": reward_stats.get("token_rewards_non_zero_ratio", 0.0),
             }
             f.write(json.dumps(payload, ensure_ascii=False) + "\n")
@@ -1721,6 +1723,8 @@ def _prepare_rewards_and_advantages(
     mqm_cache: dict[tuple[str, str, str], tuple[float, list[dict[str, Any]]]],
     esa_cache: dict[tuple[str, str, str], float],
 ) -> tuple[list[list[float]], dict[str, float], dict[str, float]]:
+    global _ESA_ALL_ZERO_WARNED
+
     def _sanitize(values: list[float], fallback: float) -> tuple[list[float], int]:
         out: list[float] = []
         replaced = 0
@@ -1868,6 +1872,20 @@ def _prepare_rewards_and_advantages(
         logger.warning(
             "ESA scorer produced %s non-finite scores; replaced with fallback 0.0.",
             esa_replaced,
+        )
+    if (
+        esa_enabled
+        and esa_scores
+        and (not _ESA_ALL_ZERO_WARNED)
+        and all(abs(float(v)) <= 1e-12 for v in esa_scores)
+    ):
+        _ESA_ALL_ZERO_WARNED = True
+        logger.warning(
+            "ESA scores are all 0.0 for this batch (n=%s). "
+            "Check reward.esa.score_min/score_max (recommended 0..100), "
+            "reward.esa.error_policy (zero can hide API failures), and ESA API logs "
+            "(GEMMA27_RL_LOG_ESA_IO=1).",
+            len(esa_scores),
         )
     span_rows = [
         [
@@ -2558,6 +2576,35 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
         if cfg.reward.esa.enabled and ((not use_deepspeed) or rank0)
         else None
     )
+    if rank0:
+        effective_esa_weight = float(cfg.reward.w_esa_seq) * float(cfg.reward.esa_seq_scale)
+        logger.info(
+            "reward config: esa_enabled=%s esa_runtime=%s w_esa_seq=%.6f esa_seq_scale=%.6f "
+            "effective_esa_weight=%.6f score_range=[%.3f, %.3f] scale_to_unit_interval=%s error_policy=%s",
+            bool(cfg.reward.esa.enabled),
+            bool(esa_scorer is not None),
+            float(cfg.reward.w_esa_seq),
+            float(cfg.reward.esa_seq_scale),
+            effective_esa_weight,
+            float(cfg.reward.esa.score_min),
+            float(cfg.reward.esa.score_max),
+            bool(cfg.reward.esa.scale_to_unit_interval),
+            str(cfg.reward.esa.error_policy),
+        )
+        if cfg.reward.esa.enabled and abs(effective_esa_weight) <= 0.0:
+            logger.warning(
+                "ESA is enabled but effective sequence weight is 0.0 "
+                "(w_esa_seq * esa_seq_scale == 0). ESA score will not affect loss."
+            )
+        if cfg.reward.esa.enabled and float(cfg.reward.esa.score_max) <= 0.0:
+            logger.warning(
+                "reward.esa.score_max <= 0.0. GEMBA-ESA usually returns 0..100, "
+                "so outputs may clip to 0.0. Recommended range is score_min=0, score_max=100."
+            )
+        if cfg.reward.esa.enabled and str(cfg.reward.esa.error_policy).strip().lower() == "zero":
+            logger.warning(
+                "reward.esa.error_policy=zero: ESA API/parsing failures are converted to 0.0."
+            )
 
     if not use_deepspeed:
         optimizer = torch.optim.AdamW(
@@ -2574,6 +2621,7 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
                 logger.warning("Resume checkpoint has no optimizer.pt: %s", resume_ckpt)
     elif is_resuming and resume_ckpt is not None:
         if _is_deepspeed_checkpoint_dir(resume_ckpt):
+            ds_resume_failed = False
             try:
                 load_path, _ = train_model.load_checkpoint(
                     str(resume_ckpt),
@@ -2583,8 +2631,32 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
                 )
                 if load_path is None and rank0:
                     logger.warning("DeepSpeed resume checkpoint could not be loaded from %s", resume_ckpt)
+                    ds_resume_failed = True
+            except AssertionError as exc:
+                # DeepSpeed can assert on empty ckpt shard list when shard files are
+                # missing for current rank/world-size. In that case, keep model
+                # weights already loaded from `policy_source` and reset optimizer.
+                text = str(exc)
+                if ("ckpt_list" in text) or ("len(self.ckpt_list)" in text):
+                    ds_resume_failed = True
+                    if rank0:
+                        logger.warning(
+                            "DeepSpeed optimizer-state resume failed from %s due to shard mismatch (%s). "
+                            "Continuing with model weights from %s and resetting optimizer state.",
+                            resume_ckpt,
+                            text or type(exc).__name__,
+                            policy_source,
+                        )
+                else:
+                    raise RuntimeError(f"Failed to load DeepSpeed checkpoint from {resume_ckpt}") from exc
             except Exception as exc:
                 raise RuntimeError(f"Failed to load DeepSpeed checkpoint from {resume_ckpt}") from exc
+            if ds_resume_failed and rank0:
+                logger.warning(
+                    "DeepSpeed resume fallback active: start_update=%s (from trainer_state), "
+                    "but optimizer/momentum states were not restored.",
+                    start_update,
+                )
         elif rank0:
             logger.warning(
                 "Resume checkpoint has no DeepSpeed shard states: %s. "
