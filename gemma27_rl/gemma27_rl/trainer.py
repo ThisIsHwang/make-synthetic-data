@@ -60,6 +60,9 @@ from .utils import (
 
 logger = logging.getLogger(__name__)
 _ESA_ALL_ZERO_WARNED = False
+_FORBIDDEN_THINK_TAGS: tuple[str, ...] = ("<think>", "</think>")
+_DEFAULT_THINK_TAG_TOKEN_PENALTY = -100.0
+_DEFAULT_THINK_TAG_SEQUENCE_PENALTY = -30.0
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -78,6 +81,16 @@ def _env_int(name: str, default: int, minimum: int = 1) -> int:
     except Exception:
         return max(minimum, int(default))
     return max(minimum, value)
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None:
+        return float(default)
+    try:
+        return float(raw.strip())
+    except Exception:
+        return float(default)
 
 
 def _span_overlap_chars(start: int, end: int, tok_s: int, tok_e: int) -> int:
@@ -112,6 +125,48 @@ def _short_text(text: str, limit: int = 120) -> str:
     if len(clean) <= limit:
         return clean
     return clean[:limit] + "..."
+
+
+def _find_forbidden_think_tag_spans(text: str) -> list[tuple[int, int, str]]:
+    text_lc = text.lower()
+    matches: list[tuple[int, int, str]] = []
+    for tag in _FORBIDDEN_THINK_TAGS:
+        tag_lc = tag.lower()
+        start = 0
+        while True:
+            idx = text_lc.find(tag_lc, start)
+            if idx < 0:
+                break
+            matches.append((idx, idx + len(tag), tag))
+            start = idx + len(tag_lc)
+    matches.sort(key=lambda row: row[0])
+    return matches
+
+
+def _apply_forbidden_think_tag_penalty(
+    *,
+    completion_text: str,
+    token_char_offsets: list[tuple[int, int]],
+    token_rewards: list[float],
+    seq_reward: float,
+    token_penalty: float,
+    seq_penalty_per_match: float,
+) -> tuple[list[float], float, int, int]:
+    matches = _find_forbidden_think_tag_spans(completion_text)
+    if not matches:
+        return token_rewards, float(seq_reward), 0, 0
+
+    token_hits: set[int] = set()
+    max_tokens = min(len(token_rewards), len(token_char_offsets))
+    for start, end, _ in matches:
+        for tok_idx in range(max_tokens):
+            tok_s, tok_e = token_char_offsets[tok_idx]
+            if _span_overlap_chars(start, end, tok_s, tok_e) > 0:
+                token_rewards[tok_idx] += float(token_penalty)
+                token_hits.add(tok_idx)
+
+    adjusted_seq_reward = float(seq_reward) + (float(seq_penalty_per_match) * float(len(matches)))
+    return token_rewards, adjusted_seq_reward, len(matches), len(token_hits)
 
 
 def _log_span_debug_for_rollout(
@@ -1771,6 +1826,12 @@ def _prepare_rewards_and_advantages(
     debug_span_max_rollouts = _env_int("GEMMA27_RL_DEBUG_SPAN_MAX_ROLLOUTS", default=1, minimum=1)
     debug_span_max_tokens = _env_int("GEMMA27_RL_DEBUG_SPAN_MAX_TOKENS", default=256, minimum=1)
     debug_span_only_nonzero = _env_flag("GEMMA27_RL_DEBUG_SPAN_ONLY_NONZERO", default=False)
+    think_tag_token_penalty = -abs(
+        _env_float("GEMMA27_RL_THINK_TAG_TOKEN_PENALTY", default=_DEFAULT_THINK_TAG_TOKEN_PENALTY)
+    )
+    think_tag_seq_penalty = -abs(
+        _env_float("GEMMA27_RL_THINK_TAG_SEQ_PENALTY", default=_DEFAULT_THINK_TAG_SEQUENCE_PENALTY)
+    )
     debug_span_records: list[tuple[int, Rollout, list[dict[str, Any]], list[float], list[float], float]] = []
 
     metricx_enabled = cfg.reward.metricx.enabled and metricx_scorer is not None
@@ -1943,6 +2004,9 @@ def _prepare_rewards_and_advantages(
     token_reward_rows: list[list[float]] = []
     raw_adv_rows: list[list[float]] = []
     severity_counts: dict[str, list[float]] = {"MINOR": [], "MAJOR": [], "CRITICAL": []}
+    think_tag_counts: list[float] = []
+    think_tag_token_hits: list[float] = []
+    think_tag_penalties: list[float] = []
 
     for rollout, span_row, seq_reward in zip(rollouts, span_rows, seq_rewards):
         token_rewards = spans_to_token_rewards(
@@ -1955,11 +2019,26 @@ def _prepare_rewards_and_advantages(
             use_confidence=cfg.reward.use_confidence,
             combine_policy=cfg.reward.span_combine_policy,
         )
+        token_reward_sum_before = float(sum(token_rewards))
+        seq_reward_before = float(seq_reward)
+        token_rewards, seq_reward, forbidden_tag_count, forbidden_token_hits = _apply_forbidden_think_tag_penalty(
+            completion_text=rollout.completion_text,
+            token_char_offsets=rollout.token_char_offsets,
+            token_rewards=token_rewards,
+            seq_reward=float(seq_reward),
+            token_penalty=think_tag_token_penalty,
+            seq_penalty_per_match=think_tag_seq_penalty,
+        )
         seq_row = broadcast_sequence_reward(seq_reward, token_count=len(token_rewards))
         raw_adv = combine_advantages(seq_row, token_rewards)
 
         token_reward_rows.append(token_rewards)
         raw_adv_rows.append(raw_adv)
+        think_tag_counts.append(float(forbidden_tag_count))
+        think_tag_token_hits.append(float(forbidden_token_hits))
+        think_tag_penalties.append(
+            (float(sum(token_rewards)) - token_reward_sum_before) + (float(seq_reward) - seq_reward_before)
+        )
         if debug_span_loss and len(debug_span_records) < debug_span_max_rollouts:
             debug_span_records.append(
                 (
@@ -1979,6 +2058,16 @@ def _prepare_rewards_and_advantages(
                 span_counter[sev] += 1
         for key in severity_counts:
             severity_counts[key].append(float(span_counter[key]))
+
+    total_forbidden_tags = int(sum(think_tag_counts))
+    if total_forbidden_tags > 0:
+        logger.info(
+            "forbidden think tag penalty applied: tags=%s token_hits=%s token_penalty=%.1f seq_penalty=%.1f",
+            total_forbidden_tags,
+            int(sum(think_tag_token_hits)),
+            float(think_tag_token_penalty),
+            float(think_tag_seq_penalty),
+        )
 
     if cfg.rl.group_normalize:
         raw_adv_rows, _ = apply_group_relative_advantage(
@@ -2048,6 +2137,11 @@ def _prepare_rewards_and_advantages(
         "span_minor_mean": float(mean(severity_counts["MINOR"]) if severity_counts["MINOR"] else 0.0),
         "span_major_mean": float(mean(severity_counts["MAJOR"]) if severity_counts["MAJOR"] else 0.0),
         "span_critical_mean": float(mean(severity_counts["CRITICAL"]) if severity_counts["CRITICAL"] else 0.0),
+        "forbidden_think_tag_count_mean": float(mean(think_tag_counts) if think_tag_counts else 0.0),
+        "forbidden_think_tag_count_total": float(sum(think_tag_counts)),
+        "forbidden_think_tag_token_hits_mean": float(mean(think_tag_token_hits) if think_tag_token_hits else 0.0),
+        "forbidden_think_penalty_mean": float(mean(think_tag_penalties) if think_tag_penalties else 0.0),
+        "forbidden_think_penalty_total": float(sum(think_tag_penalties)),
     }
 
     return norm_adv_rows, reward_stats, norm_stats
