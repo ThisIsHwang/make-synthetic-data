@@ -2077,6 +2077,7 @@ def _save_deepspeed_checkpoint_to_dir(
     ckpt_dir: Path,
     engine: Any,
     tokenizer,
+    hf_model: AutoModelForCausalLM | None = None,
     trainer_state: dict[str, Any] | None = None,
 ) -> Path:
     if _is_rank0():
@@ -2087,6 +2088,8 @@ def _save_deepspeed_checkpoint_to_dir(
     engine.save_checkpoint(str(ckpt_dir), tag="state")
     _dist_barrier()
     if _is_rank0():
+        if hf_model is not None:
+            hf_model.save_pretrained(ckpt_dir)
         tokenizer.save_pretrained(ckpt_dir)
         if trainer_state:
             _save_trainer_state(ckpt_dir, trainer_state)
@@ -2166,17 +2169,15 @@ def _save_deepspeed_resume_checkpoint(
     )
 
 
-def _save_model_only(
-    save_dir: Path,
-    model: AutoModelForCausalLM,
-    tokenizer,
-) -> Path:
-    if save_dir.exists():
-        shutil.rmtree(save_dir)
-    save_dir.mkdir(parents=True, exist_ok=True)
-    model.save_pretrained(save_dir)
-    tokenizer.save_pretrained(save_dir)
-    return save_dir
+def _is_deepspeed_checkpoint_dir(path: Path) -> bool:
+    if not path.exists() or not path.is_dir():
+        return False
+    if (path / "latest").exists():
+        return True
+    for pattern in ("**/*_model_states.pt", "**/*_optim_states.pt"):
+        if next(path.glob(pattern), None) is not None:
+            return True
+    return False
 
 
 def _compute_eval_selection_score(report: dict[str, Any], cfg: RLPostTrainConfig) -> float:
@@ -2347,9 +2348,13 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
     if tokenizer.pad_token is None and tokenizer.eos_token is not None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    resume_has_hf_artifacts = bool(
+        resume_ckpt is not None and resume_ckpt.is_dir() and (resume_ckpt / "config.json").exists()
+    )
     if use_deepspeed:
-        # DeepSpeed checkpoints are restored via engine.load_checkpoint(), not HF from_pretrained().
-        policy_source = cfg.model.policy_name_or_path
+        # Prefer resume dir as model init when it includes HF artifacts (e.g., `best`).
+        # Optimizer/lr states are still restored through DeepSpeed shards when present.
+        policy_source = str(resume_ckpt) if resume_has_hf_artifacts else cfg.model.policy_name_or_path
     else:
         policy_source = str(resume_ckpt) if resume_ckpt is not None else cfg.model.policy_name_or_path
     policy_model = _load_policy_model(cfg, device=device, model_name_or_path=policy_source)
@@ -2485,17 +2490,25 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
             else:
                 logger.warning("Resume checkpoint has no optimizer.pt: %s", resume_ckpt)
     elif is_resuming and resume_ckpt is not None:
-        try:
-            load_path, _ = train_model.load_checkpoint(
-                str(resume_ckpt),
-                tag="state",
-                load_optimizer_states=True,
-                load_lr_scheduler_states=False,
+        if _is_deepspeed_checkpoint_dir(resume_ckpt):
+            try:
+                load_path, _ = train_model.load_checkpoint(
+                    str(resume_ckpt),
+                    tag="state",
+                    load_optimizer_states=True,
+                    load_lr_scheduler_states=False,
+                )
+                if load_path is None and rank0:
+                    logger.warning("DeepSpeed resume checkpoint could not be loaded from %s", resume_ckpt)
+            except Exception as exc:
+                raise RuntimeError(f"Failed to load DeepSpeed checkpoint from {resume_ckpt}") from exc
+        elif rank0:
+            logger.warning(
+                "Resume checkpoint has no DeepSpeed shard states: %s. "
+                "Continuing with model weights only from %s (optimizer state reset).",
+                resume_ckpt,
+                policy_source,
             )
-            if load_path is None and rank0:
-                logger.warning("DeepSpeed resume checkpoint could not be loaded from %s", resume_ckpt)
-        except Exception as exc:
-            raise RuntimeError(f"Failed to load DeepSpeed checkpoint from {resume_ckpt}") from exc
 
     artifacts: dict[str, Any] = {
         "output_dir": str(output_dir),
@@ -2550,6 +2563,73 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
     best_dir = output_dir / "best"
     best_eval_score = float("-inf")
     best_eval_update: int | None = None
+
+    def _sync_and_save_best_checkpoint(candidate_score: float | None, *, update_idx: int) -> None:
+        nonlocal best_eval_score, best_eval_update
+
+        is_new_best_local = False
+        best_score_local: float | None = None
+        if rank0 and candidate_score is not None:
+            try:
+                parsed_score = float(candidate_score)
+            except (TypeError, ValueError):
+                parsed_score = float("-inf")
+            if math.isfinite(parsed_score) and parsed_score > best_eval_score:
+                is_new_best_local = True
+                best_score_local = parsed_score
+
+        shared: list[Any] = [
+            {
+                "is_new_best": bool(is_new_best_local),
+                "update_idx": int(update_idx),
+                "score": best_score_local,
+            }
+            if rank0
+            else None
+        ]
+        _broadcast_object_list(shared, src=0)
+        payload = shared[0] if shared and isinstance(shared[0], dict) else {}
+        should_save = bool(payload.get("is_new_best", False))
+        if not should_save:
+            return
+
+        resolved_update_idx = int(payload.get("update_idx", update_idx))
+        score_raw = payload.get("score")
+        try:
+            resolved_score = float(score_raw)
+        except (TypeError, ValueError):
+            resolved_score = float("-inf")
+        if not math.isfinite(resolved_score):
+            return
+
+        trainer_state_payload = {
+            "update_idx": int(resolved_update_idx),
+            "best_eval_update": int(resolved_update_idx),
+            "best_eval_score": float(resolved_score),
+        }
+
+        if use_deepspeed:
+            _save_deepspeed_checkpoint_to_dir(
+                ckpt_dir=best_dir,
+                engine=train_model,
+                tokenizer=tokenizer,
+                hf_model=policy_eval_model,
+                trainer_state=trainer_state_payload,
+            )
+        elif rank0:
+            assert optimizer is not None
+            _save_checkpoint_to_dir(
+                ckpt_dir=best_dir,
+                model=policy_eval_model,
+                tokenizer=tokenizer,
+                optimizer=optimizer,
+                trainer_state=trainer_state_payload,
+            )
+
+        if rank0:
+            best_eval_score = resolved_score
+            best_eval_update = resolved_update_idx
+            logger.info("new best eval at update=%s score=%.6f", resolved_update_idx, resolved_score)
 
     if is_resuming:
         if resume_state:
@@ -2641,11 +2721,7 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
                 float(report.get("xcomet_score_mean", 0.0)),
                 float(report.get("mqm_score_mean", 0.0)),
             )
-            if math.isfinite(eval_select_score) and eval_select_score > best_eval_score:
-                _save_model_only(best_dir, policy_eval_model, tokenizer)
-                best_eval_score = eval_select_score
-                best_eval_update = 0
-                logger.info("new best eval at update=%s score=%.6f", 0, eval_select_score)
+        _sync_and_save_best_checkpoint(eval_select_score if rank0 else None, update_idx=0)
         _dist_barrier()
     elif cfg.eval.run_before_train and eval_examples and start_update > 1:
         logger.info(
@@ -3041,11 +3117,7 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
                     float(report.get("xcomet_score_mean", 0.0)),
                     float(report.get("mqm_score_mean", 0.0)),
                 )
-                if math.isfinite(eval_select_score) and eval_select_score > best_eval_score:
-                    _save_model_only(best_dir, policy_eval_model, tokenizer)
-                    best_eval_score = eval_select_score
-                    best_eval_update = update_idx
-                    logger.info("new best eval at update=%s score=%.6f", update_idx, eval_select_score)
+            _sync_and_save_best_checkpoint(eval_select_score if rank0 else None, update_idx=update_idx)
 
         # Early-stop guard for divergence in toy runs.
         if not math.isfinite(train_stats.policy_loss):
