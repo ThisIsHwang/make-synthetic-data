@@ -1251,6 +1251,36 @@ def _parse_checkpoint_update_idx(path: Path) -> int | None:
     return int(idx_text)
 
 
+def _prune_old_checkpoints(output_dir: Path, keep_last_n: int) -> list[Path]:
+    keep_n = max(0, int(keep_last_n))
+    if keep_n <= 0:
+        return []
+
+    candidates: list[tuple[int, Path]] = []
+    for path in output_dir.glob("checkpoint-*"):
+        if not path.is_dir():
+            continue
+        update_idx = _parse_checkpoint_update_idx(path)
+        if update_idx is None:
+            continue
+        candidates.append((update_idx, path))
+
+    if len(candidates) <= keep_n:
+        return []
+
+    # Keep newest N by update index and delete the rest.
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    drop = candidates[keep_n:]
+    removed: list[Path] = []
+    for _, path in drop:
+        try:
+            shutil.rmtree(path)
+            removed.append(path)
+        except Exception as exc:
+            logger.warning("Failed to prune old checkpoint %s: %s", path, exc)
+    return removed
+
+
 def _save_trainer_state(path: Path, payload: dict[str, Any]) -> None:
     state_path = path / "trainer_state.json"
     state_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -2824,6 +2854,11 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
             "logging.save_only_best=true with logging.save_every_n_updates<=0: "
             "resume checkpoints will not be written during training."
         )
+    if rank0 and cfg.logging.keep_last_n_checkpoints > 0:
+        logger.info(
+            "Periodic checkpoint retention enabled: keep_last_n_checkpoints=%s (best checkpoint is managed separately).",
+            int(cfg.logging.keep_last_n_checkpoints),
+        )
 
     distributed_eval_shard = bool(use_deepspeed and world_size > 1 and cfg.eval.distributed_shard)
     if use_deepspeed and world_size > 1 and (not distributed_eval_shard) and rank0:
@@ -3204,18 +3239,10 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
         }
 
         if cfg.logging.save_every_n_updates > 0 and update_idx % cfg.logging.save_every_n_updates == 0:
+            keep_recent_n = int(cfg.logging.keep_last_n_checkpoints)
+            save_periodic_checkpoint = bool(keep_recent_n > 0 or (not cfg.logging.save_only_best))
             if use_deepspeed:
-                if cfg.logging.save_only_best:
-                    resume_path = _save_deepspeed_resume_checkpoint(
-                        output_dir=output_dir,
-                        update_idx=update_idx,
-                        engine=train_model,
-                        tokenizer=tokenizer,
-                        trainer_state=trainer_state_payload,
-                    )
-                    if rank0:
-                        artifacts["resume_checkpoint"] = str(resume_path)
-                else:
+                if save_periodic_checkpoint:
                     ckpt = _save_deepspeed_checkpoint(
                         output_dir=output_dir,
                         update_idx=update_idx,
@@ -3225,19 +3252,34 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
                     )
                     if rank0:
                         artifacts["checkpoints"].append(str(ckpt))
-            elif rank0:
-                if cfg.logging.save_only_best:
-                    assert optimizer is not None
-                    resume_path = _save_resume_checkpoint(
+                        if cfg.logging.save_only_best:
+                            artifacts["resume_checkpoint"] = str(ckpt)
+                        if keep_recent_n > 0:
+                            removed = _prune_old_checkpoints(output_dir, keep_recent_n)
+                            if removed:
+                                removed_set = {str(path) for path in removed}
+                                artifacts["checkpoints"] = [
+                                    path for path in artifacts["checkpoints"] if path not in removed_set
+                                ]
+                                logger.info(
+                                    "Pruned %s old checkpoints; keeping latest %s periodic checkpoints.",
+                                    len(removed),
+                                    keep_recent_n,
+                                )
+                else:
+                    resume_path = _save_deepspeed_resume_checkpoint(
                         output_dir=output_dir,
                         update_idx=update_idx,
-                        model=policy_eval_model,
+                        engine=train_model,
                         tokenizer=tokenizer,
-                        optimizer=optimizer,
                         trainer_state=trainer_state_payload,
                     )
-                    artifacts["resume_checkpoint"] = str(resume_path)
-                else:
+                    if rank0:
+                        artifacts["resume_checkpoint"] = str(resume_path)
+                if keep_recent_n > 0:
+                    _dist_barrier()
+            elif rank0:
+                if save_periodic_checkpoint:
                     assert optimizer is not None
                     ckpt = _save_checkpoint(
                         output_dir=output_dir,
@@ -3248,6 +3290,31 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
                         trainer_state=trainer_state_payload,
                     )
                     artifacts["checkpoints"].append(str(ckpt))
+                    if cfg.logging.save_only_best:
+                        artifacts["resume_checkpoint"] = str(ckpt)
+                    if keep_recent_n > 0:
+                        removed = _prune_old_checkpoints(output_dir, keep_recent_n)
+                        if removed:
+                            removed_set = {str(path) for path in removed}
+                            artifacts["checkpoints"] = [
+                                path for path in artifacts["checkpoints"] if path not in removed_set
+                            ]
+                            logger.info(
+                                "Pruned %s old checkpoints; keeping latest %s periodic checkpoints.",
+                                len(removed),
+                                keep_recent_n,
+                            )
+                else:
+                    assert optimizer is not None
+                    resume_path = _save_resume_checkpoint(
+                        output_dir=output_dir,
+                        update_idx=update_idx,
+                        model=policy_eval_model,
+                        tokenizer=tokenizer,
+                        optimizer=optimizer,
+                        trainer_state=trainer_state_payload,
+                    )
+                    artifacts["resume_checkpoint"] = str(resume_path)
 
         if (
             cfg.eval.eval_every_n_updates > 0

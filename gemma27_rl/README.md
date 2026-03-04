@@ -160,3 +160,5 @@ python -m gemma27_rl.cli --config configs/train_toy.yaml --eval-only
 - `logging.auto_resume: true`면 `resume_latest` 또는 최신 `checkpoint-*`에서 자동 재개
 - `logging.resume_from_checkpoint`를 지정하면 해당 체크포인트에서 강제 재개
 - `logging.save_only_best: true`면 주기적 `checkpoint-*` 대신 `best` + `resume_latest`만 유지
+- `logging.keep_last_n_checkpoints: N`(N>0)이면 주기 저장 시 `checkpoint-*`를 최신 N개만 유지
+  (`best` 체크포인트는 별도 유지)

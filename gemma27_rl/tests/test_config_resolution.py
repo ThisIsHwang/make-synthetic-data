@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from gemma27_rl.config import load_config
 
 
@@ -38,3 +40,27 @@ def test_python_executable_resolution_preserves_venv_symlink(tmp_path: Path) -> 
 
     cfg = load_config(cfg_path)
     assert cfg.reward.metricx.python_executable == str(venv_python)
+
+
+def test_keep_last_n_checkpoints_must_be_non_negative(tmp_path: Path) -> None:
+    cfg_path = tmp_path / "train.yaml"
+    cfg_path.write_text(
+        "\n".join(
+            [
+                "data:",
+                "  hf_dataset_name: dummy/dataset",
+                "reward:",
+                "  xcomet:",
+                "    enabled: false",
+                "  mqm:",
+                "    enabled: false",
+                "logging:",
+                "  keep_last_n_checkpoints: -1",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="logging.keep_last_n_checkpoints must be >= 0"):
+        _ = load_config(cfg_path)

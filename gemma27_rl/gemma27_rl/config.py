@@ -266,6 +266,7 @@ class LoggingConfig:
     save_eval_outputs: bool = False
     save_every_n_updates: int = 10
     save_only_best: bool = False
+    keep_last_n_checkpoints: int = 0
     auto_resume: bool = True
     resume_from_checkpoint: str | None = None
 
@@ -438,6 +439,8 @@ def _validate_config(cfg: RLPostTrainConfig) -> None:
         raise ValueError("rl.algorithm must be one of: grpo, reinforce")
     if cfg.rl.backend not in {"native", "deepspeed"}:
         raise ValueError("rl.backend must be native|deepspeed")
+    if int(cfg.logging.keep_last_n_checkpoints) < 0:
+        raise ValueError("logging.keep_last_n_checkpoints must be >= 0")
     if cfg.model.reference_runtime not in {"worker", "in_process", "cpu"}:
         raise ValueError("model.reference_runtime must be worker|in_process|cpu")
     if float(cfg.model.reference_subprocess_timeout_sec) <= 0:
