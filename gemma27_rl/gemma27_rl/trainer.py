@@ -328,6 +328,26 @@ def _apply_ngram_repeat_penalty(
     return token_rewards, adjusted_seq_reward, len(repeated_positions), repeated_occurrences
 
 
+def _zero_token_rewards_on_special_token_ids(
+    *,
+    token_rewards: list[float],
+    completion_token_ids: list[int],
+    special_token_ids: set[int],
+) -> int:
+    if not token_rewards or not completion_token_ids or not special_token_ids:
+        return 0
+    max_tokens = min(len(token_rewards), len(completion_token_ids))
+    masked = 0
+    for tok_idx in range(max_tokens):
+        if int(completion_token_ids[tok_idx]) not in special_token_ids:
+            continue
+        if float(token_rewards[tok_idx]) == 0.0:
+            continue
+        token_rewards[tok_idx] = 0.0
+        masked += 1
+    return masked
+
+
 def _collect_tokenizer_special_token_strings(tokenizer: Any | None) -> list[str]:
     if tokenizer is None:
         return []
@@ -532,6 +552,7 @@ def _apply_special_token_penalty(
 
     max_tokens = min(len(token_rewards), len(completion_token_ids))
     final_token_idx = max_tokens - 1
+    count_id_hits_in_completion = penalty_token_ids is None
     for tok_idx in range(max_tokens):
         token_id = int(completion_token_ids[tok_idx])
         if token_id not in special_token_ids:
@@ -539,7 +560,7 @@ def _apply_special_token_penalty(
         if tok_idx == final_token_idx and token_id in exempt_ids:
             continue
         completion_id_occurrences += 1
-        if id_hit_counter is not None:
+        if count_id_hits_in_completion and id_hit_counter is not None:
             id_hit_counter[token_id] = int(id_hit_counter.get(token_id, 0)) + 1
         token_hits.add(tok_idx)
         token_rewards[tok_idx] += float(token_penalty)
@@ -2287,6 +2308,8 @@ def _prepare_rewards_and_advantages(
         special_token_strings=special_token_penalty_strings,
         special_token_ids=special_token_ids,
     )
+    span_reward_texts: list[str] = []
+    span_reward_samples: list[SampleForScoring] = []
     mqm_esa_samples: list[SampleForScoring] = []
     sanitized_target_rows = 0
     sanitized_marker_total = 0
@@ -2298,6 +2321,8 @@ def _prepare_rewards_and_advantages(
         if replacement_count > 0:
             sanitized_target_rows += 1
             sanitized_marker_total += int(replacement_count)
+        span_reward_texts.append(sanitized_mt)
+        span_reward_samples.append(SampleForScoring(src=rollout.src_text, mt=sanitized_mt, ref=rollout.ref_text))
         mqm_esa_samples.append(SampleForScoring(src=rollout.src_text, mt=sanitized_mt, ref=rollout.ref_text))
     debug_span_loss = _env_flag("GEMMA27_RL_DEBUG_SPAN_LOSS", default=False)
     debug_span_max_rollouts = _env_int("GEMMA27_RL_DEBUG_SPAN_MAX_ROLLOUTS", default=1, minimum=1)
@@ -2368,7 +2393,7 @@ def _prepare_rewards_and_advantages(
             if xcomet_enabled:
                 futures["xcomet"] = executor.submit(
                     _score_with_cache_xcomet,
-                    samples=samples,
+                    samples=span_reward_samples,
                     scorer=xcomet_scorer,
                     cache=xcomet_cache,
                     use_cache=cfg.reward.cache_enabled,
@@ -2407,7 +2432,7 @@ def _prepare_rewards_and_advantages(
             )
         if xcomet_enabled:
             xcomet_scores, span_rows = _score_with_cache_xcomet(
-                samples=samples,
+                samples=span_reward_samples,
                 scorer=xcomet_scorer,
                 cache=xcomet_cache,
                 use_cache=cfg.reward.cache_enabled,
@@ -2515,12 +2540,14 @@ def _prepare_rewards_and_advantages(
     special_token_occurrence_counts: list[float] = []
     special_token_hit_counts: list[float] = []
     special_token_penalties: list[float] = []
+    span_special_masked_counts: list[float] = []
     special_token_id_occurrence_counts: dict[int, int] = {}
     special_token_text_occurrence_counts: dict[str, int] = {}
 
-    for rollout, span_row, seq_reward in zip(rollouts, span_rows, seq_rewards):
+    for row_idx, (rollout, span_row, seq_reward) in enumerate(zip(rollouts, span_rows, seq_rewards)):
+        span_reward_text = span_reward_texts[row_idx] if row_idx < len(span_reward_texts) else rollout.completion_text
         token_rewards = spans_to_token_rewards(
-            mt_text=rollout.completion_text,
+            mt_text=span_reward_text,
             token_char_offsets=rollout.token_char_offsets,
             error_spans=span_row,
             severity_weights=cfg.reward.severity_weights,
@@ -2528,6 +2555,11 @@ def _prepare_rewards_and_advantages(
             majority_threshold=cfg.reward.majority_threshold,
             use_confidence=cfg.reward.use_confidence,
             combine_policy=cfg.reward.span_combine_policy,
+        )
+        span_special_masked = _zero_token_rewards_on_special_token_ids(
+            token_rewards=token_rewards,
+            completion_token_ids=rollout.completion_token_ids,
+            special_token_ids=special_token_ids,
         )
         token_reward_sum_before = float(sum(token_rewards))
         seq_reward_before = float(seq_reward)
@@ -2621,6 +2653,7 @@ def _prepare_rewards_and_advantages(
         special_token_penalties.append(
             (float(sum(token_rewards)) - special_sum_before) + (float(seq_reward) - special_seq_before)
         )
+        span_special_masked_counts.append(float(span_special_masked))
         if debug_span_loss and len(debug_span_records) < debug_span_max_rollouts:
             debug_span_records.append(
                 (
@@ -2696,6 +2729,12 @@ def _prepare_rewards_and_advantages(
             len(rollouts),
             int(sanitized_marker_total),
             len(special_token_strings),
+        )
+    total_span_special_masked = int(sum(span_special_masked_counts))
+    if total_span_special_masked > 0:
+        logger.info(
+            "span reward special-token mask applied: masked_token_rewards=%s",
+            total_span_special_masked,
         )
 
     if cfg.rl.group_normalize:
@@ -2789,6 +2828,10 @@ def _prepare_rewards_and_advantages(
         "special_token_hit_count_mean": float(mean(special_token_hit_counts) if special_token_hit_counts else 0.0),
         "special_token_penalty_mean": float(mean(special_token_penalties) if special_token_penalties else 0.0),
         "special_token_penalty_total": float(sum(special_token_penalties)),
+        "span_special_masked_token_count_mean": float(
+            mean(span_special_masked_counts) if span_special_masked_counts else 0.0
+        ),
+        "span_special_masked_token_count_total": float(sum(span_special_masked_counts)),
         "judge_sanitized_target_count": float(sanitized_target_rows),
         "judge_sanitized_marker_total": float(sanitized_marker_total),
     }

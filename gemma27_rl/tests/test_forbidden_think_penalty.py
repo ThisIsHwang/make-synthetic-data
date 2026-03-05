@@ -11,6 +11,7 @@ from gemma27_rl.trainer import (
     _apply_special_token_penalty,
     _find_forbidden_think_tag_spans,
     _sanitize_text_for_mqm_esa,
+    _zero_token_rewards_on_special_token_ids,
 )
 
 
@@ -212,3 +213,38 @@ def test_apply_special_token_penalty_uses_raw_ids_for_sequence_penalty() -> None
     assert adjusted_seq == pytest.approx(-3.0)
     assert occurrences == 1
     assert token_hits == 0
+
+
+def test_apply_special_token_penalty_id_hit_counter_not_double_counted_with_penalty_ids() -> None:
+    id_hits: dict[int, int] = {}
+    adjusted_tokens, adjusted_seq, occurrences, token_hits = _apply_special_token_penalty(
+        completion_text="<sp>",
+        completion_token_ids=[99],
+        penalty_token_ids=[99],
+        token_char_offsets=[(0, 4)],
+        token_rewards=[0.0],
+        seq_reward=0.0,
+        special_token_ids={99},
+        special_token_strings=[],
+        token_penalty=-2.0,
+        seq_penalty_per_occurrence=-3.0,
+        id_hit_counter=id_hits,
+    )
+
+    assert adjusted_tokens == [-2.0]
+    assert adjusted_seq == pytest.approx(-3.0)
+    assert occurrences == 1
+    assert token_hits == 1
+    assert id_hits == {99: 1}
+
+
+def test_zero_token_rewards_on_special_token_ids_masks_special_positions() -> None:
+    token_rewards = [0.0, -3.0, -2.0, 1.0]
+    masked = _zero_token_rewards_on_special_token_ids(
+        token_rewards=token_rewards,
+        completion_token_ids=[10, 99, 20, 98],
+        special_token_ids={98, 99},
+    )
+
+    assert token_rewards == [0.0, 0.0, -2.0, 0.0]
+    assert masked == 2

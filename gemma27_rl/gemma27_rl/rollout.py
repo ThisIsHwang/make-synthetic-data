@@ -36,7 +36,6 @@ from .config import GenerationConfig
 from .prompting import (
     DEFAULT_TRANSLATION_PROMPT_TEMPLATE,
     format_translation_prompt,
-    postprocess_translation,
 )
 from .rl_types import Example, Rollout
 
@@ -973,9 +972,12 @@ def generate_rollouts(
                 pad_token_id=pad_token_id,
             )
             raw_text = tokenizer.decode(completion_raw_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
-            completion_text = postprocess_translation(raw_text)
-            completion_ids = tokenizer(completion_text, add_special_tokens=False)["input_ids"]
-            completion_ids = [int(x) for x in completion_ids]
+            completion_text = tokenizer.decode(
+                completion_raw_ids,
+                skip_special_tokens=False,
+                clean_up_tokenization_spaces=False,
+            )
+            completion_ids = [int(x) for x in completion_raw_ids]
             if not completion_ids:
                 empty_completion_fallbacks += 1
                 fallback_ids = tokenizer(" ", add_special_tokens=False)["input_ids"]
@@ -990,7 +992,13 @@ def generate_rollouts(
                     else:
                         fallback_ids = [0]
                 completion_ids = fallback_ids[:1]
+                completion_raw_ids = list(completion_ids)
                 completion_text = tokenizer.decode(
+                    completion_ids,
+                    skip_special_tokens=False,
+                    clean_up_tokenization_spaces=False,
+                )
+                raw_text = tokenizer.decode(
                     completion_ids,
                     skip_special_tokens=True,
                     clean_up_tokenization_spaces=False,
