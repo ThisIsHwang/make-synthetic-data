@@ -6,6 +6,7 @@ pytest.importorskip("torch")
 
 from gemma27_rl.trainer import (
     _apply_forbidden_think_tag_penalty,
+    _apply_ngram_repeat_penalty,
     _apply_repeated_token_penalty,
     _apply_special_token_penalty,
     _find_forbidden_think_tag_spans,
@@ -54,6 +55,40 @@ def test_apply_repeated_token_penalty_penalizes_consecutive_repeat_tokens() -> N
     assert adjusted_seq == pytest.approx(-2.0)
     assert repeat_count == 2
     assert repeat_runs == 1
+
+
+def test_apply_repeated_token_penalty_penalizes_periodic_non_consecutive_repeats() -> None:
+    adjusted_tokens, adjusted_seq, repeat_count, repeat_runs = _apply_repeated_token_penalty(
+        completion_token_ids=[10, 20, 10, 20, 10, 20],
+        token_rewards=[0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        seq_reward=0.0,
+        token_penalty=-1.5,
+        seq_penalty_per_repeat=-0.5,
+        min_repeat_run_length=2,
+        max_repeat_pattern_length=4,
+    )
+
+    assert adjusted_tokens == [0.0, 0.0, -1.5, -1.5, -1.5, -1.5]
+    assert adjusted_seq == pytest.approx(-2.0)
+    assert repeat_count == 4
+    assert repeat_runs == 1
+
+
+def test_apply_ngram_repeat_penalty_penalizes_repeated_ngrams() -> None:
+    adjusted_tokens, adjusted_seq, token_hits, repeat_occurrences = _apply_ngram_repeat_penalty(
+        completion_token_ids=[1, 2, 3, 1, 2, 3, 4],
+        token_rewards=[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        seq_reward=0.0,
+        token_penalty=-2.0,
+        seq_penalty_per_repeat=-0.5,
+        ngram_size=3,
+        min_occurrences=2,
+    )
+
+    assert adjusted_tokens == [0.0, 0.0, 0.0, -2.0, -2.0, -2.0, 0.0]
+    assert adjusted_seq == pytest.approx(-0.5)
+    assert token_hits == 3
+    assert repeat_occurrences == 1
 
 
 def test_sanitize_text_for_mqm_esa_removes_special_and_think_markers() -> None:

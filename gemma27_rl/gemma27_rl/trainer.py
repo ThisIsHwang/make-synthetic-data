@@ -66,6 +66,8 @@ _DEFAULT_THINK_TAG_TOKEN_PENALTY = -100.0
 _DEFAULT_THINK_TAG_SEQUENCE_PENALTY = -30.0
 _DEFAULT_REPEAT_TOKEN_PENALTY = -2.0
 _DEFAULT_REPEAT_SEQUENCE_PENALTY = -0.5
+_DEFAULT_NGRAM_TOKEN_PENALTY = -1.0
+_DEFAULT_NGRAM_SEQUENCE_PENALTY = -0.5
 _DEFAULT_SPECIAL_TOKEN_PENALTY = -50.0
 _DEFAULT_SPECIAL_SEQUENCE_PENALTY = -10.0
 _THINK_BLOCK_PATTERN = re.compile(r"<\s*think\s*>.*?<\s*/\s*think\s*>", flags=re.IGNORECASE | re.DOTALL)
@@ -181,26 +183,65 @@ def _find_repeated_token_positions(
     completion_token_ids: list[int],
     *,
     min_repeat_run_length: int,
+    max_repeat_pattern_length: int = 4,
 ) -> tuple[list[int], int]:
     if min_repeat_run_length < 2:
         min_repeat_run_length = 2
-    if len(completion_token_ids) < min_repeat_run_length:
+    if max_repeat_pattern_length < 1:
+        max_repeat_pattern_length = 1
+    token_count = len(completion_token_ids)
+    if token_count < min_repeat_run_length:
         return [], 0
 
-    repeated_positions: list[int] = []
+    repeated_positions: set[int] = set()
     repeated_runs = 0
+
+    # 1) Consecutive repeats: A A A
     run_len = 1
-    for idx in range(1, len(completion_token_ids)):
+    for idx in range(1, token_count):
         if int(completion_token_ids[idx]) == int(completion_token_ids[idx - 1]):
             run_len += 1
             if run_len == min_repeat_run_length:
                 repeated_runs += 1
-                repeated_positions.append(idx)
+                repeated_positions.add(idx)
             elif run_len > min_repeat_run_length:
-                repeated_positions.append(idx)
+                repeated_positions.add(idx)
         else:
             run_len = 1
-    return repeated_positions, repeated_runs
+
+    # 2) Periodic non-consecutive repeats: A B A B A B, A B C A B C, ...
+    max_period = min(max_repeat_pattern_length, token_count // 2)
+    min_period_repeats = max(2, min_repeat_run_length)
+    for period in range(2, max_period + 1):
+        idx = 0
+        while idx + (2 * period) <= token_count:
+            left = completion_token_ids[idx:idx + period]
+            right = completion_token_ids[idx + period:idx + (2 * period)]
+            if left != right:
+                idx += 1
+                continue
+            # Skip degenerate periodic runs like A A A A from period=2;
+            # those are already covered by consecutive repeat detection.
+            if len({int(v) for v in left}) <= 1:
+                idx += 1
+                continue
+
+            end = idx + (2 * period)
+            while end + period <= token_count:
+                prev_chunk = completion_token_ids[end - period:end]
+                next_chunk = completion_token_ids[end:end + period]
+                if prev_chunk != next_chunk:
+                    break
+                end += period
+
+            total_repeats = (end - idx) // period
+            if total_repeats >= min_period_repeats:
+                repeated_runs += 1
+                for pos in range(idx + period, end):
+                    repeated_positions.add(pos)
+            idx = max(idx + 1, end - period + 1)
+
+    return sorted(repeated_positions), repeated_runs
 
 
 def _apply_repeated_token_penalty(
@@ -211,10 +252,12 @@ def _apply_repeated_token_penalty(
     token_penalty: float,
     seq_penalty_per_repeat: float,
     min_repeat_run_length: int,
+    max_repeat_pattern_length: int = 4,
 ) -> tuple[list[float], float, int, int]:
     repeated_positions, repeated_runs = _find_repeated_token_positions(
         completion_token_ids,
         min_repeat_run_length=min_repeat_run_length,
+        max_repeat_pattern_length=max_repeat_pattern_length,
     )
     if not repeated_positions:
         return token_rewards, float(seq_reward), 0, 0
@@ -225,6 +268,64 @@ def _apply_repeated_token_penalty(
             token_rewards[idx] += float(token_penalty)
     adjusted_seq_reward = float(seq_reward) + (float(seq_penalty_per_repeat) * float(len(repeated_positions)))
     return token_rewards, adjusted_seq_reward, len(repeated_positions), repeated_runs
+
+
+def _find_repeated_ngram_positions(
+    completion_token_ids: list[int],
+    *,
+    ngram_size: int,
+    min_occurrences: int = 2,
+) -> tuple[list[int], int]:
+    if ngram_size < 2:
+        ngram_size = 2
+    if min_occurrences < 2:
+        min_occurrences = 2
+    token_count = len(completion_token_ids)
+    if token_count < ngram_size:
+        return [], 0
+
+    counts: dict[tuple[int, ...], int] = {}
+    repeated_positions: set[int] = set()
+    repeated_occurrences = 0
+
+    max_start = token_count - ngram_size
+    for start in range(max_start + 1):
+        ngram = tuple(int(v) for v in completion_token_ids[start:start + ngram_size])
+        next_count = int(counts.get(ngram, 0)) + 1
+        counts[ngram] = next_count
+        if next_count < min_occurrences:
+            continue
+        repeated_occurrences += 1
+        for pos in range(start, start + ngram_size):
+            repeated_positions.add(pos)
+
+    return sorted(repeated_positions), repeated_occurrences
+
+
+def _apply_ngram_repeat_penalty(
+    *,
+    completion_token_ids: list[int],
+    token_rewards: list[float],
+    seq_reward: float,
+    token_penalty: float,
+    seq_penalty_per_repeat: float,
+    ngram_size: int,
+    min_occurrences: int = 2,
+) -> tuple[list[float], float, int, int]:
+    repeated_positions, repeated_occurrences = _find_repeated_ngram_positions(
+        completion_token_ids,
+        ngram_size=ngram_size,
+        min_occurrences=min_occurrences,
+    )
+    if not repeated_positions:
+        return token_rewards, float(seq_reward), 0, 0
+
+    max_tokens = len(token_rewards)
+    for idx in repeated_positions:
+        if idx < max_tokens:
+            token_rewards[idx] += float(token_penalty)
+    adjusted_seq_reward = float(seq_reward) + (float(seq_penalty_per_repeat) * float(repeated_occurrences))
+    return token_rewards, adjusted_seq_reward, len(repeated_positions), repeated_occurrences
 
 
 def _collect_tokenizer_special_token_strings(tokenizer: Any | None) -> list[str]:
@@ -2161,6 +2262,15 @@ def _prepare_rewards_and_advantages(
         _env_float("GEMMA27_RL_REPEAT_SEQ_PENALTY", default=_DEFAULT_REPEAT_SEQUENCE_PENALTY)
     )
     repeat_min_run = _env_int("GEMMA27_RL_REPEAT_MIN_RUN", default=2, minimum=2)
+    repeat_max_pattern = _env_int("GEMMA27_RL_REPEAT_MAX_PATTERN", default=4, minimum=1)
+    ngram_token_penalty = -abs(
+        _env_float("GEMMA27_RL_NGRAM_TOKEN_PENALTY", default=_DEFAULT_NGRAM_TOKEN_PENALTY)
+    )
+    ngram_seq_penalty = -abs(
+        _env_float("GEMMA27_RL_NGRAM_SEQ_PENALTY", default=_DEFAULT_NGRAM_SEQUENCE_PENALTY)
+    )
+    ngram_repeat_n = _env_int("GEMMA27_RL_NGRAM_REPEAT_N", default=3, minimum=2)
+    ngram_min_occurrences = _env_int("GEMMA27_RL_NGRAM_REPEAT_MIN_OCCURS", default=2, minimum=2)
     special_token_penalty = -abs(
         _env_float("GEMMA27_RL_SPECIAL_TOKEN_PENALTY", default=_DEFAULT_SPECIAL_TOKEN_PENALTY)
     )
@@ -2345,6 +2455,9 @@ def _prepare_rewards_and_advantages(
     repeat_token_counts: list[float] = []
     repeat_run_counts: list[float] = []
     repeat_penalties: list[float] = []
+    ngram_repeat_token_hits: list[float] = []
+    ngram_repeat_occurrences: list[float] = []
+    ngram_repeat_penalties: list[float] = []
     special_token_occurrence_counts: list[float] = []
     special_token_hit_counts: list[float] = []
     special_token_penalties: list[float] = []
@@ -2395,6 +2508,18 @@ def _prepare_rewards_and_advantages(
             token_penalty=repeat_token_penalty,
             seq_penalty_per_repeat=repeat_seq_penalty,
             min_repeat_run_length=repeat_min_run,
+            max_repeat_pattern_length=repeat_max_pattern,
+        )
+        ngram_sum_before = float(sum(token_rewards))
+        ngram_seq_before = float(seq_reward)
+        token_rewards, seq_reward, ngram_token_hit_count, ngram_repeat_count = _apply_ngram_repeat_penalty(
+            completion_token_ids=rollout.completion_token_ids,
+            token_rewards=token_rewards,
+            seq_reward=float(seq_reward),
+            token_penalty=ngram_token_penalty,
+            seq_penalty_per_repeat=ngram_seq_penalty,
+            ngram_size=ngram_repeat_n,
+            min_occurrences=ngram_min_occurrences,
         )
         seq_row = broadcast_sequence_reward(seq_reward, token_count=len(token_rewards))
         raw_adv = combine_advantages(seq_row, token_rewards)
@@ -2409,6 +2534,11 @@ def _prepare_rewards_and_advantages(
         repeat_token_counts.append(float(repeat_token_count))
         repeat_run_counts.append(float(repeat_run_count))
         repeat_penalties.append((float(sum(token_rewards)) - repeat_sum_before) + (float(seq_reward) - repeat_seq_before))
+        ngram_repeat_token_hits.append(float(ngram_token_hit_count))
+        ngram_repeat_occurrences.append(float(ngram_repeat_count))
+        ngram_repeat_penalties.append(
+            (float(sum(token_rewards)) - ngram_sum_before) + (float(seq_reward) - ngram_seq_before)
+        )
         special_token_occurrence_counts.append(float(special_occurrences))
         special_token_hit_counts.append(float(special_token_hits))
         special_token_penalties.append(
@@ -2446,12 +2576,24 @@ def _prepare_rewards_and_advantages(
     total_repeat_tokens = int(sum(repeat_token_counts))
     if total_repeat_tokens > 0:
         logger.info(
-            "repeat token penalty applied: repeat_tokens=%s repeat_runs=%s min_run=%s token_penalty=%.2f seq_penalty=%.2f",
+            "repeat token penalty applied: repeat_tokens=%s repeat_runs=%s min_run=%s max_pattern=%s token_penalty=%.2f seq_penalty=%.2f",
             total_repeat_tokens,
             int(sum(repeat_run_counts)),
             int(repeat_min_run),
+            int(repeat_max_pattern),
             float(repeat_token_penalty),
             float(repeat_seq_penalty),
+        )
+    total_ngram_occurrences = int(sum(ngram_repeat_occurrences))
+    if total_ngram_occurrences > 0:
+        logger.info(
+            "n-gram repeat penalty applied: n=%s min_occurs=%s repeats=%s token_hits=%s token_penalty=%.2f seq_penalty=%.2f",
+            int(ngram_repeat_n),
+            int(ngram_min_occurrences),
+            total_ngram_occurrences,
+            int(sum(ngram_repeat_token_hits)),
+            float(ngram_token_penalty),
+            float(ngram_seq_penalty),
         )
     total_special_occurrences = int(sum(special_token_occurrence_counts))
     if total_special_occurrences > 0:
@@ -2551,6 +2693,12 @@ def _prepare_rewards_and_advantages(
         "repeat_run_count_mean": float(mean(repeat_run_counts) if repeat_run_counts else 0.0),
         "repeat_penalty_mean": float(mean(repeat_penalties) if repeat_penalties else 0.0),
         "repeat_penalty_total": float(sum(repeat_penalties)),
+        "ngram_repeat_token_hit_mean": float(mean(ngram_repeat_token_hits) if ngram_repeat_token_hits else 0.0),
+        "ngram_repeat_token_hit_total": float(sum(ngram_repeat_token_hits)),
+        "ngram_repeat_occurrence_mean": float(mean(ngram_repeat_occurrences) if ngram_repeat_occurrences else 0.0),
+        "ngram_repeat_occurrence_total": float(sum(ngram_repeat_occurrences)),
+        "ngram_repeat_penalty_mean": float(mean(ngram_repeat_penalties) if ngram_repeat_penalties else 0.0),
+        "ngram_repeat_penalty_total": float(sum(ngram_repeat_penalties)),
         "special_token_occurrence_count_mean": float(
             mean(special_token_occurrence_counts) if special_token_occurrence_counts else 0.0
         ),
