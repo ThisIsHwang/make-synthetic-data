@@ -41,6 +41,9 @@ class ModelConfig:
     reference_subprocess_timeout_sec: float = 600.0
     reference_worker_host: str | None = None
     reference_worker_remote_workdir: str | None = None
+    # colocate: share one policy instance for rollout/eval/update.
+    # separate: load a dedicated rollout/eval policy copy (native backend only).
+    policy_runtime_mode: str = "colocate"  # colocate|separate
 
 
 @dataclass
@@ -445,6 +448,10 @@ def _validate_config(cfg: RLPostTrainConfig) -> None:
         raise ValueError("logging.keep_last_n_checkpoints must be >= 0")
     if cfg.model.reference_runtime not in {"worker", "in_process", "cpu"}:
         raise ValueError("model.reference_runtime must be worker|in_process|cpu")
+    if str(cfg.model.policy_runtime_mode).strip().lower() not in {"colocate", "separate"}:
+        raise ValueError("model.policy_runtime_mode must be colocate|separate")
+    if cfg.rl.backend == "deepspeed" and str(cfg.model.policy_runtime_mode).strip().lower() == "separate":
+        raise ValueError("model.policy_runtime_mode=separate is not supported with rl.backend=deepspeed")
     if float(cfg.model.reference_subprocess_timeout_sec) <= 0:
         raise ValueError("model.reference_subprocess_timeout_sec must be > 0.")
     if not isinstance(cfg.model.use_reference_model, bool):

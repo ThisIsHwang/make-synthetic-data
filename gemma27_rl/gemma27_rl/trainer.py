@@ -3337,7 +3337,17 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
     optimizer: torch.optim.Optimizer | None = None
     if use_deepspeed:
         train_model, _ = _deepspeed_initialize(cfg, policy_model)
-    policy_eval_model = _unwrap_for_generation(train_model)
+    policy_runtime_mode = str(cfg.model.policy_runtime_mode or "colocate").strip().lower()
+    if policy_runtime_mode == "separate":
+        if use_deepspeed:
+            raise ValueError(
+                "model.policy_runtime_mode=separate is not supported with rl.backend=deepspeed. "
+                "Use model.policy_runtime_mode=colocate."
+            )
+        # Native-only: keep a dedicated rollout/eval policy copy detached from optimizer/backward.
+        policy_eval_model = _load_policy_model(cfg, device=device, model_name_or_path=policy_source)
+    else:
+        policy_eval_model = _unwrap_for_generation(train_model)
 
     if rank0:
         configured_attn = str(cfg.model.attn_implementation or "auto").strip() or "auto"
@@ -3345,6 +3355,10 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
             "Policy attention uses model.attn_implementation=%s (disable_policy_flash_attention=%s).",
             configured_attn,
             bool(cfg.model.disable_policy_flash_attention),
+        )
+        logger.info(
+            "Policy runtime mode=%s (colocate means single policy instance is shared for rollout/eval/update).",
+            policy_runtime_mode,
         )
 
     ref_model: AutoModelForCausalLM | None = None
