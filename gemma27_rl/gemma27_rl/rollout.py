@@ -157,6 +157,32 @@ def _looks_like_cuda_oom(exc: BaseException) -> bool:
     return ("out of memory" in text) or ("cuda oom" in text)
 
 
+def _error_requires_token_type_ids(exc: BaseException) -> bool:
+    text = str(exc).strip().lower()
+    if "token_type_ids" not in text:
+        return False
+    return ("required" in text) or ("must be provided" in text) or ("missing" in text)
+
+
+def _forward_with_optional_token_type_ids(
+    *,
+    model: PreTrainedModel,
+    input_ids: Any,
+    attention_mask: Any,
+) -> Any:
+    kwargs: dict[str, Any] = {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+    }
+    try:
+        return model(**kwargs)
+    except Exception as exc:
+        if not _error_requires_token_type_ids(exc):
+            raise
+    kwargs["token_type_ids"] = torch.zeros_like(input_ids)
+    return model(**kwargs)
+
+
 def _resolve_model_vocab_size(model: PreTrainedModel) -> int | None:
     try:
         emb = model.get_input_embeddings()
@@ -586,7 +612,42 @@ def compute_token_char_offsets(
         except Exception as exc:  # pragma: no cover - tokenizer dependent
             logger.warning("offset fast-path failed: %s", exc)
 
-    # Fallback for tokenizer/text normalization mismatch: decode each token piece.
+    # Fallback 1: decode growing prefixes. This is slower but robust when
+    # single-token decode strings do not concatenate back to full decode text.
+    if completion_text is None:
+        completion_text = tokenizer.decode(
+            completion_token_ids,
+            clean_up_tokenization_spaces=cfg.clean_up_tokenization_spaces,
+            skip_special_tokens=cfg.skip_special_tokens,
+        )
+    prefix_offsets: list[tuple[int, int]] = []
+    prev_text = ""
+    prefix_ok = True
+    for idx in range(len(completion_token_ids)):
+        try:
+            current_text = tokenizer.decode(
+                completion_token_ids[: idx + 1],
+                clean_up_tokenization_spaces=cfg.clean_up_tokenization_spaces,
+                skip_special_tokens=cfg.skip_special_tokens,
+            )
+        except Exception:
+            prefix_ok = False
+            break
+        if not current_text.startswith(prev_text):
+            prefix_ok = False
+            break
+        prefix_offsets.append((len(prev_text), len(current_text)))
+        prev_text = current_text
+    if prefix_ok and len(prefix_offsets) == len(completion_token_ids):
+        if prev_text != completion_text:
+            logger.warning(
+                "Token offset prefix decode mismatch. prefix_len=%s completion_len=%s",
+                len(prev_text),
+                len(completion_text),
+            )
+        return prefix_offsets
+
+    # Fallback 2: decode each token piece independently.
     offsets: list[tuple[int, int]] = []
     chunks: list[str] = []
     cursor = 0
@@ -598,15 +659,9 @@ def compute_token_char_offsets(
         chunks.append(piece)
 
     reconstructed = "".join(chunks)
-    if completion_text is None:
-        completion_text = tokenizer.decode(
-            completion_token_ids,
-            clean_up_tokenization_spaces=cfg.clean_up_tokenization_spaces,
-            skip_special_tokens=cfg.skip_special_tokens,
-        )
     if reconstructed != completion_text:
         logger.warning(
-            "Token offset reconstruction mismatch. reconstructed_len=%s completion_len=%s",
+            "Token offset reconstruction mismatch (single-token fallback). reconstructed_len=%s completion_len=%s",
             len(reconstructed),
             len(completion_text),
         )
@@ -709,7 +764,11 @@ def compute_completion_logprobs(
     input_ids = torch.tensor([prompt_input_ids + completion_token_ids], device=model_device, dtype=torch.long)
     attn = torch.ones_like(input_ids)
     with torch.no_grad():
-        outputs = model(input_ids=input_ids, attention_mask=attn)
+        outputs = _forward_with_optional_token_type_ids(
+            model=model,
+            input_ids=input_ids,
+            attention_mask=attn,
+        )
     logits = outputs.logits[0]
 
     prompt_len = len(prompt_input_ids)
@@ -792,7 +851,11 @@ def compute_completion_logprobs_batch(
             attn[row_idx, :seq_len] = 1
 
         with torch.no_grad():
-            outputs = model(input_ids=input_ids, attention_mask=attn)
+            outputs = _forward_with_optional_token_type_ids(
+                model=model,
+                input_ids=input_ids,
+                attention_mask=attn,
+            )
         logits = outputs.logits
 
         for row_idx, (_, completion_ids) in enumerate(chunk):
