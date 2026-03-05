@@ -238,6 +238,52 @@ def test_apply_special_token_penalty_id_hit_counter_not_double_counted_with_pena
     assert id_hits == {99: 1}
 
 
+def test_apply_special_token_penalty_does_not_double_count_same_marker_from_id_and_text() -> None:
+    text_hits: dict[str, int] = {}
+    adjusted_tokens, adjusted_seq, occurrences, token_hits = _apply_special_token_penalty(
+        completion_text="<sp>",
+        completion_token_ids=[99],
+        penalty_token_ids=[99],
+        token_char_offsets=[(0, 4)],
+        token_rewards=[0.0],
+        seq_reward=0.0,
+        special_token_ids={99},
+        special_token_strings=["<sp>"],
+        token_penalty=-2.0,
+        seq_penalty_per_occurrence=-3.0,
+        text_hit_counter=text_hits,
+    )
+
+    assert adjusted_tokens == [-2.0]
+    assert adjusted_seq == pytest.approx(-3.0)
+    assert occurrences == 1
+    assert token_hits == 1
+    assert text_hits == {}
+
+
+def test_apply_special_token_penalty_counts_multiple_text_occurrences_even_in_single_token() -> None:
+    text = "<sp><sp>"
+    text_hits: dict[str, int] = {}
+    adjusted_tokens, adjusted_seq, occurrences, token_hits = _apply_special_token_penalty(
+        completion_text=text,
+        completion_token_ids=[11],
+        token_char_offsets=[(0, len(text))],
+        token_rewards=[0.0],
+        seq_reward=0.0,
+        special_token_ids=set(),
+        special_token_strings=["<sp>"],
+        token_penalty=-2.0,
+        seq_penalty_per_occurrence=-3.0,
+        text_hit_counter=text_hits,
+    )
+
+    assert adjusted_tokens == [-2.0]
+    assert adjusted_seq == pytest.approx(-6.0)
+    assert occurrences == 2
+    assert token_hits == 1
+    assert text_hits == {"<sp>": 2}
+
+
 def test_zero_token_rewards_on_special_token_ids_masks_special_positions() -> None:
     token_rewards = [0.0, -3.0, -2.0, 1.0]
     masked = _zero_token_rewards_on_special_token_ids(

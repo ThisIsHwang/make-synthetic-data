@@ -579,16 +579,34 @@ def _apply_special_token_penalty(
     text_matches = _find_special_token_text_spans(completion_text, special_token_strings)
     max_with_offsets = min(len(token_rewards), len(token_char_offsets))
     text_end = len(completion_text.rstrip())
+    seen_text_spans: set[tuple[int, int]] = set()
     for start, end, matched_token_text in text_matches:
         matched_text_lc = completion_text[start:end].lower() if end > start else ""
         if end == text_end and matched_text_lc in exempt_strings_lc:
             continue
-        special_occurrences += 1
-        if text_hit_counter is not None:
-            matched_text = completion_text[start:end] if end > start else ""
-            if not matched_text:
-                matched_text = str(matched_token_text)
-            text_hit_counter[matched_text] = int(text_hit_counter.get(matched_text, 0)) + 1
+        span_key = (int(start), int(end))
+        if span_key in seen_text_spans:
+            continue
+        seen_text_spans.add(span_key)
+        overlapped_indices: list[int] = []
+        for tok_idx in range(max_with_offsets):
+            tok_s, tok_e = token_char_offsets[tok_idx]
+            if _span_overlap_chars(start, end, tok_s, tok_e) > 0:
+                overlapped_indices.append(tok_idx)
+        has_overlap = len(overlapped_indices) > 0
+        all_overlaps_special_id = has_overlap and all(
+            tok_idx < len(completion_token_ids) and int(completion_token_ids[tok_idx]) in special_token_ids
+            for tok_idx in overlapped_indices
+        )
+        # Avoid double-counting the same special marker when it's already counted by ID.
+        should_count_occurrence = not all_overlaps_special_id
+        if should_count_occurrence:
+            special_occurrences += 1
+            if text_hit_counter is not None:
+                matched_text = completion_text[start:end] if end > start else ""
+                if not matched_text:
+                    matched_text = str(matched_token_text)
+                text_hit_counter[matched_text] = int(text_hit_counter.get(matched_text, 0)) + 1
         for tok_idx in range(max_with_offsets):
             tok_s, tok_e = token_char_offsets[tok_idx]
             if _span_overlap_chars(start, end, tok_s, tok_e) <= 0:
@@ -2540,6 +2558,8 @@ def _prepare_rewards_and_advantages(
     special_token_occurrence_counts: list[float] = []
     special_token_hit_counts: list[float] = []
     special_token_penalties: list[float] = []
+    special_token_id_occurrence_totals: list[float] = []
+    special_token_text_occurrence_totals: list[float] = []
     span_special_masked_counts: list[float] = []
     special_token_id_occurrence_counts: dict[int, int] = {}
     special_token_text_occurrence_counts: dict[str, int] = {}
@@ -2571,6 +2591,7 @@ def _prepare_rewards_and_advantages(
             token_penalty=think_tag_token_penalty,
             seq_penalty_per_match=think_tag_seq_penalty,
         )
+        think_penalty_delta = (float(sum(token_rewards)) - token_reward_sum_before) + (float(seq_reward) - seq_reward_before)
         special_sum_before = float(sum(token_rewards))
         special_seq_before = float(seq_reward)
         rollout_special_id_hits: dict[int, int] = {}
@@ -2591,6 +2612,9 @@ def _prepare_rewards_and_advantages(
             id_hit_counter=rollout_special_id_hits,
             text_hit_counter=rollout_special_text_hits,
         )
+        special_penalty_delta = (float(sum(token_rewards)) - special_sum_before) + (float(seq_reward) - special_seq_before)
+        special_id_occurrences = float(sum(int(v) for v in rollout_special_id_hits.values()))
+        special_text_occurrences = float(sum(int(v) for v in rollout_special_text_hits.values()))
         if special_occurrences > 0 and (rollout_special_id_hits or rollout_special_text_hits):
             for tok_id, count in rollout_special_id_hits.items():
                 special_token_id_occurrence_counts[tok_id] = int(special_token_id_occurrence_counts.get(tok_id, 0)) + int(count)
@@ -2619,6 +2643,7 @@ def _prepare_rewards_and_advantages(
             min_repeat_run_length=repeat_min_run,
             max_repeat_pattern_length=repeat_max_pattern,
         )
+        repeat_penalty_delta = (float(sum(token_rewards)) - repeat_sum_before) + (float(seq_reward) - repeat_seq_before)
         ngram_sum_before = float(sum(token_rewards))
         ngram_seq_before = float(seq_reward)
         token_rewards, seq_reward, ngram_token_hit_count, ngram_repeat_count = _apply_ngram_repeat_penalty(
@@ -2630,6 +2655,7 @@ def _prepare_rewards_and_advantages(
             ngram_size=ngram_repeat_n,
             min_occurrences=ngram_min_occurrences,
         )
+        ngram_penalty_delta = (float(sum(token_rewards)) - ngram_sum_before) + (float(seq_reward) - ngram_seq_before)
         seq_row = broadcast_sequence_reward(seq_reward, token_count=len(token_rewards))
         raw_adv = combine_advantages(seq_row, token_rewards)
 
@@ -2637,22 +2663,18 @@ def _prepare_rewards_and_advantages(
         raw_adv_rows.append(raw_adv)
         think_tag_counts.append(float(forbidden_tag_count))
         think_tag_token_hits.append(float(forbidden_token_hits))
-        think_tag_penalties.append(
-            (float(sum(token_rewards)) - token_reward_sum_before) + (float(seq_reward) - seq_reward_before)
-        )
+        think_tag_penalties.append(float(think_penalty_delta))
         repeat_token_counts.append(float(repeat_token_count))
         repeat_run_counts.append(float(repeat_run_count))
-        repeat_penalties.append((float(sum(token_rewards)) - repeat_sum_before) + (float(seq_reward) - repeat_seq_before))
+        repeat_penalties.append(float(repeat_penalty_delta))
         ngram_repeat_token_hits.append(float(ngram_token_hit_count))
         ngram_repeat_occurrences.append(float(ngram_repeat_count))
-        ngram_repeat_penalties.append(
-            (float(sum(token_rewards)) - ngram_sum_before) + (float(seq_reward) - ngram_seq_before)
-        )
+        ngram_repeat_penalties.append(float(ngram_penalty_delta))
         special_token_occurrence_counts.append(float(special_occurrences))
         special_token_hit_counts.append(float(special_token_hits))
-        special_token_penalties.append(
-            (float(sum(token_rewards)) - special_sum_before) + (float(seq_reward) - special_seq_before)
-        )
+        special_token_penalties.append(float(special_penalty_delta))
+        special_token_id_occurrence_totals.append(float(special_id_occurrences))
+        special_token_text_occurrence_totals.append(float(special_text_occurrences))
         span_special_masked_counts.append(float(span_special_masked))
         if debug_span_loss and len(debug_span_records) < debug_span_max_rollouts:
             debug_span_records.append(
@@ -2708,8 +2730,10 @@ def _prepare_rewards_and_advantages(
     total_special_occurrences = int(sum(special_token_occurrence_counts))
     if total_special_occurrences > 0:
         logger.info(
-            "special token penalty applied: occurrences=%s token_hits=%s token_penalty=%.1f seq_penalty=%.1f ids=%s strings=%s top_id_hits=[%s] top_text_hits=[%s]",
+            "special token penalty applied: occurrences=%s id_occurrences=%s text_occurrences=%s token_hits=%s token_penalty=%.1f seq_penalty=%.1f ids=%s strings=%s top_id_hits=[%s] top_text_hits=[%s]",
             total_special_occurrences,
+            int(sum(special_token_id_occurrence_totals)),
+            int(sum(special_token_text_occurrence_totals)),
             int(sum(special_token_hit_counts)),
             float(special_token_penalty),
             float(special_seq_penalty),
@@ -2828,6 +2852,14 @@ def _prepare_rewards_and_advantages(
         "special_token_hit_count_mean": float(mean(special_token_hit_counts) if special_token_hit_counts else 0.0),
         "special_token_penalty_mean": float(mean(special_token_penalties) if special_token_penalties else 0.0),
         "special_token_penalty_total": float(sum(special_token_penalties)),
+        "special_token_id_occurrence_count_mean": float(
+            mean(special_token_id_occurrence_totals) if special_token_id_occurrence_totals else 0.0
+        ),
+        "special_token_id_occurrence_count_total": float(sum(special_token_id_occurrence_totals)),
+        "special_token_text_occurrence_count_mean": float(
+            mean(special_token_text_occurrence_totals) if special_token_text_occurrence_totals else 0.0
+        ),
+        "special_token_text_occurrence_count_total": float(sum(special_token_text_occurrence_totals)),
         "span_special_masked_token_count_mean": float(
             mean(span_special_masked_counts) if span_special_masked_counts else 0.0
         ),
