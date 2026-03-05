@@ -64,3 +64,29 @@ def test_keep_last_n_checkpoints_must_be_non_negative(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="logging.keep_last_n_checkpoints must be >= 0"):
         _ = load_config(cfg_path)
+
+
+def test_disable_reference_model_allows_reference_gpu_settings_without_deepspeed(tmp_path: Path) -> None:
+    cfg_path = tmp_path / "train.yaml"
+    cfg_path.write_text(
+        "\n".join(
+            [
+                "data:",
+                "  hf_dataset_name: dummy/dataset",
+                "model:",
+                "  use_reference_model: false",
+                "  reference_gpu_ids: [0, 1]",
+                "reward:",
+                "  xcomet:",
+                "    enabled: false",
+                "  mqm:",
+                "    enabled: false",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    cfg = load_config(cfg_path)
+    assert cfg.model.use_reference_model is False
+    assert cfg.model.reference_gpu_ids == [0, 1]

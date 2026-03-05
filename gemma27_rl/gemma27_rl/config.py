@@ -24,6 +24,8 @@ def _require_yaml():
 class ModelConfig:
     policy_name_or_path: str = "../outputs/gemma3-27b-it-sft"
     reference_name_or_path: str | None = None
+    # When false, skip loading/using reference model even if rl.kl_coef > 0.
+    use_reference_model: bool = True
     tokenizer_name_or_path: str | None = None
     trust_remote_code: bool = False
     attn_implementation: str | None = "auto"
@@ -445,6 +447,8 @@ def _validate_config(cfg: RLPostTrainConfig) -> None:
         raise ValueError("model.reference_runtime must be worker|in_process|cpu")
     if float(cfg.model.reference_subprocess_timeout_sec) <= 0:
         raise ValueError("model.reference_subprocess_timeout_sec must be > 0.")
+    if not isinstance(cfg.model.use_reference_model, bool):
+        raise ValueError("model.use_reference_model must be a bool.")
     if not isinstance(cfg.model.disable_policy_flash_attention, bool):
         raise ValueError("model.disable_policy_flash_attention must be a bool.")
     if int(cfg.model.reference_logprob_micro_batch_size) <= 0:
@@ -555,6 +559,7 @@ def _validate_config(cfg: RLPostTrainConfig) -> None:
 
     cfg.model.policy_gpu_ids = _normalize_gpu_ids(cfg.model.policy_gpu_ids, "model.policy_gpu_ids")
     cfg.model.reference_gpu_ids = _normalize_gpu_ids(cfg.model.reference_gpu_ids, "model.reference_gpu_ids")
+    reference_enabled = bool(cfg.model.use_reference_model and float(cfg.rl.kl_coef) > 0.0)
 
     reference_host = _effective_worker_host(cfg.model.reference_worker_host, cfg.misc.aux_worker_host)
     metricx_host = _effective_worker_host(cfg.reward.metricx.worker_host, cfg.misc.aux_worker_host)
@@ -570,13 +575,13 @@ def _validate_config(cfg: RLPostTrainConfig) -> None:
                 "model.policy_gpu_ids with length > 1 requires rl.backend=deepspeed "
                 "(device_map=auto path is disabled)."
             )
-        if len(cfg.model.reference_gpu_ids) > 1:
+        if reference_enabled and len(cfg.model.reference_gpu_ids) > 1:
             raise ValueError(
                 "model.reference_gpu_ids with length > 1 is not supported without deepspeed."
             )
 
     policy_set = set(cfg.model.policy_gpu_ids)
-    ref_set = set(cfg.model.reference_gpu_ids) if reference_host is None else set()
+    ref_set = set(cfg.model.reference_gpu_ids) if (reference_enabled and reference_host is None) else set()
     overlap = sorted(policy_set & ref_set)
     if overlap:
         raise ValueError(
@@ -588,9 +593,9 @@ def _validate_config(cfg: RLPostTrainConfig) -> None:
     metricx_idx = _parse_cuda_index(cfg.reward.metricx.device if cfg.reward.metricx.enabled else None)
     xcomet_idx = _parse_cuda_index(cfg.reward.xcomet.device if cfg.reward.xcomet.enabled else None)
     reference_idx = None
-    if cfg.model.reference_gpu_ids:
+    if reference_enabled and cfg.model.reference_gpu_ids:
         reference_idx = int(cfg.model.reference_gpu_ids[0])
-    elif cfg.model.reference_runtime != "cpu":
+    elif reference_enabled and cfg.model.reference_runtime != "cpu":
         reference_idx = _parse_cuda_index(cfg.model.reference_device)
 
     if metricx_host is None and metricx_idx is not None and metricx_idx in reserved:

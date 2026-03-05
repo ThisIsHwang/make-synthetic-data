@@ -2032,8 +2032,12 @@ def _load_policy_model(
     )
 
 
+def _reference_kl_enabled(cfg: RLPostTrainConfig) -> bool:
+    return bool(cfg.model.use_reference_model and float(cfg.rl.kl_coef) > 0.0)
+
+
 def _load_reference_model(cfg: RLPostTrainConfig, default_device: str) -> tuple[AutoModelForCausalLM | None, str | None]:
-    if cfg.rl.kl_coef <= 0:
+    if not _reference_kl_enabled(cfg):
         return None, None
 
     ref_name = cfg.model.reference_name_or_path or cfg.model.policy_name_or_path
@@ -2081,7 +2085,7 @@ def _create_reference_logprob_client(
     cfg: RLPostTrainConfig,
     default_device: str,
 ) -> tuple[ReferenceLogprobClient | None, str | None]:
-    if cfg.rl.kl_coef <= 0:
+    if not _reference_kl_enabled(cfg):
         return None, None
 
     ref_name = cfg.model.reference_name_or_path or cfg.model.policy_name_or_path
@@ -2881,7 +2885,7 @@ def _fill_missing_reference_logprobs(
     ref_device: str | None,
     device: str,
 ) -> int:
-    if (not merged_rollouts) or cfg.rl.kl_coef <= 0:
+    if (not merged_rollouts) or (not _reference_kl_enabled(cfg)):
         return 0
 
     missing_idx = [i for i, rollout in enumerate(merged_rollouts) if rollout.ref_logprobs is None]
@@ -3352,14 +3356,20 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
     ref_model: AutoModelForCausalLM | None = None
     ref_device: str | None = None
     ref_logprob_client: ReferenceLogprobClient | None = None
+    reference_kl_enabled = _reference_kl_enabled(cfg)
+    if rank0 and (float(cfg.rl.kl_coef) > 0.0) and (not reference_kl_enabled):
+        logger.info(
+            "Reference model is disabled (model.use_reference_model=false); KL-to-reference term will be skipped."
+        )
     if (not use_deepspeed) or rank0:
-        reference_runtime = str(cfg.model.reference_runtime or "worker").strip().lower()
-        if reference_runtime == "worker":
-            ref_logprob_client, ref_device = _create_reference_logprob_client(cfg, default_device=device)
-        elif reference_runtime == "cpu":
-            ref_model, ref_device = _load_reference_model(cfg, default_device="cpu")
-        else:
-            ref_model, ref_device = _load_reference_model(cfg, default_device=device)
+        if reference_kl_enabled:
+            reference_runtime = str(cfg.model.reference_runtime or "worker").strip().lower()
+            if reference_runtime == "worker":
+                ref_logprob_client, ref_device = _create_reference_logprob_client(cfg, default_device=device)
+            elif reference_runtime == "cpu":
+                ref_model, ref_device = _load_reference_model(cfg, default_device="cpu")
+            else:
+                ref_model, ref_device = _load_reference_model(cfg, default_device=device)
 
     train_examples = load_examples(cfg.data, split="train", limit=cfg.data.limit)
     if not train_examples:
@@ -3860,7 +3870,7 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
                             tokenizer=tokenizer,
                         )
                         ref_fill_future = None
-                        if cfg.rl.kl_coef > 0:
+                        if reference_kl_enabled:
                             ref_fill_future = step_executor.submit(
                                 _fill_missing_reference_logprobs,
                                 merged_rollouts=merged_rollouts,
@@ -3970,7 +3980,7 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
                     esa_cache=esa_cache,
                     tokenizer=tokenizer,
                 )
-                if cfg.rl.kl_coef > 0:
+                if reference_kl_enabled:
                     _ = _fill_missing_reference_logprobs(
                         merged_rollouts=rollouts,
                         cfg=cfg,
