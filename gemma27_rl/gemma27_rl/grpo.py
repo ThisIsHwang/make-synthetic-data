@@ -227,22 +227,39 @@ def _align_tensors(
     old_logprobs: list[float],
     advantages: list[float],
     ref_logprobs: list[float] | None,
+    *,
+    example_id: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
     target_device = new_logprobs.device
-    length = min(len(new_logprobs), len(old_logprobs), len(advantages))
-    if ref_logprobs is not None:
-        length = min(length, len(ref_logprobs))
+    new_len = int(len(new_logprobs))
+    old_len = int(len(old_logprobs))
+    adv_len = int(len(advantages))
+    if new_len != old_len or new_len != adv_len:
+        context = f" example_id={example_id}" if example_id is not None else ""
+        raise ValueError(
+            "token-alignment length mismatch:"
+            f"{context} new_logprobs={new_len} old_logprobs={old_len} advantages={adv_len}"
+        )
 
-    if length <= 0:
+    if ref_logprobs is not None:
+        ref_len = int(len(ref_logprobs))
+        if ref_len != new_len:
+            context = f" example_id={example_id}" if example_id is not None else ""
+            raise ValueError(
+                "token-alignment length mismatch:"
+                f"{context} new_logprobs={new_len} ref_logprobs={ref_len}"
+            )
+
+    if new_len <= 0:
         empty = torch.empty(0, device=target_device, dtype=new_logprobs.dtype)
         return empty, empty, empty, None
 
-    new_lp = new_logprobs[:length]
-    old_lp = torch.tensor(old_logprobs[:length], device=target_device, dtype=new_logprobs.dtype)
-    adv = torch.tensor(advantages[:length], device=target_device, dtype=new_logprobs.dtype)
+    new_lp = new_logprobs
+    old_lp = torch.tensor(old_logprobs, device=target_device, dtype=new_logprobs.dtype)
+    adv = torch.tensor(advantages, device=target_device, dtype=new_logprobs.dtype)
     ref_lp = None
     if ref_logprobs is not None:
-        ref_lp = torch.tensor(ref_logprobs[:length], device=target_device, dtype=new_logprobs.dtype)
+        ref_lp = torch.tensor(ref_logprobs, device=target_device, dtype=new_logprobs.dtype)
     return new_lp, old_lp, adv, ref_lp
 
 
@@ -329,6 +346,7 @@ def update_policy(
             old_logprobs=rollout.old_logprobs,
             advantages=adv_row,
             ref_logprobs=rollout.ref_logprobs,
+            example_id=rollout.example_id,
         )
         if new_lp.numel() == 0:
             continue
