@@ -29,6 +29,24 @@ class TinyGemmaLikeLM(nn.Module):
         return SimpleNamespace(logits=logits)
 
 
+class TinyNeedsTokenTypeLM(nn.Module):
+    def __init__(self, vocab_size: int = 32, hidden_size: int = 16):
+        super().__init__()
+        self.config = SimpleNamespace(model_type="other", vocab_size=vocab_size)
+        self.emb = nn.Embedding(vocab_size, hidden_size)
+        self.proj = nn.Linear(hidden_size, vocab_size)
+        self.last_token_type_ids = None
+
+    def forward(self, input_ids, attention_mask=None, token_type_ids=None, use_cache=None):
+        del attention_mask, use_cache
+        if token_type_ids is None:
+            raise ValueError("token_type_ids is required as a model input when training")
+        self.last_token_type_ids = token_type_ids.detach().clone()
+        x = self.emb(input_ids)
+        logits = self.proj(x)
+        return SimpleNamespace(logits=logits)
+
+
 def test_update_policy_includes_token_type_ids_for_gemma_models() -> None:
     torch.manual_seed(0)
     model = TinyGemmaLikeLM(vocab_size=64, hidden_size=32)
@@ -65,3 +83,37 @@ def test_update_policy_includes_token_type_ids_for_gemma_models() -> None:
     expected_shape = (1, len(prompt_ids) + len(completion_ids))
     assert tuple(model.last_token_type_ids.shape) == expected_shape
     assert torch.count_nonzero(model.last_token_type_ids).item() == 0
+
+
+def test_update_policy_retries_with_token_type_ids_when_model_requires_it() -> None:
+    torch.manual_seed(0)
+    model = TinyNeedsTokenTypeLM(vocab_size=64, hidden_size=32)
+    device = "cpu"
+
+    prompt_ids = [1, 2, 3]
+    completion_ids = [4, 5, 6]
+    rollout = Rollout(
+        example_id="ex-required-token-type",
+        prompt_text="p",
+        prompt_input_ids=prompt_ids,
+        completion_text="c",
+        completion_token_ids=completion_ids,
+        old_logprobs=[0.0, 0.0, 0.0],
+        ref_logprobs=None,
+        token_char_offsets=[(0, 1), (1, 2), (2, 3)],
+        src_text="src",
+        ref_text=None,
+    )
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-2)
+    _ = update_policy(
+        rollouts=[rollout],
+        advantages=[[0.1, -0.1, 0.2]],
+        policy_model=model,
+        optimizer=optimizer,
+        rl_cfg=RLConfig(algorithm="grpo", clip_eps=0.2, kl_coef=0.0, entropy_coef=0.0),
+        device=device,
+    )
+
+    assert model.last_token_type_ids is not None
+    assert tuple(model.last_token_type_ids.shape) == (1, len(prompt_ids) + len(completion_ids))

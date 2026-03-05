@@ -61,16 +61,55 @@ def _resolve_model_vocab_size(model: nn.Module) -> int | None:
     return size if size > 0 else None
 
 
+def _iter_model_candidates(model: nn.Module) -> list[Any]:
+    candidates: list[Any] = []
+    queue: list[Any] = [model]
+    seen: set[int] = set()
+    while queue and len(candidates) < 8:
+        current = queue.pop(0)
+        marker = id(current)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        candidates.append(current)
+        for attr_name in ("module", "model", "base_model"):
+            nested = getattr(current, attr_name, None)
+            if nested is None:
+                continue
+            if id(nested) in seen:
+                continue
+            queue.append(nested)
+    return candidates
+
+
 def _is_gemma_like_model(model: nn.Module) -> bool:
-    cfg_obj = getattr(model, "config", None)
-    model_type = str(getattr(cfg_obj, "model_type", "") or "").strip().lower()
-    if "gemma" in model_type:
-        return True
-    model_name = str(getattr(cfg_obj, "_name_or_path", "") or "").strip().lower()
-    if "gemma" in model_name:
-        return True
-    cls_name = model.__class__.__name__.lower()
-    return "gemma" in cls_name
+    for candidate in _iter_model_candidates(model):
+        cfg_obj = getattr(candidate, "config", None)
+        model_type = str(getattr(cfg_obj, "model_type", "") or "").strip().lower()
+        if "gemma" in model_type:
+            return True
+        model_name = str(getattr(cfg_obj, "_name_or_path", "") or "").strip().lower()
+        if "gemma" in model_name:
+            return True
+        cls_name = candidate.__class__.__name__.lower()
+        if "gemma" in cls_name:
+            return True
+    return False
+
+
+def _error_requires_token_type_ids(exc: BaseException) -> bool:
+    text = str(exc).strip().lower()
+    if "token_type_ids" not in text:
+        return False
+    return ("required" in text) or ("must be provided" in text) or ("missing" in text)
+
+
+def _call_policy_forward(policy_model: nn.Module, kwargs: dict[str, Any]) -> Any:
+    try:
+        # Keep training activation memory bounded; KV cache is only useful for autoregressive generation.
+        return policy_model(use_cache=False, **kwargs)
+    except TypeError:
+        return policy_model(**kwargs)
 
 
 def _forward_policy_model(
@@ -82,36 +121,30 @@ def _forward_policy_model(
 ) -> Any:
     global _GEMMA_TOKEN_TYPE_IDS_FALLBACK_WARNED
 
-    base_kwargs: dict[str, Any] = {
+    kwargs_without_token_type_ids: dict[str, Any] = {
         "input_ids": input_ids,
         "attention_mask": attention_mask,
     }
+    kwargs_with_token_type_ids = dict(kwargs_without_token_type_ids)
+    kwargs_with_token_type_ids["token_type_ids"] = torch.zeros_like(input_ids)
+
     if include_token_type_ids:
-        base_kwargs["token_type_ids"] = torch.zeros_like(input_ids)
+        try:
+            return _call_policy_forward(policy_model, kwargs_with_token_type_ids)
+        except TypeError:
+            if not _GEMMA_TOKEN_TYPE_IDS_FALLBACK_WARNED:
+                _GEMMA_TOKEN_TYPE_IDS_FALLBACK_WARNED = True
+                logger.warning(
+                    "Gemma token_type_ids were requested but model forward rejected them; retrying without token_type_ids."
+                )
+            return _call_policy_forward(policy_model, kwargs_without_token_type_ids)
 
     try:
-        # Keep training activation memory bounded; KV cache is only useful for autoregressive generation.
-        return policy_model(use_cache=False, **base_kwargs)
-    except TypeError:
-        pass
-
-    try:
-        return policy_model(**base_kwargs)
-    except TypeError:
-        if "token_type_ids" not in base_kwargs:
+        return _call_policy_forward(policy_model, kwargs_without_token_type_ids)
+    except Exception as exc:
+        if not _error_requires_token_type_ids(exc):
             raise
-
-    fallback_kwargs = dict(base_kwargs)
-    fallback_kwargs.pop("token_type_ids", None)
-    if not _GEMMA_TOKEN_TYPE_IDS_FALLBACK_WARNED:
-        _GEMMA_TOKEN_TYPE_IDS_FALLBACK_WARNED = True
-        logger.warning(
-            "Gemma token_type_ids were requested but model forward rejected them; retrying without token_type_ids."
-        )
-    try:
-        return policy_model(use_cache=False, **fallback_kwargs)
-    except TypeError:
-        return policy_model(**fallback_kwargs)
+        return _call_policy_forward(policy_model, kwargs_with_token_type_ids)
 
 
 def _safe_token_texts(tokenizer: Any, token_id: int) -> tuple[str, str]:
