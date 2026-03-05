@@ -323,6 +323,40 @@ def _decode_single_token(tokenizer: PreTrainedTokenizerBase, token_id: int, cfg:
     )
 
 
+def _rescale_offsets_to_length(offsets: list[tuple[int, int]], target_len: int) -> list[tuple[int, int]]:
+    if not offsets:
+        return []
+    n = len(offsets)
+    target = max(0, int(target_len))
+    src_end = int(offsets[-1][1]) if offsets else 0
+
+    bounds: list[int] = [0]
+    if src_end <= 0:
+        # Degenerate source: distribute target length uniformly.
+        for i in range(1, n + 1):
+            bounds.append(int(round((target * i) / float(n))))
+    else:
+        for _, end in offsets:
+            scaled = int(round((float(end) / float(src_end)) * float(target)))
+            bounds.append(scaled)
+
+    # Enforce monotonic in [0, target], and force exact final boundary.
+    bounds[0] = 0
+    for i in range(1, len(bounds)):
+        if bounds[i] < bounds[i - 1]:
+            bounds[i] = bounds[i - 1]
+        if bounds[i] > target:
+            bounds[i] = target
+    bounds[-1] = target
+    for i in range(len(bounds) - 2, -1, -1):
+        if bounds[i] > bounds[i + 1]:
+            bounds[i] = bounds[i + 1]
+        if bounds[i] < 0:
+            bounds[i] = 0
+
+    return [(int(bounds[i]), int(bounds[i + 1])) for i in range(n)]
+
+
 def _resolve_eos_token_ids(
     tokenizer_eos_token_id: int | list[int] | None,
     model_eos_token_id: int | list[int] | None,
@@ -623,8 +657,9 @@ def compute_token_char_offsets(
             skip_special_tokens=cfg.skip_special_tokens,
         )
     prefix_offsets: list[tuple[int, int]] = []
+    prefix_lens: list[int] = []
     prev_text = ""
-    prefix_ok = True
+    strict_prefix_ok = True
     for idx in range(len(completion_token_ids)):
         try:
             current_text = tokenizer.decode(
@@ -633,14 +668,17 @@ def compute_token_char_offsets(
                 skip_special_tokens=cfg.skip_special_tokens,
             )
         except Exception:
-            prefix_ok = False
+            strict_prefix_ok = False
             break
-        if not current_text.startswith(prev_text):
-            prefix_ok = False
-            break
-        prefix_offsets.append((len(prev_text), len(current_text)))
+        cur_len = len(current_text)
+        prefix_lens.append(cur_len)
+        if strict_prefix_ok and current_text.startswith(prev_text):
+            prefix_offsets.append((len(prev_text), cur_len))
+        else:
+            strict_prefix_ok = False
         prev_text = current_text
-    if prefix_ok and len(prefix_offsets) == len(completion_token_ids):
+
+    if strict_prefix_ok and len(prefix_offsets) == len(completion_token_ids):
         if prev_text != completion_text:
             logger.warning(
                 "Token offset prefix decode mismatch. prefix_len=%s completion_len=%s",
@@ -648,6 +686,25 @@ def compute_token_char_offsets(
                 len(completion_text),
             )
         return prefix_offsets
+
+    # Fallback 1b: some tokenizers rewrite previous chars across prefix boundaries.
+    # If prefix decode lengths are monotonic and end at the same final length, keep
+    # length-derived boundaries even when strict text-prefix check fails.
+    if len(prefix_lens) == len(completion_token_ids):
+        monotonic = True
+        prev_len = 0
+        for cur_len in prefix_lens:
+            if cur_len < prev_len:
+                monotonic = False
+                break
+            prev_len = cur_len
+        if monotonic and prev_len == len(completion_text):
+            out: list[tuple[int, int]] = []
+            start = 0
+            for end in prefix_lens:
+                out.append((start, int(end)))
+                start = int(end)
+            return out
 
     # Fallback 2: decode each token piece independently.
     offsets: list[tuple[int, int]] = []
@@ -662,6 +719,17 @@ def compute_token_char_offsets(
 
     reconstructed = "".join(chunks)
     if reconstructed != completion_text:
+        # Last-resort guard: keep monotonic offsets aligned to completion_text length
+        # so downstream span-to-token projection remains in-range.
+        adjusted = _rescale_offsets_to_length(offsets, len(completion_text))
+        if adjusted:
+            logger.debug(
+                "Token offset reconstruction mismatch (single-token fallback). "
+                "reconstructed_len=%s completion_len=%s; applied rescaled offsets.",
+                len(reconstructed),
+                len(completion_text),
+            )
+            return adjusted
         logger.warning(
             "Token offset reconstruction mismatch (single-token fallback). reconstructed_len=%s completion_len=%s",
             len(reconstructed),
