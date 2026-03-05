@@ -1912,24 +1912,15 @@ def _load_policy_model(
     device: str,
     model_name_or_path: str | None = None,
 ) -> AutoModelForCausalLM:
-    dtype, _ = _resolve_model_dtype_and_attn(cfg, device)
-    device_text = str(device).strip().lower()
-    if not device_text.startswith("cuda"):
-        raise RuntimeError(
-            "Policy flash_attention_2 is forced, but policy device is non-CUDA: "
-            f"{device}. Use a CUDA device for training."
-        )
-    if dtype not in {torch.float16, torch.bfloat16}:
-        logger.warning(
-            "Policy flash_attention_2 is forced. Overriding policy dtype from %s to bfloat16.",
-            dtype,
-        )
-        dtype = torch.bfloat16
-    attn_impl = "flash_attention_2"
+    dtype, attn_impl = _resolve_model_dtype_and_attn(cfg, device)
     if cfg.model.disable_policy_flash_attention:
-        logger.warning(
-            "Ignoring model.disable_policy_flash_attention=true because policy flash_attention_2 is forced."
-        )
+        attn_text = str(attn_impl or "").strip().lower()
+        if attn_text == "flash_attention_2":
+            logger.warning(
+                "Policy flash_attention_2 is disabled by model.disable_policy_flash_attention=true; "
+                "falling back to sdpa for training stability."
+            )
+            attn_impl = "sdpa"
 
     kwargs: dict[str, Any] = {
         "trust_remote_code": cfg.model.trust_remote_code,
@@ -3349,7 +3340,12 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
     policy_eval_model = _unwrap_for_generation(train_model)
 
     if rank0:
-        logger.info("Policy attention is fixed to flash_attention_2 for rollout/eval/update (config ignored).")
+        configured_attn = str(cfg.model.attn_implementation or "auto").strip() or "auto"
+        logger.info(
+            "Policy attention uses model.attn_implementation=%s (disable_policy_flash_attention=%s).",
+            configured_attn,
+            bool(cfg.model.disable_policy_flash_attention),
+        )
 
     ref_model: AutoModelForCausalLM | None = None
     ref_device: str | None = None
