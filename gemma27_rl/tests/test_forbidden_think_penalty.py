@@ -107,6 +107,7 @@ def test_sanitize_text_for_mqm_esa_removes_special_and_think_markers() -> None:
 
 
 def test_apply_special_token_penalty_penalizes_special_token_id_hits() -> None:
+    id_hits: dict[int, int] = {}
     adjusted_tokens, adjusted_seq, occurrences, token_hits = _apply_special_token_penalty(
         completion_text="abc",
         completion_token_ids=[11, 99, 12],
@@ -117,16 +118,19 @@ def test_apply_special_token_penalty_penalizes_special_token_id_hits() -> None:
         special_token_strings=[],
         token_penalty=-5.0,
         seq_penalty_per_occurrence=-2.0,
+        id_hit_counter=id_hits,
     )
 
     assert adjusted_tokens == [0.0, -5.0, 0.0]
     assert adjusted_seq == pytest.approx(-2.0)
     assert occurrences == 1
     assert token_hits == 1
+    assert id_hits == {99: 1}
 
 
 def test_apply_special_token_penalty_penalizes_special_token_text_hits() -> None:
     text = "hello <|assistant|> world"
+    text_hits: dict[str, int] = {}
     adjusted_tokens, adjusted_seq, occurrences, token_hits = _apply_special_token_penalty(
         completion_text=text,
         completion_token_ids=[11],
@@ -137,12 +141,14 @@ def test_apply_special_token_penalty_penalizes_special_token_text_hits() -> None
         special_token_strings=["<|assistant|>"],
         token_penalty=-4.0,
         seq_penalty_per_occurrence=-3.0,
+        text_hit_counter=text_hits,
     )
 
     assert adjusted_tokens == [-4.0]
     assert adjusted_seq == pytest.approx(-2.0)
     assert occurrences == 1
     assert token_hits == 1
+    assert text_hits.get("<|assistant|>", 0) == 1
 
 
 def test_apply_special_token_penalty_skips_final_exempt_end_of_turn_token_id() -> None:

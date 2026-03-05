@@ -372,6 +372,46 @@ def _collect_tokenizer_special_token_ids(tokenizer: Any | None) -> set[int]:
     return out
 
 
+def _build_special_token_id_label_map(tokenizer: Any | None, special_token_ids: set[int]) -> dict[int, str]:
+    if tokenizer is None or not special_token_ids:
+        return {}
+    labels: dict[int, str] = {}
+    converter = getattr(tokenizer, "convert_ids_to_tokens", None)
+    if callable(converter):
+        for tok_id in sorted(special_token_ids):
+            try:
+                token_text = converter(int(tok_id))
+            except Exception:
+                continue
+            if isinstance(token_text, str) and token_text:
+                labels[int(tok_id)] = token_text
+    return labels
+
+
+def _format_top_special_id_counts(
+    id_counts: dict[int, int],
+    *,
+    id_label_map: dict[int, str],
+    limit: int = 8,
+) -> str:
+    if not id_counts:
+        return "-"
+    rows = sorted(id_counts.items(), key=lambda item: (-int(item[1]), int(item[0])))
+    shown = rows[: max(1, int(limit))]
+    return ", ".join(
+        f"{id_label_map.get(tok_id, str(tok_id))}(id={tok_id}):{count}"
+        for tok_id, count in shown
+    )
+
+
+def _format_top_special_text_counts(text_counts: dict[str, int], *, limit: int = 8) -> str:
+    if not text_counts:
+        return "-"
+    rows = sorted(text_counts.items(), key=lambda item: (-int(item[1]), str(item[0])))
+    shown = rows[: max(1, int(limit))]
+    return ", ".join(f"{_short_text(text, limit=60)}:{count}" for text, count in shown)
+
+
 def _find_special_token_text_spans(text: str, special_tokens: list[str]) -> list[tuple[int, int, str]]:
     if not text or not special_tokens:
         return []
@@ -448,6 +488,7 @@ def _count_special_token_id_occurrences(
     token_ids: list[int],
     special_token_ids: set[int],
     exempt_final_token_ids: set[int] | None = None,
+    hit_counter: dict[int, int] | None = None,
 ) -> int:
     if not token_ids or not special_token_ids:
         return 0
@@ -461,6 +502,8 @@ def _count_special_token_id_occurrences(
         if tok_idx == final_idx and tok_id in exempt_ids:
             continue
         occurrences += 1
+        if hit_counter is not None:
+            hit_counter[tok_id] = int(hit_counter.get(tok_id, 0)) + 1
     return occurrences
 
 
@@ -478,6 +521,8 @@ def _apply_special_token_penalty(
     seq_penalty_per_occurrence: float,
     exempt_final_token_ids: set[int] | None = None,
     exempt_final_token_strings: set[str] | None = None,
+    id_hit_counter: dict[int, int] | None = None,
+    text_hit_counter: dict[str, int] | None = None,
 ) -> tuple[list[float], float, int, int]:
     exempt_ids = exempt_final_token_ids or set()
     exempt_strings_lc = {str(tok).lower() for tok in (exempt_final_token_strings or set()) if str(tok)}
@@ -494,6 +539,8 @@ def _apply_special_token_penalty(
         if tok_idx == final_token_idx and token_id in exempt_ids:
             continue
         completion_id_occurrences += 1
+        if id_hit_counter is not None:
+            id_hit_counter[token_id] = int(id_hit_counter.get(token_id, 0)) + 1
         token_hits.add(tok_idx)
         token_rewards[tok_idx] += float(token_penalty)
 
@@ -505,16 +552,22 @@ def _apply_special_token_penalty(
             token_ids=seq_id_source,
             special_token_ids=special_token_ids,
             exempt_final_token_ids=exempt_ids,
+            hit_counter=id_hit_counter,
         )
 
     text_matches = _find_special_token_text_spans(completion_text, special_token_strings)
     max_with_offsets = min(len(token_rewards), len(token_char_offsets))
     text_end = len(completion_text.rstrip())
-    for start, end, _ in text_matches:
+    for start, end, matched_token_text in text_matches:
         matched_text_lc = completion_text[start:end].lower() if end > start else ""
         if end == text_end and matched_text_lc in exempt_strings_lc:
             continue
         special_occurrences += 1
+        if text_hit_counter is not None:
+            matched_text = completion_text[start:end] if end > start else ""
+            if not matched_text:
+                matched_text = str(matched_token_text)
+            text_hit_counter[matched_text] = int(text_hit_counter.get(matched_text, 0)) + 1
         for tok_idx in range(max_with_offsets):
             tok_s, tok_e = token_char_offsets[tok_idx]
             if _span_overlap_chars(start, end, tok_s, tok_e) <= 0:
@@ -2225,6 +2278,7 @@ def _prepare_rewards_and_advantages(
     samples = [SampleForScoring(src=r.src_text, mt=r.completion_text, ref=r.ref_text) for r in rollouts]
     special_token_strings = _collect_tokenizer_special_token_strings(tokenizer)
     special_token_ids = _collect_tokenizer_special_token_ids(tokenizer)
+    special_token_id_labels = _build_special_token_id_label_map(tokenizer, special_token_ids)
     special_token_penalty_strings = [
         tok for tok in special_token_strings if str(tok).strip().lower() not in {"<think>", "</think>"}
     ]
@@ -2461,6 +2515,8 @@ def _prepare_rewards_and_advantages(
     special_token_occurrence_counts: list[float] = []
     special_token_hit_counts: list[float] = []
     special_token_penalties: list[float] = []
+    special_token_id_occurrence_counts: dict[int, int] = {}
+    special_token_text_occurrence_counts: dict[str, int] = {}
 
     for rollout, span_row, seq_reward in zip(rollouts, span_rows, seq_rewards):
         token_rewards = spans_to_token_rewards(
@@ -2485,6 +2541,8 @@ def _prepare_rewards_and_advantages(
         )
         special_sum_before = float(sum(token_rewards))
         special_seq_before = float(seq_reward)
+        rollout_special_id_hits: dict[int, int] = {}
+        rollout_special_text_hits: dict[str, int] = {}
         token_rewards, seq_reward, special_occurrences, special_token_hits = _apply_special_token_penalty(
             completion_text=rollout.completion_text,
             completion_token_ids=rollout.completion_token_ids,
@@ -2498,7 +2556,26 @@ def _prepare_rewards_and_advantages(
             seq_penalty_per_occurrence=special_seq_penalty,
             exempt_final_token_ids=exempt_final_special_ids,
             exempt_final_token_strings=exempt_final_special_strings,
+            id_hit_counter=rollout_special_id_hits,
+            text_hit_counter=rollout_special_text_hits,
         )
+        if special_occurrences > 0 and (rollout_special_id_hits or rollout_special_text_hits):
+            for tok_id, count in rollout_special_id_hits.items():
+                special_token_id_occurrence_counts[tok_id] = int(special_token_id_occurrence_counts.get(tok_id, 0)) + int(count)
+            for token_text, count in rollout_special_text_hits.items():
+                special_token_text_occurrence_counts[token_text] = (
+                    int(special_token_text_occurrence_counts.get(token_text, 0)) + int(count)
+                )
+            logger.info(
+                "special token penalty detail: example_id=%s id_hits=[%s] text_hits=[%s]",
+                rollout.example_id,
+                _format_top_special_id_counts(
+                    rollout_special_id_hits,
+                    id_label_map=special_token_id_labels,
+                    limit=8,
+                ),
+                _format_top_special_text_counts(rollout_special_text_hits, limit=8),
+            )
         repeat_sum_before = float(sum(token_rewards))
         repeat_seq_before = float(seq_reward)
         token_rewards, seq_reward, repeat_token_count, repeat_run_count = _apply_repeated_token_penalty(
@@ -2598,13 +2675,19 @@ def _prepare_rewards_and_advantages(
     total_special_occurrences = int(sum(special_token_occurrence_counts))
     if total_special_occurrences > 0:
         logger.info(
-            "special token penalty applied: occurrences=%s token_hits=%s token_penalty=%.1f seq_penalty=%.1f ids=%s strings=%s",
+            "special token penalty applied: occurrences=%s token_hits=%s token_penalty=%.1f seq_penalty=%.1f ids=%s strings=%s top_id_hits=[%s] top_text_hits=[%s]",
             total_special_occurrences,
             int(sum(special_token_hit_counts)),
             float(special_token_penalty),
             float(special_seq_penalty),
             len(special_token_ids),
             len(special_token_penalty_strings),
+            _format_top_special_id_counts(
+                special_token_id_occurrence_counts,
+                id_label_map=special_token_id_labels,
+                limit=12,
+            ),
+            _format_top_special_text_counts(special_token_text_occurrence_counts, limit=12),
         )
     if sanitized_target_rows > 0:
         logger.info(
