@@ -40,3 +40,19 @@ def test_spans_to_token_rewards_maps_penalty_to_matching_token() -> None:
         combine_policy="sum",
     )
     assert rewards == [0.0, 0.0, -5.0]
+
+
+def test_spans_to_token_rewards_max_prefers_stronger_penalty_by_magnitude() -> None:
+    rewards = spans_to_token_rewards(
+        mt_text="hello world",
+        token_char_offsets=[(0, 5), (5, 6), (6, 11)],
+        error_spans=[
+            {"start": 6, "end": 11, "severity": "MAJOR"},
+            {"start": 6, "end": 11, "severity": "CRITICAL"},
+        ],
+        severity_weights={"MINOR": -1.0, "MAJOR": -5.0, "CRITICAL": -10.0},
+        overlap_policy="any_overlap",
+        use_confidence=False,
+        combine_policy="max",
+    )
+    assert rewards == [0.0, 0.0, -10.0]

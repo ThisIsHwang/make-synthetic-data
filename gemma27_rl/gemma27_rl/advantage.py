@@ -56,15 +56,20 @@ def apply_group_relative_advantage(
     group_ids: list[str],
     coef: float = 1.0,
     eps: float = 1e-8,
+    rollout_scalars: list[float] | None = None,
 ) -> tuple[list[list[float]], list[float]]:
     if len(raw_advantages) != len(group_ids):
         raise ValueError("raw_advantages and group_ids length mismatch")
 
     group_to_indices: dict[str, list[int]] = defaultdict(list)
-    rollout_scalar: list[float] = []
-    for idx, arr in enumerate(raw_advantages):
-        scalar = sum(arr) / max(1, len(arr))
-        rollout_scalar.append(float(scalar))
+    if rollout_scalars is None:
+        rollout_scalar = [float(sum(arr) / max(1, len(arr))) for arr in raw_advantages]
+    else:
+        if len(rollout_scalars) != len(raw_advantages):
+            raise ValueError("rollout_scalars and raw_advantages length mismatch")
+        rollout_scalar = [float(v) for v in rollout_scalars]
+
+    for idx in range(len(raw_advantages)):
         group_to_indices[group_ids[idx]].append(idx)
 
     group_z = [0.0 for _ in raw_advantages]

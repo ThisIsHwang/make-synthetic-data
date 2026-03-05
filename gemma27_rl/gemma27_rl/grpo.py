@@ -303,7 +303,10 @@ def update_policy(
 
     total_tokens = 0
     total_loss_value = 0.0
-    pending_backward = 0
+    grad_accum_steps = max(1, int(rl_cfg.grad_accum))
+    accum_loss_sum: torch.Tensor | None = None
+    accum_token_count = 0
+    accum_rollout_count = 0
 
     total_approx_kl = 0.0
     total_clip = 0.0
@@ -320,6 +323,33 @@ def update_policy(
     debug_loss_only_nonzero_adv = _env_flag("GEMMA27_RL_DEBUG_LOSS_ONLY_NONZERO_ADV", default=False)
     debug_loss_logged = 0
     include_token_type_ids = _is_gemma_like_model(policy_model)
+
+    def _flush_grad_accum() -> None:
+        nonlocal accum_loss_sum, accum_token_count, accum_rollout_count
+        if accum_rollout_count <= 0:
+            return
+        if accum_loss_sum is None or accum_token_count <= 0:
+            raise RuntimeError(
+                "Invalid grad accumulation state: "
+                f"rollouts={accum_rollout_count} tokens={accum_token_count} has_loss={accum_loss_sum is not None}"
+            )
+        # Optimize the same objective that is reported in logs: token-weighted mean loss.
+        micro_loss = accum_loss_sum / float(accum_token_count)
+        if use_engine_step:
+            policy_model.backward(micro_loss)  # type: ignore[attr-defined]
+        else:
+            micro_loss.backward()
+        if (not use_engine_step) and rl_cfg.max_grad_norm > 0:
+            torch.nn.utils.clip_grad_norm_(policy_model.parameters(), rl_cfg.max_grad_norm)
+        if use_engine_step:
+            policy_model.step()  # type: ignore[attr-defined]
+        else:
+            assert optimizer is not None
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+        accum_loss_sum = None
+        accum_token_count = 0
+        accum_rollout_count = 0
 
     for rollout, adv_row in zip(rollouts, advantages):
         _validate_rollout_token_ids(rollout=rollout, vocab_size=vocab_size)
@@ -512,33 +542,18 @@ def update_policy(
         total_clip += float(clip_fraction.detach().sum().item())
         total_approx_kl += float(approx_kl.detach().sum().item())
 
-        micro_loss = per_token_loss.mean() / max(1, rl_cfg.grad_accum)
-        if use_engine_step:
-            policy_model.backward(micro_loss)  # type: ignore[attr-defined]
+        if accum_loss_sum is None:
+            accum_loss_sum = loss_sum
         else:
-            micro_loss.backward()
-        pending_backward += 1
-        if pending_backward % max(1, rl_cfg.grad_accum) == 0:
-            if (not use_engine_step) and rl_cfg.max_grad_norm > 0:
-                torch.nn.utils.clip_grad_norm_(policy_model.parameters(), rl_cfg.max_grad_norm)
-            if use_engine_step:
-                policy_model.step()  # type: ignore[attr-defined]
-            else:
-                assert optimizer is not None
-                optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
+            accum_loss_sum = accum_loss_sum + loss_sum
+        accum_token_count += token_count
+        accum_rollout_count += 1
+        if accum_rollout_count >= grad_accum_steps:
+            _flush_grad_accum()
 
     if total_tokens == 0:
         raise RuntimeError("No valid tokens found for update.")
-    if pending_backward % max(1, rl_cfg.grad_accum) != 0:
-        if (not use_engine_step) and rl_cfg.max_grad_norm > 0:
-            torch.nn.utils.clip_grad_norm_(policy_model.parameters(), rl_cfg.max_grad_norm)
-        if use_engine_step:
-            policy_model.step()  # type: ignore[attr-defined]
-        else:
-            assert optimizer is not None
-            optimizer.step()
-            optimizer.zero_grad(set_to_none=True)
+    _flush_grad_accum()
 
     mean_loss = float(total_loss_value / total_tokens)
     if not math.isfinite(mean_loss):

@@ -35,7 +35,9 @@ except Exception:  # pragma: no cover - optional dependency
 from .config import GenerationConfig
 from .prompting import (
     DEFAULT_TRANSLATION_PROMPT_TEMPLATE,
+    collect_tokenizer_special_token_strings,
     format_translation_prompt,
+    sanitize_text_for_scoring,
 )
 from .rl_types import Example, Rollout
 
@@ -890,10 +892,16 @@ def generate_rollouts(
     compute_old_logprobs: bool = True,
     compute_token_offsets: bool = True,
     include_prompt_input_ids: bool = True,
+    prompt_instance_ids: list[str] | None = None,
 ) -> list[Rollout]:
     _require_torch()
     if not examples:
         return []
+    if prompt_instance_ids is not None and len(prompt_instance_ids) != len(examples):
+        raise ValueError(
+            "prompt_instance_ids and examples length mismatch: "
+            f"{len(prompt_instance_ids)} != {len(examples)}"
+        )
 
     pad_token_id = tokenizer.pad_token_id
     model_eos = getattr(getattr(policy_model, "generation_config", None), "eos_token_id", None)
@@ -920,7 +928,7 @@ def generate_rollouts(
     decode_cfg = TokenDecodeConfig()
     policy_vocab_size = _get_model_vocab_size(policy_model)
     ref_dev = ref_device or device
-    empty_completion_fallbacks = 0
+    empty_completion_count = 0
     pending_policy_logprob_items: list[tuple[int, list[int], list[int]]] = []
     pending_ref_model_logprob_items: list[tuple[int, list[int], list[int]]] = []
 
@@ -938,6 +946,7 @@ def generate_rollouts(
         gen_cfg=gen_cfg,
         pad_token_id=pad_token_id,
     )
+    special_token_strings = collect_tokenizer_special_token_strings(tokenizer)
     raw_io_log_enabled = _env_flag("GEMMA27_RL_LOG_RAW_IO", default=False)
     raw_io_log_all_ranks = _env_flag("GEMMA27_RL_LOG_RAW_IO_ALL_RANKS", default=False)
     raw_io_max_chars = _env_int("GEMMA27_RL_LOG_RAW_IO_MAX_CHARS", default=20000, minimum=256)
@@ -1023,6 +1032,11 @@ def generate_rollouts(
             if ex_idx >= len(examples):
                 break
             ex = examples[ex_idx]
+            prompt_instance_id = (
+                str(prompt_instance_ids[ex_idx])
+                if prompt_instance_ids is not None and ex_idx < len(prompt_instance_ids)
+                else str(ex_idx)
+            )
             prompt_text = prompt_texts[ex_idx]
             prompt_ids = prompt_id_rows[ex_idx]
 
@@ -1034,7 +1048,11 @@ def generate_rollouts(
                 eos_token_ids=eos_token_ids,
                 pad_token_id=pad_token_id,
             )
-            raw_text = tokenizer.decode(completion_raw_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+            completion_skip_special_text = tokenizer.decode(
+                completion_raw_ids,
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=False,
+            )
             completion_text = tokenizer.decode(
                 completion_raw_ids,
                 skip_special_tokens=False,
@@ -1042,30 +1060,12 @@ def generate_rollouts(
             )
             completion_ids = [int(x) for x in completion_raw_ids]
             if not completion_ids:
-                empty_completion_fallbacks += 1
-                fallback_ids = tokenizer(" ", add_special_tokens=False)["input_ids"]
-                fallback_ids = [int(x) for x in fallback_ids]
-                if not fallback_ids:
-                    if completion_raw_ids:
-                        fallback_ids = [int(completion_raw_ids[0])]
-                    elif eos_token_ids:
-                        fallback_ids = [int(eos_token_ids[0])]
-                    elif pad_token_id is not None:
-                        fallback_ids = [int(pad_token_id)]
-                    else:
-                        fallback_ids = [0]
-                completion_ids = fallback_ids[:1]
-                completion_raw_ids = list(completion_ids)
-                completion_text = tokenizer.decode(
-                    completion_ids,
-                    skip_special_tokens=False,
-                    clean_up_tokenization_spaces=False,
-                )
-                raw_text = tokenizer.decode(
-                    completion_ids,
-                    skip_special_tokens=True,
-                    clean_up_tokenization_spaces=False,
-                )
+                empty_completion_count += 1
+            completion_raw_text = str(completion_text or "")
+            completion_clean_text, _ = sanitize_text_for_scoring(
+                completion_raw_text,
+                special_tokens=special_token_strings,
+            )
             if should_log_raw_io:
                 output_row_idx = len(rollouts)
                 if raw_io_max_rows <= 0 or output_row_idx < raw_io_max_rows:
@@ -1079,7 +1079,8 @@ def generate_rollouts(
                         "[raw-io][%s][output] row_idx=%s seq_idx=%s ex_idx=%s sample_idx=%s example_id=%s "
                         "completion_untrimmed_ids=%s completion_untrimmed_tokens=%s completion_untrimmed_decoded_with_specials=%r "
                         "completion_raw_ids=%s completion_raw_tokens=%s completion_raw_decoded_with_specials=%r "
-                        "completion_raw_text=%r completion_ids=%s completion_tokens=%s completion_decoded_with_specials=%r completion_text=%r",
+                        "completion_skip_special_text=%r completion_ids=%s completion_tokens=%s completion_decoded_with_specials=%r "
+                        "completion_raw_text=%r completion_clean_text=%r",
                         raw_phase,
                         output_row_idx,
                         seq_idx,
@@ -1092,11 +1093,12 @@ def generate_rollouts(
                         _truncate_for_log(json.dumps(completion_raw_ids, ensure_ascii=False), raw_io_max_chars),
                         _truncate_for_log(json.dumps(completion_raw_tokens, ensure_ascii=False), raw_io_max_chars),
                         _truncate_for_log(completion_raw_decoded, raw_io_max_chars),
-                        _truncate_for_log(raw_text, raw_io_max_chars),
+                        _truncate_for_log(completion_skip_special_text, raw_io_max_chars),
                         _truncate_for_log(json.dumps(completion_ids, ensure_ascii=False), raw_io_max_chars),
                         _truncate_for_log(json.dumps(completion_tokens, ensure_ascii=False), raw_io_max_chars),
                         _truncate_for_log(completion_decoded, raw_io_max_chars),
-                        _truncate_for_log(completion_text, raw_io_max_chars),
+                        _truncate_for_log(completion_raw_text, raw_io_max_chars),
+                        _truncate_for_log(completion_clean_text, raw_io_max_chars),
                     )
             if policy_vocab_size is not None:
                 _validate_token_ids_in_vocab(
@@ -1137,6 +1139,9 @@ def generate_rollouts(
                     src_text=ex.src_text,
                     ref_text=ex.ref_text,
                     raw_completion_token_ids=list(completion_raw_ids),
+                    completion_raw_text=completion_raw_text,
+                    completion_clean_text=completion_clean_text,
+                    prompt_instance_id=prompt_instance_id,
                 )
             )
     finally:
@@ -1175,10 +1180,11 @@ def generate_rollouts(
             if rollout_idx < len(rollouts):
                 rollouts[rollout_idx].ref_logprobs = [float(v) for v in row.tolist()]
 
-    if empty_completion_fallbacks > 0:
+    if empty_completion_count > 0:
         logger.info(
-            "generate_rollouts: replaced %s empty completions with fallback token to keep rollout shape stable.",
-            empty_completion_fallbacks,
+            "generate_rollouts: observed %s empty completions after eos/pad trimming; "
+            "keeping them empty so token-level policy update can skip non-sampled actions.",
+            empty_completion_count,
         )
 
     return rollouts

@@ -2028,7 +2028,18 @@ def spans_to_token_rewards(
             elif combine_policy == "min":
                 rewards[token_idx] = penalty if not initialized[token_idx] else min(rewards[token_idx], penalty)
             elif combine_policy == "max":
-                rewards[token_idx] = penalty if not initialized[token_idx] else max(rewards[token_idx], penalty)
+                if not initialized[token_idx]:
+                    rewards[token_idx] = penalty
+                else:
+                    current = rewards[token_idx]
+                    current_abs = abs(float(current))
+                    penalty_abs = abs(float(penalty))
+                    if penalty_abs > current_abs:
+                        rewards[token_idx] = penalty
+                    elif penalty_abs == current_abs:
+                        # Tie-break toward stronger (more negative) penalty for
+                        # common negative-penalty configurations.
+                        rewards[token_idx] = min(current, penalty)
             initialized[token_idx] = True
 
     return rewards

@@ -28,6 +28,9 @@ class Rollout:
     src_text: str
     ref_text: str | None = None
     raw_completion_token_ids: list[int] | None = None
+    completion_raw_text: str | None = None
+    completion_clean_text: str | None = None
+    prompt_instance_id: str | None = None
 
 
 @dataclass

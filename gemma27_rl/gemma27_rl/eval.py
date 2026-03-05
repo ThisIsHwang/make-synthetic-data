@@ -17,6 +17,7 @@ except Exception:  # pragma: no cover - optional for lightweight tests
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
 from .config import GenerationConfig, RLPostTrainConfig
+from .prompting import collect_tokenizer_special_token_strings, sanitize_text_for_scoring
 from .rewards import (
     OpenAICompatibleESAScorer,
     OpenAICompatibleMQMScorer,
@@ -335,7 +336,33 @@ def evaluate_on_dataset(
     if (not shard_eval) or distributed_rank == 0:
         logger.info("evaluate_on_dataset: rollout complete rollouts=%s", len(rollouts))
 
-    samples = [SampleForScoring(src=r.src_text, mt=r.completion_text, ref=r.ref_text) for r in rollouts]
+    special_token_strings = collect_tokenizer_special_token_strings(tokenizer)
+    samples: list[SampleForScoring] = []
+    raw_completion_texts: list[str] = []
+    clean_completion_texts: list[str] = []
+    sanitized_target_rows = 0
+    sanitized_marker_total = 0
+    for rollout in rollouts:
+        raw_mt = str(rollout.completion_raw_text if rollout.completion_raw_text is not None else rollout.completion_text or "")
+        sanitized_mt, replacement_count = sanitize_text_for_scoring(
+            raw_mt,
+            special_tokens=special_token_strings,
+        )
+        clean_mt = str(rollout.completion_clean_text if rollout.completion_clean_text is not None else sanitized_mt)
+        raw_completion_texts.append(raw_mt)
+        clean_completion_texts.append(clean_mt)
+        if replacement_count > 0:
+            sanitized_target_rows += 1
+            sanitized_marker_total += int(replacement_count)
+        samples.append(SampleForScoring(src=rollout.src_text, mt=clean_mt, ref=rollout.ref_text))
+    if sanitized_target_rows > 0:
+        logger.info(
+            "evaluate_on_dataset: scorer target sanitize applied: rows=%s/%s marker_replacements=%s tokenizer_special_tokens=%s",
+            int(sanitized_target_rows),
+            len(rollouts),
+            int(sanitized_marker_total),
+            len(special_token_strings),
+        )
 
     metricx_scores = [0.0 for _ in rollouts]
     metricx_rewards = [0.0 for _ in rollouts]
@@ -508,13 +535,22 @@ def evaluate_on_dataset(
             completion_tokens = _safe_convert_ids_to_tokens(tokenizer, completion_ids)
             completion_decoded_with_specials = _safe_decode_ids_with_specials(tokenizer, completion_ids)
             logger.info(
-                "[raw-io][eval][scored] idx=%s example_id=%s src=%r ref=%r mt=%r metricx=%.6f metricx_reward=%.6f "
+                "[raw-io][eval][scored] idx=%s example_id=%s src=%r ref=%r mt_raw=%r mt_clean=%r metricx=%.6f metricx_reward=%.6f "
                 "xcomet=%.6f mqm=%.6f esa=%.6f completion_ids=%s completion_tokens=%s completion_decoded_with_specials=%r spans=%s",
                 idx,
                 rollout.example_id,
                 _truncate_for_log(rollout.src_text, raw_io_max_chars),
                 _truncate_for_log(rollout.ref_text, raw_io_max_chars),
-                _truncate_for_log(rollout.completion_text, raw_io_max_chars),
+                _truncate_for_log(
+                    raw_completion_texts[idx] if idx < len(raw_completion_texts) else str(rollout.completion_text or ""),
+                    raw_io_max_chars,
+                ),
+                _truncate_for_log(
+                    clean_completion_texts[idx]
+                    if idx < len(clean_completion_texts)
+                    else str(rollout.completion_clean_text if rollout.completion_clean_text is not None else rollout.completion_text or ""),
+                    raw_io_max_chars,
+                ),
                 float(metricx_scores[idx]) if idx < len(metricx_scores) else 0.0,
                 float(metricx_rewards[idx]) if idx < len(metricx_rewards) else 0.0,
                 float(xcomet_scores[idx]) if idx < len(xcomet_scores) else 0.0,
@@ -535,6 +571,16 @@ def evaluate_on_dataset(
                     "example_id": rollout.example_id,
                     "src_text": rollout.src_text,
                     "completion_text": rollout.completion_text,
+                    "completion_raw_text": (
+                        raw_completion_texts[idx]
+                        if idx < len(raw_completion_texts)
+                        else str(rollout.completion_raw_text if rollout.completion_raw_text is not None else rollout.completion_text or "")
+                    ),
+                    "completion_clean_text": (
+                        clean_completion_texts[idx]
+                        if idx < len(clean_completion_texts)
+                        else str(rollout.completion_clean_text if rollout.completion_clean_text is not None else rollout.completion_text or "")
+                    ),
                     "ref_text": rollout.ref_text,
                     "completion_len": len(rollout.completion_token_ids),
                     "metricx_score": float(metricx_scores[idx]) if idx < len(metricx_scores) else 0.0,

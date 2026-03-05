@@ -8,7 +8,6 @@ import math
 import os
 from pathlib import Path
 import random
-import re
 import select
 import shutil
 import socket
@@ -37,6 +36,10 @@ from .config import RLPostTrainConfig, dump_config
 from .data import load_examples
 from .eval import evaluate_on_dataset
 from .grpo import update_policy
+from .prompting import (
+    collect_tokenizer_special_token_strings as _collect_special_token_strings_shared,
+    sanitize_text_for_scoring as _sanitize_text_for_scoring_shared,
+)
 from .rewards import (
     OpenAICompatibleESAScorer,
     OpenAICompatibleMQMScorer,
@@ -70,9 +73,6 @@ _DEFAULT_NGRAM_TOKEN_PENALTY = -1.0
 _DEFAULT_NGRAM_SEQUENCE_PENALTY = -0.5
 _DEFAULT_SPECIAL_TOKEN_PENALTY = -50.0
 _DEFAULT_SPECIAL_SEQUENCE_PENALTY = -10.0
-_THINK_BLOCK_PATTERN = re.compile(r"<\s*think\s*>.*?<\s*/\s*think\s*>", flags=re.IGNORECASE | re.DOTALL)
-_THINK_TAG_PATTERN = re.compile(r"<\s*/?\s*think\s*>", flags=re.IGNORECASE)
-_PIPE_SPECIAL_PATTERN = re.compile(r"<\|[^>\n]{1,128}\|>")
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -349,33 +349,7 @@ def _zero_token_rewards_on_special_token_ids(
 
 
 def _collect_tokenizer_special_token_strings(tokenizer: Any | None) -> list[str]:
-    if tokenizer is None:
-        return []
-    tokens: set[str] = set()
-
-    all_special = getattr(tokenizer, "all_special_tokens", None)
-    if isinstance(all_special, (list, tuple, set)):
-        for tok in all_special:
-            if isinstance(tok, str) and tok:
-                tokens.add(tok)
-
-    additional_special = getattr(tokenizer, "additional_special_tokens", None)
-    if isinstance(additional_special, (list, tuple, set)):
-        for tok in additional_special:
-            if isinstance(tok, str) and tok:
-                tokens.add(tok)
-
-    special_map = getattr(tokenizer, "special_tokens_map", None)
-    if isinstance(special_map, dict):
-        for value in special_map.values():
-            if isinstance(value, str) and value:
-                tokens.add(value)
-            elif isinstance(value, (list, tuple, set)):
-                for tok in value:
-                    if isinstance(tok, str) and tok:
-                        tokens.add(tok)
-
-    return sorted(tokens, key=len, reverse=True)
+    return _collect_special_token_strings_shared(tokenizer)
 
 
 def _collect_tokenizer_special_token_ids(tokenizer: Any | None) -> set[int]:
@@ -623,42 +597,8 @@ def _apply_special_token_penalty(
     return token_rewards, adjusted_seq, special_occurrences, len(token_hits)
 
 
-def _replace_matches_with_spaces(text: str, pattern: re.Pattern[str]) -> tuple[str, int]:
-    match_count = 0
-
-    def _repl(match: re.Match[str]) -> str:
-        nonlocal match_count
-        match_count += 1
-        return " " * (match.end() - match.start())
-
-    return pattern.sub(_repl, text), match_count
-
-
 def _sanitize_text_for_mqm_esa(target_text: str, *, special_tokens: list[str]) -> tuple[str, int]:
-    sanitized = str(target_text or "")
-    replacement_count = 0
-
-    sanitized, replaced = _replace_matches_with_spaces(sanitized, _THINK_BLOCK_PATTERN)
-    replacement_count += replaced
-
-    sanitized, replaced = _replace_matches_with_spaces(sanitized, _THINK_TAG_PATTERN)
-    replacement_count += replaced
-
-    for tok in special_tokens:
-        token_text = str(tok or "")
-        if not token_text:
-            continue
-        if token_text.lower() in {"<think>", "</think>"}:
-            continue
-        occurrences = sanitized.count(token_text)
-        if occurrences <= 0:
-            continue
-        sanitized = sanitized.replace(token_text, " " * len(token_text))
-        replacement_count += occurrences
-
-    sanitized, replaced = _replace_matches_with_spaces(sanitized, _PIPE_SPECIAL_PATTERN)
-    replacement_count += replaced
-    return sanitized, replacement_count
+    return _sanitize_text_for_scoring_shared(target_text, special_tokens=special_tokens)
 
 
 def _log_span_debug_for_rollout(
@@ -1756,6 +1696,17 @@ def _append_rollout_jsonl(
                 "example_id": rollout.example_id,
                 "src_text": rollout.src_text,
                 "completion_text": rollout.completion_text,
+                "prompt_instance_id": rollout.prompt_instance_id,
+                "completion_raw_text": (
+                    rollout.completion_raw_text
+                    if rollout.completion_raw_text is not None
+                    else rollout.completion_text
+                ),
+                "completion_clean_text": (
+                    rollout.completion_clean_text
+                    if rollout.completion_clean_text is not None
+                    else rollout.completion_text
+                ),
                 "ref_text": rollout.ref_text,
                 "completion_len": len(rollout.completion_token_ids),
                 "adv_mean": float(sum(adv_row) / len(adv_row)) if adv_row else 0.0,
@@ -2003,15 +1954,24 @@ def _load_policy_model(
     device: str,
     model_name_or_path: str | None = None,
 ) -> AutoModelForCausalLM:
-    dtype, attn_impl = _resolve_model_dtype_and_attn(cfg, device)
+    dtype, _ = _resolve_model_dtype_and_attn(cfg, device)
+    device_text = str(device).strip().lower()
+    if not device_text.startswith("cuda"):
+        raise RuntimeError(
+            "Policy flash_attention_2 is forced, but policy device is non-CUDA: "
+            f"{device}. Use a CUDA device for training."
+        )
+    if dtype not in {torch.float16, torch.bfloat16}:
+        logger.warning(
+            "Policy flash_attention_2 is forced. Overriding policy dtype from %s to bfloat16.",
+            dtype,
+        )
+        dtype = torch.bfloat16
+    attn_impl = "flash_attention_2"
     if cfg.model.disable_policy_flash_attention:
-        attn_text = str(attn_impl or "").strip().lower()
-        if attn_text == "flash_attention_2":
-            logger.warning(
-                "Policy flash_attention_2 is disabled by model.disable_policy_flash_attention=true; "
-                "falling back to sdpa for training stability."
-            )
-            attn_impl = "sdpa"
+        logger.warning(
+            "Ignoring model.disable_policy_flash_attention=true because policy flash_attention_2 is forced."
+        )
 
     kwargs: dict[str, Any] = {
         "trust_remote_code": cfg.model.trust_remote_code,
@@ -2167,6 +2127,64 @@ def _sample_batch(examples: list, batch_size: int, rng: random.Random) -> list:
     return [examples[i] for i in indices]
 
 
+def _resolve_group_ids_for_rollouts(
+    rollouts: list[Rollout],
+    *,
+    num_samples_per_prompt: int,
+) -> list[str]:
+    prompt_instance_ids: list[str] = []
+    all_present = True
+    for rollout in rollouts:
+        marker = str(rollout.prompt_instance_id or "").strip()
+        prompt_instance_ids.append(marker)
+        if not marker:
+            all_present = False
+
+    if all_present:
+        return [f"prompt_instance:{marker}" for marker in prompt_instance_ids]
+
+    # Backward-compatible fallback for legacy rollouts that do not carry
+    # prompt_instance_id yet: infer prompt-instance groups by rollout ordering.
+    group_size = max(1, int(num_samples_per_prompt))
+    return [f"fallback_prompt_instance:{idx // group_size}" for idx in range(len(rollouts))]
+
+
+def _validate_scorer_batch_lengths(
+    *,
+    scorer_name: str,
+    requested: int,
+    sequence_scores: Any,
+    error_spans: Any | None = None,
+) -> tuple[list[Any], list[Any] | None]:
+    if not isinstance(sequence_scores, (list, tuple)):
+        raise RuntimeError(
+            f"{scorer_name} scorer returned non-list sequence_scores "
+            f"(type={type(sequence_scores).__name__}, requested={requested})."
+        )
+    score_rows = list(sequence_scores)
+    if len(score_rows) != int(requested):
+        raise RuntimeError(
+            f"{scorer_name} scorer returned mismatched sequence_scores length: "
+            f"requested={requested} returned={len(score_rows)}"
+        )
+
+    span_rows: list[Any] | None = None
+    if error_spans is not None:
+        if not isinstance(error_spans, (list, tuple)):
+            raise RuntimeError(
+                f"{scorer_name} scorer returned non-list error_spans "
+                f"(type={type(error_spans).__name__}, requested={requested})."
+            )
+        span_rows = list(error_spans)
+        if len(span_rows) != int(requested):
+            raise RuntimeError(
+                f"{scorer_name} scorer returned mismatched error_spans length: "
+                f"requested={requested} returned={len(span_rows)}"
+            )
+
+    return score_rows, span_rows
+
+
 def _score_with_cache_metricx(
     samples: list[SampleForScoring],
     scorer: MetricXQEScorer,
@@ -2186,7 +2204,12 @@ def _score_with_cache_metricx(
             uncached_idx.append(idx)
 
     if uncached:
-        scores = scorer.score_batch(uncached).sequence_scores
+        raw_scores = scorer.score_batch(uncached).sequence_scores
+        scores, _ = _validate_scorer_batch_lengths(
+            scorer_name="MetricX",
+            requested=len(uncached),
+            sequence_scores=raw_scores,
+        )
         for idx, score, sample in zip(uncached_idx, scores, uncached):
             out[idx] = float(score)
             if use_cache:
@@ -2216,10 +2239,18 @@ def _score_with_cache_xcomet(
 
     if uncached:
         out = scorer.score_batch(uncached)
-        span_rows = (out.metadata or {}).get("error_spans", [[] for _ in uncached])
-        for idx, score, span_row, sample in zip(uncached_idx, out.sequence_scores, span_rows, uncached):
+        raw_span_rows = (out.metadata or {}).get("error_spans", [[] for _ in uncached])
+        sequence_scores, span_rows = _validate_scorer_batch_lengths(
+            scorer_name="xCOMET",
+            requested=len(uncached),
+            sequence_scores=out.sequence_scores,
+            error_spans=raw_span_rows,
+        )
+        assert span_rows is not None
+        for idx, score, span_row, sample in zip(uncached_idx, sequence_scores, span_rows, uncached):
             score_f = float(score)
-            span_list = [s for s in span_row if isinstance(s, dict)]
+            span_iter = span_row if isinstance(span_row, (list, tuple)) else []
+            span_list = [s for s in span_iter if isinstance(s, dict)]
             scores[idx] = score_f
             spans[idx] = span_list
             if use_cache:
@@ -2249,10 +2280,18 @@ def _score_with_cache_mqm(
 
     if uncached:
         out = scorer.score_batch(uncached)
-        span_rows = (out.metadata or {}).get("error_spans", [[] for _ in uncached])
-        for idx, score, span_row, sample in zip(uncached_idx, out.sequence_scores, span_rows, uncached):
+        raw_span_rows = (out.metadata or {}).get("error_spans", [[] for _ in uncached])
+        sequence_scores, span_rows = _validate_scorer_batch_lengths(
+            scorer_name="MQM",
+            requested=len(uncached),
+            sequence_scores=out.sequence_scores,
+            error_spans=raw_span_rows,
+        )
+        assert span_rows is not None
+        for idx, score, span_row, sample in zip(uncached_idx, sequence_scores, span_rows, uncached):
             score_f = float(score)
-            span_list = [s for s in span_row if isinstance(s, dict)]
+            span_iter = span_row if isinstance(span_row, (list, tuple)) else []
+            span_list = [s for s in span_iter if isinstance(s, dict)]
             scores[idx] = score_f
             spans[idx] = span_list
             if use_cache:
@@ -2283,7 +2322,12 @@ def _score_with_cache_esa(
             uncached_idx.append(idx)
 
     if uncached:
-        scores = scorer.score_batch(uncached).sequence_scores
+        raw_scores = scorer.score_batch(uncached).sequence_scores
+        scores, _ = _validate_scorer_batch_lengths(
+            scorer_name="ESA",
+            requested=len(uncached),
+            sequence_scores=raw_scores,
+        )
         for idx, score, sample in zip(uncached_idx, scores, uncached):
             out[idx] = float(score)
             if use_cache:
@@ -2318,7 +2362,7 @@ def _prepare_rewards_and_advantages(
                 replaced += 1
         return out, replaced
 
-    samples = [SampleForScoring(src=r.src_text, mt=r.completion_text, ref=r.ref_text) for r in rollouts]
+    samples: list[SampleForScoring] = []
     special_token_strings = _collect_tokenizer_special_token_strings(tokenizer)
     special_token_ids = _collect_tokenizer_special_token_ids(tokenizer)
     special_token_id_labels = _build_special_token_id_label_map(tokenizer, special_token_ids)
@@ -2333,19 +2377,26 @@ def _prepare_rewards_and_advantages(
     span_reward_texts: list[str] = []
     span_reward_samples: list[SampleForScoring] = []
     mqm_esa_samples: list[SampleForScoring] = []
+    raw_completion_texts: list[str] = []
+    clean_completion_texts: list[str] = []
     sanitized_target_rows = 0
     sanitized_marker_total = 0
     for rollout in rollouts:
+        raw_mt = str(rollout.completion_raw_text if rollout.completion_raw_text is not None else rollout.completion_text or "")
         sanitized_mt, replacement_count = _sanitize_text_for_mqm_esa(
-            rollout.completion_text,
+            raw_mt,
             special_tokens=special_token_strings,
         )
+        clean_mt = str(rollout.completion_clean_text if rollout.completion_clean_text is not None else sanitized_mt)
+        raw_completion_texts.append(raw_mt)
+        clean_completion_texts.append(clean_mt)
         if replacement_count > 0:
             sanitized_target_rows += 1
             sanitized_marker_total += int(replacement_count)
-        span_reward_texts.append(sanitized_mt)
-        span_reward_samples.append(SampleForScoring(src=rollout.src_text, mt=sanitized_mt, ref=rollout.ref_text))
-        mqm_esa_samples.append(SampleForScoring(src=rollout.src_text, mt=sanitized_mt, ref=rollout.ref_text))
+        samples.append(SampleForScoring(src=rollout.src_text, mt=clean_mt, ref=rollout.ref_text))
+        span_reward_texts.append(clean_mt)
+        span_reward_samples.append(SampleForScoring(src=rollout.src_text, mt=clean_mt, ref=rollout.ref_text))
+        mqm_esa_samples.append(SampleForScoring(src=rollout.src_text, mt=clean_mt, ref=rollout.ref_text))
     debug_span_loss = _env_flag("GEMMA27_RL_DEBUG_SPAN_LOSS", default=False)
     debug_span_max_rollouts = _env_int("GEMMA27_RL_DEBUG_SPAN_MAX_ROLLOUTS", default=1, minimum=1)
     debug_span_max_tokens = _env_int("GEMMA27_RL_DEBUG_SPAN_MAX_TOKENS", default=256, minimum=1)
@@ -2565,11 +2616,21 @@ def _prepare_rewards_and_advantages(
     special_token_id_occurrence_totals: list[float] = []
     special_token_text_occurrence_totals: list[float] = []
     span_special_masked_counts: list[float] = []
+    group_scalar_rewards: list[float] = []
     special_token_id_occurrence_counts: dict[int, int] = {}
     special_token_text_occurrence_counts: dict[str, int] = {}
 
     for row_idx, (rollout, span_row, seq_reward) in enumerate(zip(rollouts, span_rows, seq_rewards)):
-        span_reward_text = span_reward_texts[row_idx] if row_idx < len(span_reward_texts) else rollout.completion_text
+        raw_completion_text = (
+            raw_completion_texts[row_idx]
+            if row_idx < len(raw_completion_texts)
+            else str(rollout.completion_raw_text if rollout.completion_raw_text is not None else rollout.completion_text or "")
+        )
+        span_reward_text = (
+            span_reward_texts[row_idx]
+            if row_idx < len(span_reward_texts)
+            else str(rollout.completion_clean_text if rollout.completion_clean_text is not None else raw_completion_text)
+        )
         token_rewards = spans_to_token_rewards(
             mt_text=span_reward_text,
             token_char_offsets=rollout.token_char_offsets,
@@ -2588,7 +2649,7 @@ def _prepare_rewards_and_advantages(
         token_reward_sum_before = float(sum(token_rewards))
         seq_reward_before = float(seq_reward)
         token_rewards, seq_reward, forbidden_tag_count, forbidden_token_hits = _apply_forbidden_think_tag_penalty(
-            completion_text=rollout.completion_text,
+            completion_text=raw_completion_text,
             token_char_offsets=rollout.token_char_offsets,
             token_rewards=token_rewards,
             seq_reward=float(seq_reward),
@@ -2601,7 +2662,7 @@ def _prepare_rewards_and_advantages(
         rollout_special_id_hits: dict[int, int] = {}
         rollout_special_text_hits: dict[str, int] = {}
         token_rewards, seq_reward, special_occurrences, special_token_hits = _apply_special_token_penalty(
-            completion_text=rollout.completion_text,
+            completion_text=raw_completion_text,
             completion_token_ids=rollout.completion_token_ids,
             penalty_token_ids=rollout.raw_completion_token_ids,
             token_char_offsets=rollout.token_char_offsets,
@@ -2660,6 +2721,7 @@ def _prepare_rewards_and_advantages(
             min_occurrences=ngram_min_occurrences,
         )
         ngram_penalty_delta = (float(sum(token_rewards)) - ngram_sum_before) + (float(seq_reward) - ngram_seq_before)
+        group_scalar_rewards.append(float(seq_reward))
         seq_row = broadcast_sequence_reward(seq_reward, token_count=len(token_rewards))
         raw_adv = combine_advantages(seq_row, token_rewards)
 
@@ -2766,9 +2828,14 @@ def _prepare_rewards_and_advantages(
         )
 
     if cfg.rl.group_normalize:
+        group_ids = _resolve_group_ids_for_rollouts(
+            rollouts,
+            num_samples_per_prompt=int(getattr(cfg.generation, "num_samples_per_prompt", 1) or 1),
+        )
         raw_adv_rows, _ = apply_group_relative_advantage(
             raw_advantages=raw_adv_rows,
-            group_ids=[r.example_id for r in rollouts],
+            group_ids=group_ids,
+            rollout_scalars=group_scalar_rewards,
             coef=cfg.rl.group_advantage_coef,
             eps=cfg.rl.eps,
         )
@@ -2889,6 +2956,20 @@ def _fill_missing_reference_logprobs(
         return 0
 
     missing_idx = [i for i, rollout in enumerate(merged_rollouts) if rollout.ref_logprobs is None]
+    if missing_idx:
+        empty_completion_missing = 0
+        for idx in list(missing_idx):
+            if merged_rollouts[idx].completion_token_ids:
+                continue
+            merged_rollouts[idx].ref_logprobs = []
+            empty_completion_missing += 1
+        if empty_completion_missing > 0:
+            missing_idx = [i for i in missing_idx if merged_rollouts[i].ref_logprobs is None]
+            logger.info(
+                "Skipping reference logprob fill for %s empty-completion rollouts at update=%s.",
+                empty_completion_missing,
+                update_idx,
+            )
     if not missing_idx:
         return 0
 
@@ -3309,28 +3390,10 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
         train_model, _ = _deepspeed_initialize(cfg, policy_model)
     policy_eval_model = _unwrap_for_generation(train_model)
 
-    requested_policy_attn = _normalize_attn_impl_text(cfg.model.attn_implementation)
-    requested_policy_attn_norm = str(requested_policy_attn or "").strip().lower()
-    if requested_policy_attn_norm == "auto":
-        requested_policy_attn = None
-        requested_policy_attn_norm = ""
-
-    # Qwen + DeepSpeed runs have shown FA2 kernel instability in update/backward
-    # for some environments. Keep FA2 for rollout/eval generation, and use SDPA
-    # for update to avoid illegal-memory-access crashes in training steps.
-    if requested_policy_attn_norm == "flash_attention_2":
-        rollout_attn_impl = "flash_attention_2"
-        update_attn_impl = "sdpa"
-    else:
-        rollout_attn_impl = requested_policy_attn
-        update_attn_impl = requested_policy_attn
-
-    if rank0 and rollout_attn_impl and update_attn_impl and rollout_attn_impl != update_attn_impl:
-        logger.info(
-            "Policy attn split enabled for stability: rollout/eval=%s, update=%s",
-            rollout_attn_impl,
-            update_attn_impl,
-        )
+    rollout_attn_impl = "flash_attention_2"
+    update_attn_impl = "flash_attention_2"
+    if rank0:
+        logger.info("Policy attention is forced to flash_attention_2 for rollout/eval/update (config ignored).")
 
     last_runtime_attn: str | None = None
 
@@ -3816,6 +3879,10 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
             if not local_indices:
                 logger.warning("Rank %s has empty rollout shard at update=%s; skipping step.", rank, update_idx)
             local_examples = [train_examples[i] for i in local_indices]
+            local_prompt_instance_ids = [
+                f"u{update_idx}:r{rank}:p{pos}:idx{int(local_indices[pos])}"
+                for pos in range(len(local_examples))
+            ]
 
             _set_rollout_sampling_seed(cfg.misc.seed + update_idx + (rank * 1009))
             _set_policy_runtime_attn(rollout_attn_impl, phase="rollout")
@@ -3834,6 +3901,7 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
                 prompt_template=cfg.prompt.template,
                 show_progress=bool(rank0),
                 progress_desc=f"rollout u{update_idx}",
+                prompt_instance_ids=local_prompt_instance_ids,
             )
             gathered_rollouts = _gather_object_to_rank0(local_rollouts)
             per_rank_payload: list[Any] | None = None
@@ -3950,6 +4018,10 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
             batch_indices = train_indices[train_cursor:batch_end]
             train_cursor = batch_end
             batch_examples = [train_examples[i] for i in batch_indices]
+            prompt_instance_ids = [
+                f"u{update_idx}:r{rank}:p{pos}:idx{int(batch_indices[pos])}"
+                for pos in range(len(batch_examples))
+            ]
             _set_policy_runtime_attn(rollout_attn_impl, phase="rollout")
             rollouts = generate_rollouts(
                 examples=batch_examples,
@@ -3965,6 +4037,7 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
                 prompt_template=cfg.prompt.template,
                 show_progress=True,
                 progress_desc=f"rollout u{update_idx}",
+                prompt_instance_ids=prompt_instance_ids,
             )
             if rollouts:
                 advantages, reward_stats, adv_stats = _prepare_rewards_and_advantages(

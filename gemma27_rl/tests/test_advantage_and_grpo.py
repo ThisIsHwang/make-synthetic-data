@@ -10,7 +10,7 @@ from torch import nn
 from gemma27_rl.advantage import normalize_advantages
 from gemma27_rl.config import RLConfig
 from gemma27_rl.grpo import update_policy
-from gemma27_rl.rollout import compute_completion_logprobs
+from gemma27_rl.rollout import compute_completion_logprobs, compute_completion_logprobs_batch
 from gemma27_rl.rl_types import Rollout
 
 
@@ -78,3 +78,24 @@ def test_grpo_update_smoke_step_no_nan() -> None:
     assert math.isfinite(stats.approx_kl)
     assert math.isfinite(stats.clip_fraction)
     assert any(not torch.allclose(b, a) for b, a in zip(before, after))
+
+
+def test_compute_completion_logprobs_rejects_out_of_vocab_token_ids() -> None:
+    model = TinyCausalLM(vocab_size=8, hidden_size=8)
+    with pytest.raises(ValueError, match="token id out of range"):
+        _ = compute_completion_logprobs(
+            model=model,
+            prompt_input_ids=[1, 2, 9],
+            completion_token_ids=[3],
+            device="cpu",
+        )
+
+
+def test_compute_completion_logprobs_batch_rejects_out_of_vocab_token_ids() -> None:
+    model = TinyCausalLM(vocab_size=8, hidden_size=8)
+    with pytest.raises(ValueError, match="token id out of range"):
+        _ = compute_completion_logprobs_batch(
+            model=model,
+            items=[([1, 2], [3]), ([4], [10])],
+            device="cpu",
+        )
