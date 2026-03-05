@@ -1151,48 +1151,6 @@ def _unwrap_for_generation(model: Any) -> Any:
     return module if module is not None else model
 
 
-def _normalize_attn_impl_text(value: str | None) -> str | None:
-    if value is None:
-        return None
-    text = str(value).strip()
-    return text or None
-
-
-def _set_model_attn_implementation(model: Any, attn_impl: str | None) -> int:
-    target = _normalize_attn_impl_text(attn_impl)
-    if target is None:
-        return 0
-    root = _unwrap_for_generation(model)
-    visited_cfg: set[int] = set()
-    changed = 0
-
-    modules = [root]
-    modules.extend(list(getattr(root, "modules", lambda: [])()))
-    for module in modules:
-        cfg_obj = getattr(module, "config", None)
-        if cfg_obj is None:
-            continue
-        cfg_id = id(cfg_obj)
-        if cfg_id in visited_cfg:
-            continue
-        visited_cfg.add(cfg_id)
-        for attr in ("_attn_implementation", "attn_implementation"):
-            if not hasattr(cfg_obj, attr):
-                continue
-            try:
-                current = getattr(cfg_obj, attr)
-            except Exception:
-                continue
-            if str(current) == target:
-                continue
-            try:
-                setattr(cfg_obj, attr, target)
-                changed += 1
-            except Exception:
-                continue
-    return changed
-
-
 def _parse_cuda_index(device: str | None) -> int | None:
     if not device:
         return None
@@ -3390,31 +3348,8 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
         train_model, _ = _deepspeed_initialize(cfg, policy_model)
     policy_eval_model = _unwrap_for_generation(train_model)
 
-    rollout_attn_impl = "flash_attention_2"
-    update_attn_impl = "flash_attention_2"
     if rank0:
-        logger.info("Policy attention is forced to flash_attention_2 for rollout/eval/update (config ignored).")
-
-    last_runtime_attn: str | None = None
-
-    def _set_policy_runtime_attn(target_attn: str | None, phase: str) -> None:
-        nonlocal last_runtime_attn
-        target = _normalize_attn_impl_text(target_attn)
-        if target is None:
-            return
-        if last_runtime_attn == target:
-            return
-        changed_train = _set_model_attn_implementation(train_model, target)
-        changed_eval = _set_model_attn_implementation(policy_eval_model, target)
-        last_runtime_attn = target
-        if rank0:
-            logger.info(
-                "Policy runtime attn set for %s: target=%s changed(train=%s eval=%s)",
-                phase,
-                target,
-                changed_train,
-                changed_eval,
-            )
+        logger.info("Policy attention is fixed to flash_attention_2 for rollout/eval/update (config ignored).")
 
     ref_model: AutoModelForCausalLM | None = None
     ref_device: str | None = None
@@ -3758,7 +3693,6 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
         )
 
     def _run_eval_once(*, collect_outputs: bool, show_progress: bool) -> dict[str, Any]:
-        _set_policy_runtime_attn(rollout_attn_impl, phase="eval")
         return evaluate_on_dataset(
             examples=eval_examples,
             policy_model=policy_eval_model,
@@ -3885,7 +3819,6 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
             ]
 
             _set_rollout_sampling_seed(cfg.misc.seed + update_idx + (rank * 1009))
-            _set_policy_runtime_attn(rollout_attn_impl, phase="rollout")
             local_rollouts = generate_rollouts(
                 examples=local_examples,
                 policy_model=policy_eval_model,
@@ -4022,7 +3955,6 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
                 f"u{update_idx}:r{rank}:p{pos}:idx{int(batch_indices[pos])}"
                 for pos in range(len(batch_examples))
             ]
-            _set_policy_runtime_attn(rollout_attn_impl, phase="rollout")
             rollouts = generate_rollouts(
                 examples=batch_examples,
                 policy_model=policy_eval_model,
@@ -4073,7 +4005,6 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
             continue
 
         step_stats = []
-        _set_policy_runtime_attn(update_attn_impl, phase="update")
         for _ in range(max(1, cfg.rl.ppo_epochs)):
             step_stats.append(
                 update_policy(
