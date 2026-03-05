@@ -13,6 +13,7 @@ from .config import RLConfig
 from .rl_types import Rollout, TrainStats
 
 logger = logging.getLogger(__name__)
+_GEMMA_TOKEN_TYPE_IDS_FALLBACK_WARNED = False
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -58,6 +59,59 @@ def _resolve_model_vocab_size(model: nn.Module) -> int | None:
     except Exception:
         size = 0
     return size if size > 0 else None
+
+
+def _is_gemma_like_model(model: nn.Module) -> bool:
+    cfg_obj = getattr(model, "config", None)
+    model_type = str(getattr(cfg_obj, "model_type", "") or "").strip().lower()
+    if "gemma" in model_type:
+        return True
+    model_name = str(getattr(cfg_obj, "_name_or_path", "") or "").strip().lower()
+    if "gemma" in model_name:
+        return True
+    cls_name = model.__class__.__name__.lower()
+    return "gemma" in cls_name
+
+
+def _forward_policy_model(
+    *,
+    policy_model: nn.Module,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    include_token_type_ids: bool,
+) -> Any:
+    global _GEMMA_TOKEN_TYPE_IDS_FALLBACK_WARNED
+
+    base_kwargs: dict[str, Any] = {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+    }
+    if include_token_type_ids:
+        base_kwargs["token_type_ids"] = torch.zeros_like(input_ids)
+
+    try:
+        # Keep training activation memory bounded; KV cache is only useful for autoregressive generation.
+        return policy_model(use_cache=False, **base_kwargs)
+    except TypeError:
+        pass
+
+    try:
+        return policy_model(**base_kwargs)
+    except TypeError:
+        if "token_type_ids" not in base_kwargs:
+            raise
+
+    fallback_kwargs = dict(base_kwargs)
+    fallback_kwargs.pop("token_type_ids", None)
+    if not _GEMMA_TOKEN_TYPE_IDS_FALLBACK_WARNED:
+        _GEMMA_TOKEN_TYPE_IDS_FALLBACK_WARNED = True
+        logger.warning(
+            "Gemma token_type_ids were requested but model forward rejected them; retrying without token_type_ids."
+        )
+    try:
+        return policy_model(use_cache=False, **fallback_kwargs)
+    except TypeError:
+        return policy_model(**fallback_kwargs)
 
 
 def _safe_token_texts(tokenizer: Any, token_id: int) -> tuple[str, str]:
@@ -215,6 +269,7 @@ def update_policy(
     debug_loss_max_input_tokens = _env_int("GEMMA27_RL_DEBUG_LOSS_MAX_INPUT_TOKENS", default=0, minimum=0)
     debug_loss_only_nonzero_adv = _env_flag("GEMMA27_RL_DEBUG_LOSS_ONLY_NONZERO_ADV", default=False)
     debug_loss_logged = 0
+    include_token_type_ids = _is_gemma_like_model(policy_model)
 
     for rollout, adv_row in zip(rollouts, advantages):
         _validate_rollout_token_ids(rollout=rollout, vocab_size=vocab_size)
@@ -224,11 +279,12 @@ def update_policy(
             dtype=torch.long,
         )
         attention_mask = torch.ones_like(input_ids)
-        try:
-            # Keep training activation memory bounded; KV cache is only useful for autoregressive generation.
-            outputs = policy_model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
-        except TypeError:
-            outputs = policy_model(input_ids=input_ids, attention_mask=attention_mask)
+        outputs = _forward_policy_model(
+            policy_model=policy_model,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            include_token_type_ids=include_token_type_ids,
+        )
         new_logprobs, entropy = _token_logprobs_and_entropy(
             outputs.logits,
             prompt_len=len(rollout.prompt_input_ids),
