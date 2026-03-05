@@ -8,6 +8,7 @@ import math
 import os
 from pathlib import Path
 import random
+import re
 import select
 import shutil
 import socket
@@ -63,6 +64,13 @@ _ESA_ALL_ZERO_WARNED = False
 _FORBIDDEN_THINK_TAGS: tuple[str, ...] = ("<think>", "</think>")
 _DEFAULT_THINK_TAG_TOKEN_PENALTY = -100.0
 _DEFAULT_THINK_TAG_SEQUENCE_PENALTY = -30.0
+_DEFAULT_REPEAT_TOKEN_PENALTY = -2.0
+_DEFAULT_REPEAT_SEQUENCE_PENALTY = -0.5
+_DEFAULT_SPECIAL_TOKEN_PENALTY = -50.0
+_DEFAULT_SPECIAL_SEQUENCE_PENALTY = -10.0
+_THINK_BLOCK_PATTERN = re.compile(r"<\s*think\s*>.*?<\s*/\s*think\s*>", flags=re.IGNORECASE | re.DOTALL)
+_THINK_TAG_PATTERN = re.compile(r"<\s*/?\s*think\s*>", flags=re.IGNORECASE)
+_PIPE_SPECIAL_PATTERN = re.compile(r"<\|[^>\n]{1,128}\|>")
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -167,6 +175,297 @@ def _apply_forbidden_think_tag_penalty(
 
     adjusted_seq_reward = float(seq_reward) + (float(seq_penalty_per_match) * float(len(matches)))
     return token_rewards, adjusted_seq_reward, len(matches), len(token_hits)
+
+
+def _find_repeated_token_positions(
+    completion_token_ids: list[int],
+    *,
+    min_repeat_run_length: int,
+) -> tuple[list[int], int]:
+    if min_repeat_run_length < 2:
+        min_repeat_run_length = 2
+    if len(completion_token_ids) < min_repeat_run_length:
+        return [], 0
+
+    repeated_positions: list[int] = []
+    repeated_runs = 0
+    run_len = 1
+    for idx in range(1, len(completion_token_ids)):
+        if int(completion_token_ids[idx]) == int(completion_token_ids[idx - 1]):
+            run_len += 1
+            if run_len == min_repeat_run_length:
+                repeated_runs += 1
+                repeated_positions.append(idx)
+            elif run_len > min_repeat_run_length:
+                repeated_positions.append(idx)
+        else:
+            run_len = 1
+    return repeated_positions, repeated_runs
+
+
+def _apply_repeated_token_penalty(
+    *,
+    completion_token_ids: list[int],
+    token_rewards: list[float],
+    seq_reward: float,
+    token_penalty: float,
+    seq_penalty_per_repeat: float,
+    min_repeat_run_length: int,
+) -> tuple[list[float], float, int, int]:
+    repeated_positions, repeated_runs = _find_repeated_token_positions(
+        completion_token_ids,
+        min_repeat_run_length=min_repeat_run_length,
+    )
+    if not repeated_positions:
+        return token_rewards, float(seq_reward), 0, 0
+
+    max_tokens = len(token_rewards)
+    for idx in repeated_positions:
+        if idx < max_tokens:
+            token_rewards[idx] += float(token_penalty)
+    adjusted_seq_reward = float(seq_reward) + (float(seq_penalty_per_repeat) * float(len(repeated_positions)))
+    return token_rewards, adjusted_seq_reward, len(repeated_positions), repeated_runs
+
+
+def _collect_tokenizer_special_token_strings(tokenizer: Any | None) -> list[str]:
+    if tokenizer is None:
+        return []
+    tokens: set[str] = set()
+
+    all_special = getattr(tokenizer, "all_special_tokens", None)
+    if isinstance(all_special, (list, tuple, set)):
+        for tok in all_special:
+            if isinstance(tok, str) and tok:
+                tokens.add(tok)
+
+    additional_special = getattr(tokenizer, "additional_special_tokens", None)
+    if isinstance(additional_special, (list, tuple, set)):
+        for tok in additional_special:
+            if isinstance(tok, str) and tok:
+                tokens.add(tok)
+
+    special_map = getattr(tokenizer, "special_tokens_map", None)
+    if isinstance(special_map, dict):
+        for value in special_map.values():
+            if isinstance(value, str) and value:
+                tokens.add(value)
+            elif isinstance(value, (list, tuple, set)):
+                for tok in value:
+                    if isinstance(tok, str) and tok:
+                        tokens.add(tok)
+
+    return sorted(tokens, key=len, reverse=True)
+
+
+def _collect_tokenizer_special_token_ids(tokenizer: Any | None) -> set[int]:
+    if tokenizer is None:
+        return set()
+    out: set[int] = set()
+    raw_ids = getattr(tokenizer, "all_special_ids", None)
+    if isinstance(raw_ids, (list, tuple, set)):
+        for tok_id in raw_ids:
+            try:
+                out.add(int(tok_id))
+            except Exception:
+                continue
+    return out
+
+
+def _find_special_token_text_spans(text: str, special_tokens: list[str]) -> list[tuple[int, int, str]]:
+    if not text or not special_tokens:
+        return []
+    matches: list[tuple[int, int, str]] = []
+    for token in special_tokens:
+        tok = str(token or "")
+        if not tok:
+            continue
+        start = 0
+        while True:
+            idx = text.find(tok, start)
+            if idx < 0:
+                break
+            matches.append((idx, idx + len(tok), tok))
+            start = idx + len(tok)
+    matches.sort(key=lambda row: row[0])
+    return matches
+
+
+def _looks_like_end_of_turn_marker(token_text: str) -> bool:
+    text = str(token_text or "").strip().lower()
+    if not text:
+        return False
+    return any(hint in text for hint in ("end_of_turn", "eot", "im_end", "endofturn", "eos"))
+
+
+def _collect_exempt_final_end_of_turn_markers(
+    tokenizer: Any | None,
+    *,
+    special_token_strings: list[str],
+    special_token_ids: set[int],
+) -> tuple[set[int], set[str]]:
+    exempt_strings: set[str] = set()
+    exempt_ids: set[int] = set()
+
+    for token in special_token_strings:
+        if _looks_like_end_of_turn_marker(token):
+            exempt_strings.add(str(token))
+
+    eos_token = getattr(tokenizer, "eos_token", None) if tokenizer is not None else None
+    if isinstance(eos_token, str) and eos_token.strip():
+        exempt_strings.add(eos_token.strip())
+
+    eos_token_id = getattr(tokenizer, "eos_token_id", None) if tokenizer is not None else None
+    if isinstance(eos_token_id, int):
+        exempt_ids.add(int(eos_token_id))
+    elif isinstance(eos_token_id, (list, tuple, set)):
+        for tok_id in eos_token_id:
+            try:
+                exempt_ids.add(int(tok_id))
+            except Exception:
+                continue
+
+    converter = getattr(tokenizer, "convert_tokens_to_ids", None) if tokenizer is not None else None
+    if callable(converter):
+        for token in exempt_strings:
+            try:
+                tok_id = converter(token)
+            except Exception:
+                continue
+            try:
+                tok_id_int = int(tok_id)
+            except Exception:
+                continue
+            exempt_ids.add(tok_id_int)
+
+    if special_token_ids:
+        exempt_ids = {tok_id for tok_id in exempt_ids if tok_id in special_token_ids}
+    return exempt_ids, exempt_strings
+
+
+def _count_special_token_id_occurrences(
+    *,
+    token_ids: list[int],
+    special_token_ids: set[int],
+    exempt_final_token_ids: set[int] | None = None,
+) -> int:
+    if not token_ids or not special_token_ids:
+        return 0
+    exempt_ids = exempt_final_token_ids or set()
+    final_idx = len(token_ids) - 1
+    occurrences = 0
+    for tok_idx, tok_id_raw in enumerate(token_ids):
+        tok_id = int(tok_id_raw)
+        if tok_id not in special_token_ids:
+            continue
+        if tok_idx == final_idx and tok_id in exempt_ids:
+            continue
+        occurrences += 1
+    return occurrences
+
+
+def _apply_special_token_penalty(
+    *,
+    completion_text: str,
+    completion_token_ids: list[int],
+    penalty_token_ids: list[int] | None = None,
+    token_char_offsets: list[tuple[int, int]],
+    token_rewards: list[float],
+    seq_reward: float,
+    special_token_ids: set[int],
+    special_token_strings: list[str],
+    token_penalty: float,
+    seq_penalty_per_occurrence: float,
+    exempt_final_token_ids: set[int] | None = None,
+    exempt_final_token_strings: set[str] | None = None,
+) -> tuple[list[float], float, int, int]:
+    exempt_ids = exempt_final_token_ids or set()
+    exempt_strings_lc = {str(tok).lower() for tok in (exempt_final_token_strings or set()) if str(tok)}
+    special_occurrences = 0
+    token_hits: set[int] = set()
+    completion_id_occurrences = 0
+
+    max_tokens = min(len(token_rewards), len(completion_token_ids))
+    final_token_idx = max_tokens - 1
+    for tok_idx in range(max_tokens):
+        token_id = int(completion_token_ids[tok_idx])
+        if token_id not in special_token_ids:
+            continue
+        if tok_idx == final_token_idx and token_id in exempt_ids:
+            continue
+        completion_id_occurrences += 1
+        token_hits.add(tok_idx)
+        token_rewards[tok_idx] += float(token_penalty)
+
+    seq_id_source = penalty_token_ids if penalty_token_ids is not None else completion_token_ids
+    if penalty_token_ids is None:
+        special_occurrences += completion_id_occurrences
+    else:
+        special_occurrences += _count_special_token_id_occurrences(
+            token_ids=seq_id_source,
+            special_token_ids=special_token_ids,
+            exempt_final_token_ids=exempt_ids,
+        )
+
+    text_matches = _find_special_token_text_spans(completion_text, special_token_strings)
+    max_with_offsets = min(len(token_rewards), len(token_char_offsets))
+    text_end = len(completion_text.rstrip())
+    for start, end, _ in text_matches:
+        matched_text_lc = completion_text[start:end].lower() if end > start else ""
+        if end == text_end and matched_text_lc in exempt_strings_lc:
+            continue
+        special_occurrences += 1
+        for tok_idx in range(max_with_offsets):
+            tok_s, tok_e = token_char_offsets[tok_idx]
+            if _span_overlap_chars(start, end, tok_s, tok_e) <= 0:
+                continue
+            if tok_idx in token_hits:
+                continue
+            token_hits.add(tok_idx)
+            token_rewards[tok_idx] += float(token_penalty)
+
+    if special_occurrences <= 0:
+        return token_rewards, float(seq_reward), 0, 0
+
+    adjusted_seq = float(seq_reward) + (float(seq_penalty_per_occurrence) * float(special_occurrences))
+    return token_rewards, adjusted_seq, special_occurrences, len(token_hits)
+
+
+def _replace_matches_with_spaces(text: str, pattern: re.Pattern[str]) -> tuple[str, int]:
+    match_count = 0
+
+    def _repl(match: re.Match[str]) -> str:
+        nonlocal match_count
+        match_count += 1
+        return " " * (match.end() - match.start())
+
+    return pattern.sub(_repl, text), match_count
+
+
+def _sanitize_text_for_mqm_esa(target_text: str, *, special_tokens: list[str]) -> tuple[str, int]:
+    sanitized = str(target_text or "")
+    replacement_count = 0
+
+    sanitized, replaced = _replace_matches_with_spaces(sanitized, _THINK_BLOCK_PATTERN)
+    replacement_count += replaced
+
+    sanitized, replaced = _replace_matches_with_spaces(sanitized, _THINK_TAG_PATTERN)
+    replacement_count += replaced
+
+    for tok in special_tokens:
+        token_text = str(tok or "")
+        if not token_text:
+            continue
+        if token_text.lower() in {"<think>", "</think>"}:
+            continue
+        occurrences = sanitized.count(token_text)
+        if occurrences <= 0:
+            continue
+        sanitized = sanitized.replace(token_text, " " * len(token_text))
+        replacement_count += occurrences
+
+    sanitized, replaced = _replace_matches_with_spaces(sanitized, _PIPE_SPECIAL_PATTERN)
+    replacement_count += replaced
+    return sanitized, replacement_count
 
 
 def _log_span_debug_for_rollout(
@@ -1807,6 +2106,7 @@ def _prepare_rewards_and_advantages(
     xcomet_cache: dict[tuple[str, str, str], tuple[float, list[dict[str, Any]]]],
     mqm_cache: dict[tuple[str, str, str], tuple[float, list[dict[str, Any]]]],
     esa_cache: dict[tuple[str, str, str], float],
+    tokenizer: Any | None = None,
 ) -> tuple[list[list[float]], dict[str, float], dict[str, float]]:
     global _ESA_ALL_ZERO_WARNED
 
@@ -1822,6 +2122,28 @@ def _prepare_rewards_and_advantages(
         return out, replaced
 
     samples = [SampleForScoring(src=r.src_text, mt=r.completion_text, ref=r.ref_text) for r in rollouts]
+    special_token_strings = _collect_tokenizer_special_token_strings(tokenizer)
+    special_token_ids = _collect_tokenizer_special_token_ids(tokenizer)
+    special_token_penalty_strings = [
+        tok for tok in special_token_strings if str(tok).strip().lower() not in {"<think>", "</think>"}
+    ]
+    exempt_final_special_ids, exempt_final_special_strings = _collect_exempt_final_end_of_turn_markers(
+        tokenizer,
+        special_token_strings=special_token_penalty_strings,
+        special_token_ids=special_token_ids,
+    )
+    mqm_esa_samples: list[SampleForScoring] = []
+    sanitized_target_rows = 0
+    sanitized_marker_total = 0
+    for rollout in rollouts:
+        sanitized_mt, replacement_count = _sanitize_text_for_mqm_esa(
+            rollout.completion_text,
+            special_tokens=special_token_strings,
+        )
+        if replacement_count > 0:
+            sanitized_target_rows += 1
+            sanitized_marker_total += int(replacement_count)
+        mqm_esa_samples.append(SampleForScoring(src=rollout.src_text, mt=sanitized_mt, ref=rollout.ref_text))
     debug_span_loss = _env_flag("GEMMA27_RL_DEBUG_SPAN_LOSS", default=False)
     debug_span_max_rollouts = _env_int("GEMMA27_RL_DEBUG_SPAN_MAX_ROLLOUTS", default=1, minimum=1)
     debug_span_max_tokens = _env_int("GEMMA27_RL_DEBUG_SPAN_MAX_TOKENS", default=256, minimum=1)
@@ -1831,6 +2153,19 @@ def _prepare_rewards_and_advantages(
     )
     think_tag_seq_penalty = -abs(
         _env_float("GEMMA27_RL_THINK_TAG_SEQ_PENALTY", default=_DEFAULT_THINK_TAG_SEQUENCE_PENALTY)
+    )
+    repeat_token_penalty = -abs(
+        _env_float("GEMMA27_RL_REPEAT_TOKEN_PENALTY", default=_DEFAULT_REPEAT_TOKEN_PENALTY)
+    )
+    repeat_seq_penalty = -abs(
+        _env_float("GEMMA27_RL_REPEAT_SEQ_PENALTY", default=_DEFAULT_REPEAT_SEQUENCE_PENALTY)
+    )
+    repeat_min_run = _env_int("GEMMA27_RL_REPEAT_MIN_RUN", default=2, minimum=2)
+    special_token_penalty = -abs(
+        _env_float("GEMMA27_RL_SPECIAL_TOKEN_PENALTY", default=_DEFAULT_SPECIAL_TOKEN_PENALTY)
+    )
+    special_seq_penalty = -abs(
+        _env_float("GEMMA27_RL_SPECIAL_SEQ_PENALTY", default=_DEFAULT_SPECIAL_SEQUENCE_PENALTY)
     )
     debug_span_records: list[tuple[int, Rollout, list[dict[str, Any]], list[float], list[float], float]] = []
 
@@ -1877,7 +2212,7 @@ def _prepare_rewards_and_advantages(
             if mqm_enabled:
                 futures["mqm"] = executor.submit(
                     _score_with_cache_mqm,
-                    samples=samples,
+                    samples=mqm_esa_samples,
                     scorer=mqm_scorer,
                     cache=mqm_cache,
                     use_cache=cfg.reward.cache_enabled and cfg.reward.mqm.enabled,
@@ -1885,7 +2220,7 @@ def _prepare_rewards_and_advantages(
             if esa_enabled:
                 futures["esa"] = executor.submit(
                     _score_with_cache_esa,
-                    samples=samples,
+                    samples=mqm_esa_samples,
                     scorer=esa_scorer,
                     cache=esa_cache,
                     use_cache=cfg.reward.cache_enabled and cfg.reward.esa.enabled,
@@ -1915,14 +2250,14 @@ def _prepare_rewards_and_advantages(
             )
         if mqm_enabled:
             mqm_scores, mqm_span_rows = _score_with_cache_mqm(
-                samples=samples,
+                samples=mqm_esa_samples,
                 scorer=mqm_scorer,
                 cache=mqm_cache,
                 use_cache=cfg.reward.cache_enabled and cfg.reward.mqm.enabled,
             )
         if esa_enabled:
             esa_scores = _score_with_cache_esa(
-                samples=samples,
+                samples=mqm_esa_samples,
                 scorer=esa_scorer,
                 cache=esa_cache,
                 use_cache=cfg.reward.cache_enabled and cfg.reward.esa.enabled,
@@ -2007,6 +2342,12 @@ def _prepare_rewards_and_advantages(
     think_tag_counts: list[float] = []
     think_tag_token_hits: list[float] = []
     think_tag_penalties: list[float] = []
+    repeat_token_counts: list[float] = []
+    repeat_run_counts: list[float] = []
+    repeat_penalties: list[float] = []
+    special_token_occurrence_counts: list[float] = []
+    special_token_hit_counts: list[float] = []
+    special_token_penalties: list[float] = []
 
     for rollout, span_row, seq_reward in zip(rollouts, span_rows, seq_rewards):
         token_rewards = spans_to_token_rewards(
@@ -2029,6 +2370,32 @@ def _prepare_rewards_and_advantages(
             token_penalty=think_tag_token_penalty,
             seq_penalty_per_match=think_tag_seq_penalty,
         )
+        special_sum_before = float(sum(token_rewards))
+        special_seq_before = float(seq_reward)
+        token_rewards, seq_reward, special_occurrences, special_token_hits = _apply_special_token_penalty(
+            completion_text=rollout.completion_text,
+            completion_token_ids=rollout.completion_token_ids,
+            penalty_token_ids=rollout.raw_completion_token_ids,
+            token_char_offsets=rollout.token_char_offsets,
+            token_rewards=token_rewards,
+            seq_reward=float(seq_reward),
+            special_token_ids=special_token_ids,
+            special_token_strings=special_token_penalty_strings,
+            token_penalty=special_token_penalty,
+            seq_penalty_per_occurrence=special_seq_penalty,
+            exempt_final_token_ids=exempt_final_special_ids,
+            exempt_final_token_strings=exempt_final_special_strings,
+        )
+        repeat_sum_before = float(sum(token_rewards))
+        repeat_seq_before = float(seq_reward)
+        token_rewards, seq_reward, repeat_token_count, repeat_run_count = _apply_repeated_token_penalty(
+            completion_token_ids=rollout.completion_token_ids,
+            token_rewards=token_rewards,
+            seq_reward=float(seq_reward),
+            token_penalty=repeat_token_penalty,
+            seq_penalty_per_repeat=repeat_seq_penalty,
+            min_repeat_run_length=repeat_min_run,
+        )
         seq_row = broadcast_sequence_reward(seq_reward, token_count=len(token_rewards))
         raw_adv = combine_advantages(seq_row, token_rewards)
 
@@ -2038,6 +2405,14 @@ def _prepare_rewards_and_advantages(
         think_tag_token_hits.append(float(forbidden_token_hits))
         think_tag_penalties.append(
             (float(sum(token_rewards)) - token_reward_sum_before) + (float(seq_reward) - seq_reward_before)
+        )
+        repeat_token_counts.append(float(repeat_token_count))
+        repeat_run_counts.append(float(repeat_run_count))
+        repeat_penalties.append((float(sum(token_rewards)) - repeat_sum_before) + (float(seq_reward) - repeat_seq_before))
+        special_token_occurrence_counts.append(float(special_occurrences))
+        special_token_hit_counts.append(float(special_token_hits))
+        special_token_penalties.append(
+            (float(sum(token_rewards)) - special_sum_before) + (float(seq_reward) - special_seq_before)
         )
         if debug_span_loss and len(debug_span_records) < debug_span_max_rollouts:
             debug_span_records.append(
@@ -2067,6 +2442,35 @@ def _prepare_rewards_and_advantages(
             int(sum(think_tag_token_hits)),
             float(think_tag_token_penalty),
             float(think_tag_seq_penalty),
+        )
+    total_repeat_tokens = int(sum(repeat_token_counts))
+    if total_repeat_tokens > 0:
+        logger.info(
+            "repeat token penalty applied: repeat_tokens=%s repeat_runs=%s min_run=%s token_penalty=%.2f seq_penalty=%.2f",
+            total_repeat_tokens,
+            int(sum(repeat_run_counts)),
+            int(repeat_min_run),
+            float(repeat_token_penalty),
+            float(repeat_seq_penalty),
+        )
+    total_special_occurrences = int(sum(special_token_occurrence_counts))
+    if total_special_occurrences > 0:
+        logger.info(
+            "special token penalty applied: occurrences=%s token_hits=%s token_penalty=%.1f seq_penalty=%.1f ids=%s strings=%s",
+            total_special_occurrences,
+            int(sum(special_token_hit_counts)),
+            float(special_token_penalty),
+            float(special_seq_penalty),
+            len(special_token_ids),
+            len(special_token_penalty_strings),
+        )
+    if sanitized_target_rows > 0:
+        logger.info(
+            "MQM/ESA target sanitize applied: rows=%s/%s marker_replacements=%s tokenizer_special_tokens=%s",
+            int(sanitized_target_rows),
+            len(rollouts),
+            int(sanitized_marker_total),
+            len(special_token_strings),
         )
 
     if cfg.rl.group_normalize:
@@ -2142,6 +2546,20 @@ def _prepare_rewards_and_advantages(
         "forbidden_think_tag_token_hits_mean": float(mean(think_tag_token_hits) if think_tag_token_hits else 0.0),
         "forbidden_think_penalty_mean": float(mean(think_tag_penalties) if think_tag_penalties else 0.0),
         "forbidden_think_penalty_total": float(sum(think_tag_penalties)),
+        "repeat_token_count_mean": float(mean(repeat_token_counts) if repeat_token_counts else 0.0),
+        "repeat_token_count_total": float(sum(repeat_token_counts)),
+        "repeat_run_count_mean": float(mean(repeat_run_counts) if repeat_run_counts else 0.0),
+        "repeat_penalty_mean": float(mean(repeat_penalties) if repeat_penalties else 0.0),
+        "repeat_penalty_total": float(sum(repeat_penalties)),
+        "special_token_occurrence_count_mean": float(
+            mean(special_token_occurrence_counts) if special_token_occurrence_counts else 0.0
+        ),
+        "special_token_occurrence_count_total": float(sum(special_token_occurrence_counts)),
+        "special_token_hit_count_mean": float(mean(special_token_hit_counts) if special_token_hit_counts else 0.0),
+        "special_token_penalty_mean": float(mean(special_token_penalties) if special_token_penalties else 0.0),
+        "special_token_penalty_total": float(sum(special_token_penalties)),
+        "judge_sanitized_target_count": float(sanitized_target_rows),
+        "judge_sanitized_marker_total": float(sanitized_marker_total),
     }
 
     return norm_adv_rows, reward_stats, norm_stats
@@ -3133,6 +3551,7 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
                             xcomet_cache=xcomet_cache,
                             mqm_cache=mqm_cache,
                             esa_cache=esa_cache,
+                            tokenizer=tokenizer,
                         )
                         ref_fill_future = None
                         if cfg.rl.kl_coef > 0:
@@ -3243,6 +3662,7 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
                     xcomet_cache=xcomet_cache,
                     mqm_cache=mqm_cache,
                     esa_cache=esa_cache,
+                    tokenizer=tokenizer,
                 )
                 if cfg.rl.kl_coef > 0:
                     _ = _fill_missing_reference_logprobs(

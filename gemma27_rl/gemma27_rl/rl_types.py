@@ -27,6 +27,7 @@ class Rollout:
     token_char_offsets: list[tuple[int, int]]
     src_text: str
     ref_text: str | None = None
+    raw_completion_token_ids: list[int] | None = None
 
 
 @dataclass

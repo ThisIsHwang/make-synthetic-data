@@ -299,6 +299,7 @@ def _decode_single_token(tokenizer: PreTrainedTokenizerBase, token_id: int, cfg:
 def _resolve_eos_token_ids(
     tokenizer_eos_token_id: int | list[int] | None,
     model_eos_token_id: int | list[int] | None,
+    extra_token_ids: list[int] | None = None,
 ) -> list[int]:
     eos_ids: list[int] = []
     for raw in (model_eos_token_id, tokenizer_eos_token_id):
@@ -313,6 +314,12 @@ def _resolve_eos_token_ids(
                     eos_ids.append(int(item))
                 except Exception:
                     continue
+    if extra_token_ids:
+        for tok_id in extra_token_ids:
+            try:
+                eos_ids.append(int(tok_id))
+            except Exception:
+                continue
 
     uniq: list[int] = []
     seen: set[int] = set()
@@ -322,6 +329,82 @@ def _resolve_eos_token_ids(
         seen.add(tok)
         uniq.append(tok)
     return uniq
+
+
+def _looks_like_end_of_turn_marker(token_text: str) -> bool:
+    text = str(token_text or "").strip().lower()
+    if not text:
+        return False
+    return any(hint in text for hint in ("end_of_turn", "eot", "im_end", "endofturn"))
+
+
+def _collect_end_of_turn_token_ids(tokenizer: PreTrainedTokenizerBase | Any | None) -> list[int]:
+    if tokenizer is None:
+        return []
+
+    out: list[int] = []
+    seen: set[int] = set()
+
+    def _add_token_id(raw: Any) -> None:
+        try:
+            tok_id = int(raw)
+        except Exception:
+            return
+        if tok_id < 0:
+            return
+        if tok_id in seen:
+            return
+        seen.add(tok_id)
+        out.append(tok_id)
+
+    for attr_name in ("eot_token_id", "end_of_turn_token_id", "im_end_id"):
+        raw_attr = getattr(tokenizer, attr_name, None)
+        if isinstance(raw_attr, int):
+            _add_token_id(raw_attr)
+        elif isinstance(raw_attr, (list, tuple, set)):
+            for item in raw_attr:
+                _add_token_id(item)
+
+    candidate_tokens: list[str] = []
+    all_special = getattr(tokenizer, "all_special_tokens", None)
+    if isinstance(all_special, (list, tuple, set)):
+        candidate_tokens.extend(str(tok) for tok in all_special if str(tok))
+
+    additional_special = getattr(tokenizer, "additional_special_tokens", None)
+    if isinstance(additional_special, (list, tuple, set)):
+        candidate_tokens.extend(str(tok) for tok in additional_special if str(tok))
+
+    special_map = getattr(tokenizer, "special_tokens_map", None)
+    if isinstance(special_map, dict):
+        for value in special_map.values():
+            if isinstance(value, str):
+                candidate_tokens.append(value)
+            elif isinstance(value, (list, tuple, set)):
+                candidate_tokens.extend(str(tok) for tok in value if str(tok))
+
+    added_vocab_getter = getattr(tokenizer, "get_added_vocab", None)
+    if callable(added_vocab_getter):
+        try:
+            added_vocab = added_vocab_getter()
+        except Exception:
+            added_vocab = {}
+        if isinstance(added_vocab, dict):
+            for token_text, token_id in added_vocab.items():
+                if _looks_like_end_of_turn_marker(str(token_text)):
+                    _add_token_id(token_id)
+
+    converter = getattr(tokenizer, "convert_tokens_to_ids", None)
+    if callable(converter):
+        for token_text in candidate_tokens:
+            if not _looks_like_end_of_turn_marker(token_text):
+                continue
+            try:
+                converted = converter(token_text)
+            except Exception:
+                continue
+            _add_token_id(converted)
+
+    return out
 
 
 def _extract_prompt_rows_from_tokenized(
@@ -752,7 +835,8 @@ def generate_rollouts(
 
     pad_token_id = tokenizer.pad_token_id
     model_eos = getattr(getattr(policy_model, "generation_config", None), "eos_token_id", None)
-    eos_token_ids = _resolve_eos_token_ids(tokenizer.eos_token_id, model_eos)
+    eot_token_ids = _collect_end_of_turn_token_ids(tokenizer)
+    eos_token_ids = _resolve_eos_token_ids(tokenizer.eos_token_id, model_eos, extra_token_ids=eot_token_ids)
     eos_for_generate: int | list[int] | None
     if not eos_token_ids:
         eos_for_generate = None
@@ -763,6 +847,8 @@ def generate_rollouts(
 
     if pad_token_id is None and eos_token_ids:
         pad_token_id = eos_token_ids[0]
+    if eot_token_ids:
+        logger.info("generate_rollouts: end-of-turn stop token ids enabled: %s", eot_token_ids)
 
     policy_model.eval()
     if ref_model is not None:
@@ -979,6 +1065,7 @@ def generate_rollouts(
                     token_char_offsets=offsets,
                     src_text=ex.src_text,
                     ref_text=ex.ref_text,
+                    raw_completion_token_ids=list(completion_raw_ids),
                 )
             )
     finally:
