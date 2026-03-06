@@ -56,7 +56,7 @@ from .rewards import (
     metricx_score_to_reward,
     spans_to_token_rewards,
 )
-from .rollout import compute_completion_logprobs, generate_rollouts
+from .rollout import compute_completion_logprobs, compute_completion_logprobs_batch, generate_rollouts
 from .rl_types import Rollout, SampleForScoring
 from .utils import (
     build_worker_launch_command,

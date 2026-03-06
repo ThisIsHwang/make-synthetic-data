@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 import os
+from types import SimpleNamespace
 
 import pytest
 
-pytest.importorskip("torch")
+torch = pytest.importorskip("torch")
+from torch import nn
 
 from gemma27_rl.config import RLPostTrainConfig
 from gemma27_rl import trainer as trainer_mod
@@ -170,3 +173,38 @@ def test_save_deepspeed_resume_checkpoint_wrapper_passes_hf_model(
     trainer_state = captured["trainer_state"]
     assert isinstance(trainer_state, dict)
     assert trainer_state["update_idx"] == 9
+
+
+class _FakeColocatedPolicyModel(nn.Module):
+    def __init__(self, vocab_size: int = 16, hidden_size: int = 8) -> None:
+        super().__init__()
+        self.emb = nn.Embedding(vocab_size, hidden_size)
+        self.proj = nn.Linear(hidden_size, vocab_size)
+
+    def disable_adapter(self):
+        return nullcontext()
+
+    def forward(self, input_ids, attention_mask=None):
+        del attention_mask
+        hidden = self.emb(input_ids)
+        return SimpleNamespace(logits=self.proj(hidden))
+
+
+def test_create_colocated_reference_logprob_batch_fn_scores_without_name_error() -> None:
+    cfg = _base_cfg()
+    cfg.model.reference_runtime = "colocate"
+    cfg.model.policy_runtime_mode = "colocate"
+    cfg.model.lora.enabled = True
+    cfg.model.reference_logprob_micro_batch_size = 2
+
+    batch_fn, model_device = trainer_mod._create_colocated_reference_logprob_batch_fn(
+        cfg,
+        _FakeColocatedPolicyModel(),
+        device="cpu",
+    )
+    rows = batch_fn([([1, 2], [3]), ([4], [5, 6])])
+
+    assert model_device == "cpu"
+    assert len(rows) == 2
+    assert len(rows[0]) == 1
+    assert len(rows[1]) == 2
