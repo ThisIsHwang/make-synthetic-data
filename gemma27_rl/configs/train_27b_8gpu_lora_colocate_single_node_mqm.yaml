@@ -1,0 +1,231 @@
+model:
+  # Replace with your 27B SFT checkpoint or HF model id.
+  policy_name_or_path: ../outputs/gemma3-27b-it-sft-fsdp
+  reference_name_or_path: null
+  tokenizer_name_or_path: null
+  trust_remote_code: false
+  attn_implementation: flash_attention_2
+  disable_policy_flash_attention: false
+  reference_attn_implementation: sdpa
+  use_fast_tokenizer: true
+  reference_device: null
+  policy_gpu_ids: [0, 1, 2, 3, 4, 5, 6, 7]
+  reference_gpu_ids: []
+  reference_runtime: colocate
+  policy_runtime_mode: colocate
+  reference_logprob_micro_batch_size: 1
+  lora:
+    enabled: true
+    r: 64
+    alpha: 128
+    dropout: 0.05
+    bias: none
+    target_modules:
+      - q_proj
+      - k_proj
+      - v_proj
+      - o_proj
+      - gate_proj
+      - up_proj
+      - down_proj
+
+data:
+  # Replace with your local files if you are not training on WMT24++.
+  train_file: null
+  eval_file: null
+  hf_dataset_name: google/wmt24pp
+  hf_dataset_config_name: en-ko_KR
+  hf_train_split: train
+  hf_eval_split: train
+  hf_revision: null
+  hf_streaming: false
+  split_field: null
+  train_split: null
+  eval_split: null
+  limit: null
+  eval_limit: 128
+  eval_sampling_count: null
+  eval_sampling_ratio: null
+  eval_sampling_seed: 42
+  eval_sampling_min_samples: 1
+
+  id_field: segment_id
+  src_text_field: source
+  src_lang_field: src_lang
+  tgt_lang_field: tgt_lang
+  src_lang_code_field: src_lang_code
+  tgt_lang_code_field: tgt_lang_code
+  ref_text_field: target
+  is_bad_source_field: is_bad_source
+  skip_bad_source: true
+
+  default_src_lang: English
+  default_tgt_lang: Korean
+  default_src_lang_code: en
+  default_tgt_lang_code: ko
+
+prompt:
+  template: "You are a professional {source_lang} ({src_lang_code}) to {target_lang} ({tgt_lang_code}) translator. Your goal is to accurately convey the meaning and nuances of the original {source_lang} text while adhering to {target_lang} grammar, vocabulary, and cultural sensitivities. Produce only the {target_lang} translation, without any additional explanations or commentary. Please translate the following {source_lang} text into {target_lang}:\n\n{text}"
+
+generation:
+  max_new_tokens: 256
+  temperature: 0.7
+  top_p: 0.95
+  top_k: 50
+  num_samples_per_prompt: 4
+  do_sample: true
+  repetition_penalty: 1.0
+  chat_template_kwargs:
+    enable_thinking: false
+
+reward:
+  w_metricx: 0.0
+  w_xcomet_seq: 0.0
+  xcomet_seq_scale: 1.0
+  w_mqm_seq: 0.2
+  mqm_seq_scale: 1.0
+  w_esa_seq: 0.0
+  esa_seq_scale: 1.0
+  severity_weights:
+    MINOR: -1.0
+    MAJOR: -5.0
+    CRITICAL: -10.0
+  overlap_policy: any_overlap
+  majority_threshold: 0.5
+  use_confidence: false
+  span_combine_policy: sum
+  cache_enabled: true
+
+  # All 8 local GPUs are reserved for the LoRA policy + colocated reference path.
+  metricx:
+    enabled: false
+    model_name: google/metricx-24-hybrid-xxl-v2p6
+    tokenizer_name: google/mt5-xl
+    use_reference: false
+    batch_size: 1
+    device: cuda:0
+    dtype: float16
+    max_input_length: 2048
+    overflow_policy: truncate
+    offset: 5.0
+    python_executable: ../../.venv_metricx/bin/python
+    subprocess_timeout_sec: 1800.0
+    worker_host: null
+    worker_remote_workdir: null
+
+  xcomet:
+    enabled: false
+    model_name: Unbabel/XCOMET-XL
+    batch_size: 1
+    device: cuda:0
+    use_reference: false
+    python_executable: ../../.venv_xcomet/bin/python
+    subprocess_timeout_sec: 1800.0
+    worker_host: null
+    worker_remote_workdir: null
+
+  # Replace base_url/model_name with your OpenAI-compatible judge endpoint.
+  mqm:
+    enabled: true
+    base_url: http://replace-with-openai-compatible-endpoint/v1
+    model_name: qwen3.5-397b-instruct
+    api_key: null
+    api_key_env: OPENAI_API_KEY
+    source_lang: English
+    target_lang: Korean
+    timeout_sec: 120.0
+    timeout_s: 120.0
+    max_retries: 3
+    batch_size: 1
+    use_reference: false
+    temperature: 0.0
+    top_p: 1.0
+    top_k: null
+    presence_penalty: null
+    repetition_penalty: null
+    max_tokens: 1024
+    stop: []
+    chat_template_kwargs:
+      enable_thinking: false
+    score_min: -25.0
+    score_max: 0.0
+    scale_to_unit_interval: false
+    error_policy: raise
+
+  esa:
+    enabled: false
+    base_url: null
+    model_name: qwen3.5-397b-instruct
+    api_key: null
+    api_key_env: OPENAI_API_KEY
+    source_lang: English
+    target_lang: Korean
+    timeout_sec: 120.0
+    timeout_s: 120.0
+    max_retries: 3
+    batch_size: 1
+    use_reference: false
+    temperature: 0.0
+    top_p: 1.0
+    top_k: null
+    presence_penalty: null
+    repetition_penalty: null
+    max_tokens_error_spans: 1024
+    max_tokens_score: 256
+    stop: []
+    chat_template_kwargs:
+      enable_thinking: false
+    use_fewshot: true
+    score_min: 0.0
+    score_max: 100.0
+    scale_to_unit_interval: false
+    error_policy: raise
+
+rl:
+  backend: deepspeed
+  algorithm: grpo
+  lr: 2.0e-6
+  weight_decay: 0.0
+  batch_size: 1
+  grad_accum: 32
+  clip_eps: 0.2
+  kl_coef: 0.01
+  entropy_coef: 0.0
+  max_grad_norm: 1.0
+  ppo_epochs: 1
+  updates: 500
+  normalize_advantage: true
+  group_normalize: true
+  group_advantage_coef: 1.0
+  eps: 1.0e-8
+  deepspeed_zero_stage: 3
+  deepspeed_offload_optimizer: false
+  deepspeed_offload_param: false
+
+eval:
+  eval_every_n_updates: 10
+  eval_limit: 128
+  run_before_train: true
+  distributed_shard: true
+
+logging:
+  output_dir: ./gemma27_rl_outputs/grpo-gemma3-27b-8gpu-lora-colocate-single-node-mqm
+  jsonl_name: train_log.jsonl
+  rollout_jsonl_name: train_rollouts.jsonl
+  save_rollouts: true
+  eval_output_jsonl_name: eval_outputs.jsonl
+  save_eval_outputs: true
+  save_every_n_updates: 100
+  save_only_best: true
+  auto_resume: true
+  resume_from_checkpoint: null
+
+misc:
+  seed: 42
+  device: cuda:0
+  dtype: bfloat16
+  huggingface_cache_dir: /media/sdd3
+  huggingface_token: null
+  huggingface_token_env: HF_TOKEN
+  aux_worker_host: null
+  aux_worker_remote_workdir: null

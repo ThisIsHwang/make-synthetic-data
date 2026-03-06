@@ -110,6 +110,24 @@ def _pick_text(row: dict[str, Any], field: str, default: str | None = None) -> s
     return value
 
 
+def _parse_bad_source_flag(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return bool(value)
+    if isinstance(value, (int, float)):
+        return bool(value)
+
+    text = str(value).strip().lower()
+    if not text:
+        return False
+    if text in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    if text in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    return True
+
+
 def _resolve_split(records: list[dict[str, Any]], split_field: str | None, split_name: str | None) -> list[dict[str, Any]]:
     if not split_field or not split_name:
         return records
@@ -240,7 +258,7 @@ def load_examples(cfg: DataConfig, split: str, limit: int | None = None) -> list
     skipped_bad_source = 0
     skipped_empty_source = 0
     for idx, row in enumerate(records):
-        if cfg.skip_bad_source and bool(row.get(cfg.is_bad_source_field, False)):
+        if cfg.skip_bad_source and _parse_bad_source_flag(row.get(cfg.is_bad_source_field, False)):
             skipped_bad_source += 1
             continue
 

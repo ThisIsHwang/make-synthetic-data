@@ -36,6 +36,7 @@ uv pip install -e .
 기본 예시: `configs/train_toy.yaml`
 WMT24pp 빠른 테스트 예시: `configs/train_wmt24pp_enko_toy.yaml`
 27B LoRA + colocated reference 예시: `configs/train_27b_8gpu_lora_colocate.yaml`
+27B LoRA + colocated reference + single-node MQM 예시: `configs/train_27b_8gpu_lora_colocate_single_node_mqm.yaml`
 Qwen3.5 + MQM 전용 예시: `configs/qwen35_mqm/`
 
 핵심값:

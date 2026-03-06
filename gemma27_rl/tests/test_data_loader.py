@@ -169,3 +169,29 @@ def test_eval_sampling_count_uses_absolute_size(tmp_path) -> None:
     eval_examples = load_examples(cfg, split="eval", limit=None)
     assert len(eval_examples) == 3
     assert len(train_examples) == 9
+
+
+def test_skip_bad_source_parses_common_string_booleans(tmp_path) -> None:
+    data_path = tmp_path / "string_bad_source.jsonl"
+    rows = [
+        {"id": 1, "source": "keep-false", "target": "t1", "is_bad_source": "false"},
+        {"id": 2, "source": "keep-zero", "target": "t2", "is_bad_source": "0"},
+        {"id": 3, "source": "keep-empty", "target": "t3", "is_bad_source": ""},
+        {"id": 4, "source": "keep-missing", "target": "t4"},
+        {"id": 5, "source": "drop-true", "target": "t5", "is_bad_source": "true"},
+        {"id": 6, "source": "drop-one", "target": "t6", "is_bad_source": "1"},
+    ]
+    with data_path.open("w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+    cfg = DataConfig(
+        train_file=str(data_path),
+        id_field="id",
+        src_text_field="source",
+        ref_text_field="target",
+        skip_bad_source=True,
+    )
+
+    examples = load_examples(cfg, split="train", limit=None)
+    assert [example.example_id for example in examples] == ["1", "2", "3", "4"]

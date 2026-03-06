@@ -14,7 +14,11 @@ try:
 except Exception:  # pragma: no cover - optional for lightweight tests
     torch = None  # type: ignore[assignment]
 
-from transformers import PreTrainedModel, PreTrainedTokenizerBase
+try:
+    from transformers import PreTrainedModel, PreTrainedTokenizerBase
+except Exception:  # pragma: no cover - optional during lightweight tests
+    PreTrainedModel = Any  # type: ignore[assignment,misc]
+    PreTrainedTokenizerBase = Any  # type: ignore[assignment,misc]
 
 from .config import GenerationConfig, RLPostTrainConfig
 from .prompting import collect_tokenizer_special_token_strings, sanitize_text_for_scoring
@@ -89,6 +93,42 @@ def _mean_std(values: list[float]) -> tuple[float, float]:
     m = mean(values)
     var = sum((v - m) ** 2 for v in values) / len(values)
     return float(m), float(var**0.5)
+
+
+def _validate_scorer_batch_lengths(
+    *,
+    scorer_name: str,
+    requested: int,
+    sequence_scores: Any,
+    error_spans: Any | None = None,
+) -> tuple[list[Any], list[Any] | None]:
+    if not isinstance(sequence_scores, (list, tuple)):
+        raise RuntimeError(
+            f"{scorer_name} scorer returned non-list sequence_scores "
+            f"(type={type(sequence_scores).__name__}, requested={requested})."
+        )
+    score_rows = list(sequence_scores)
+    if len(score_rows) != int(requested):
+        raise RuntimeError(
+            f"{scorer_name} scorer returned mismatched sequence_scores length: "
+            f"requested={requested} returned={len(score_rows)}"
+        )
+
+    span_rows: list[Any] | None = None
+    if error_spans is not None:
+        if not isinstance(error_spans, (list, tuple)):
+            raise RuntimeError(
+                f"{scorer_name} scorer returned non-list error_spans "
+                f"(type={type(error_spans).__name__}, requested={requested})."
+            )
+        span_rows = list(error_spans)
+        if len(span_rows) != int(requested):
+            raise RuntimeError(
+                f"{scorer_name} scorer returned mismatched error_spans length: "
+                f"requested={requested} returned={len(span_rows)}"
+            )
+
+    return score_rows, span_rows
 
 
 def _distributed_ready(rank: int, world_size: int) -> bool:
@@ -378,7 +418,12 @@ def evaluate_on_dataset(
     esa_enabled = esa_scorer is not None and cfg.reward.esa.enabled
 
     def _score_metricx_eval() -> tuple[list[float], list[float]]:
-        metricx_local_scores = metricx_scorer.score_batch(samples).sequence_scores  # type: ignore[union-attr]
+        metricx_out = metricx_scorer.score_batch(samples)  # type: ignore[union-attr]
+        metricx_local_scores, _ = _validate_scorer_batch_lengths(
+            scorer_name="MetricX",
+            requested=len(samples),
+            sequence_scores=metricx_out.sequence_scores,
+        )
         non_finite_idx = [idx for idx, value in enumerate(metricx_local_scores) if not math.isfinite(float(value))]
         if non_finite_idx:
             msg = (
@@ -403,7 +448,12 @@ def evaluate_on_dataset(
 
     def _score_xcomet_eval() -> tuple[list[float], list[list[dict[str, Any]]]]:
         xcomet_out = xcomet_scorer.score_batch(samples)  # type: ignore[union-attr]
-        xcomet_local_scores = xcomet_out.sequence_scores
+        xcomet_local_scores, span_rows = _validate_scorer_batch_lengths(
+            scorer_name="xCOMET",
+            requested=len(samples),
+            sequence_scores=xcomet_out.sequence_scores,
+            error_spans=(xcomet_out.metadata or {}).get("error_spans", [[] for _ in samples]),
+        )
         non_finite_idx = [idx for idx, value in enumerate(xcomet_local_scores) if not math.isfinite(float(value))]
         if non_finite_idx:
             logger.warning(
@@ -412,15 +462,21 @@ def evaluate_on_dataset(
             )
             for idx in non_finite_idx:
                 xcomet_local_scores[idx] = 0.0
-        meta = xcomet_out.metadata or {}
-        xcomet_local_spans: list[list[dict[str, Any]]] = meta.get("error_spans", [[] for _ in rollouts])
+        assert span_rows is not None
+        xcomet_local_spans = [
+            [item for item in span_row if isinstance(item, dict)] if isinstance(span_row, (list, tuple)) else []
+            for span_row in span_rows
+        ]
         return xcomet_local_scores, xcomet_local_spans
 
     def _score_mqm_eval() -> tuple[list[float], list[list[dict[str, Any]]]]:
         mqm_out = mqm_scorer.score_batch(samples)
-        mqm_local_scores = mqm_out.sequence_scores
-        mqm_meta = mqm_out.metadata or {}
-        mqm_local_spans: list[list[dict[str, Any]]] = mqm_meta.get("error_spans", [[] for _ in rollouts])
+        mqm_local_scores, span_rows = _validate_scorer_batch_lengths(
+            scorer_name="MQM",
+            requested=len(samples),
+            sequence_scores=mqm_out.sequence_scores,
+            error_spans=(mqm_out.metadata or {}).get("error_spans", [[] for _ in samples]),
+        )
         non_finite_idx = [idx for idx, value in enumerate(mqm_local_scores) if not math.isfinite(float(value))]
         if non_finite_idx:
             logger.warning(
@@ -429,11 +485,20 @@ def evaluate_on_dataset(
             )
             for idx in non_finite_idx:
                 mqm_local_scores[idx] = 0.0
+        assert span_rows is not None
+        mqm_local_spans = [
+            [item for item in span_row if isinstance(item, dict)] if isinstance(span_row, (list, tuple)) else []
+            for span_row in span_rows
+        ]
         return mqm_local_scores, mqm_local_spans
 
     def _score_esa_eval() -> list[float]:
         esa_out = esa_scorer.score_batch(samples)
-        esa_local_scores = esa_out.sequence_scores
+        esa_local_scores, _ = _validate_scorer_batch_lengths(
+            scorer_name="ESA",
+            requested=len(samples),
+            sequence_scores=esa_out.sequence_scores,
+        )
         non_finite_idx = [idx for idx, value in enumerate(esa_local_scores) if not math.isfinite(float(value))]
         if non_finite_idx:
             logger.warning(
