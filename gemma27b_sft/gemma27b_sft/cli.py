@@ -405,6 +405,8 @@ def _load_model(cfg: SFTConfig):
         "trust_remote_code": cfg.model.trust_remote_code,
     }
     resolved_attn = _resolve_attn_implementation(cfg)
+    if resolved_attn is not None:
+        cfg.model.attn_implementation = resolved_attn
     if resolved_attn:
         model_kwargs["attn_implementation"] = resolved_attn
     try:
@@ -418,6 +420,7 @@ def _load_model(cfg: SFTConfig):
                 "flash_attention_2 is unavailable at runtime (%s). Falling back to sdpa.",
                 err,
             )
+            cfg.model.attn_implementation = "sdpa"
             model_kwargs["attn_implementation"] = "sdpa"
             model = AutoModelForCausalLM.from_pretrained(cfg.model.name_or_path, **model_kwargs)
             return model
@@ -449,6 +452,7 @@ def _build_training_arguments(
             cfg.train.eval_steps,
         )
         effective_save_steps = cfg.train.eval_steps
+        cfg.train.save_steps = effective_save_steps
 
     kwargs: dict[str, object] = {
         "output_dir": str(output_dir),
@@ -696,7 +700,6 @@ def run(cfg: SFTConfig) -> None:
     output_dir = Path(cfg.train.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     _apply_runtime_compat_overrides(cfg)
-    dump_config(cfg, output_dir / "resolved_config.yaml")
     _validate_launch(cfg)
 
     tokenizer = _load_tokenizer(cfg)
@@ -775,6 +778,9 @@ def run(cfg: SFTConfig) -> None:
         has_eval=eval_ds is not None,
         hf_gradient_checkpointing=use_hf_gradient_ckpt,
     )
+
+    dump_config(cfg, output_dir / "resolved_config.yaml")
+
     collator = DataCollatorCausalLM(
         tokenizer=tokenizer,
         pad_to_multiple_of=8,

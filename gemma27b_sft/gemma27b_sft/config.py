@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+import json
 import os
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -148,11 +149,42 @@ def _resolve_optional_path(value: str | None, base_dir: Path) -> str | None:
         return None
     raw = str(value).strip()
     if not raw:
-        return value
+        return None
     p = Path(raw).expanduser()
     if p.is_absolute():
         return str(p)
     return str((base_dir / p).resolve())
+
+
+def _validate_jsonl_file(path: str, label: str) -> None:
+    file_path = Path(path)
+    if not file_path.exists():
+        raise FileNotFoundError(f"{label} not found: {path}")
+    if not file_path.is_file():
+        raise ValueError(f"{label} must be a file: {path}")
+    if file_path.suffix.lower() != ".jsonl":
+        raise ValueError(f"{label} must point to a .jsonl file: {path}")
+
+    with file_path.open("r", encoding="utf-8") as f:
+        for line_no, line in enumerate(f, start=1):
+            raw = line.strip()
+            if not raw:
+                continue
+            try:
+                record = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"{label} must be newline-delimited JSON objects. "
+                    f"First non-empty line is invalid JSON at line {line_no}: {path}"
+                ) from exc
+            if not isinstance(record, dict):
+                raise ValueError(
+                    f"{label} must contain JSON objects per line. "
+                    f"First non-empty line is {type(record).__name__} at line {line_no}: {path}"
+                )
+            return
+
+    raise ValueError(f"{label} must contain at least one JSON object line: {path}")
 
 
 def _world_size() -> int:
@@ -185,7 +217,7 @@ def _template_fields(template: str) -> set[str]:
 
 
 def load_config(path: str | Path) -> SFTConfig:
-    config_path = Path(path)
+    config_path = Path(path).expanduser()
     payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     if payload is None:
         payload = {}
@@ -195,29 +227,51 @@ def load_config(path: str | Path) -> SFTConfig:
     cfg.data.train_file = _resolve_optional_path(cfg.data.train_file, base_dir) or cfg.data.train_file
     cfg.data.eval_file = _resolve_optional_path(cfg.data.eval_file, base_dir)
     cfg.train.output_dir = _resolve_optional_path(cfg.train.output_dir, base_dir) or cfg.train.output_dir
+    cfg.train.resume_from_checkpoint = _resolve_optional_path(cfg.train.resume_from_checkpoint, base_dir)
     if isinstance(cfg.train.deepspeed, str):
         cfg.train.deepspeed = _resolve_optional_path(cfg.train.deepspeed, base_dir) or cfg.train.deepspeed
     if cfg.train.fsdp is not None and not str(cfg.train.fsdp).strip():
         cfg.train.fsdp = None
+    if not str(cfg.data.train_file).strip():
+        raise ValueError("data.train_file must not be empty.")
+    if not str(cfg.train.output_dir).strip():
+        raise ValueError("train.output_dir must not be empty.")
     if isinstance(cfg.train.deepspeed, str) and not str(cfg.train.deepspeed).strip():
         cfg.train.deepspeed = None
 
-    if not Path(cfg.data.train_file).exists():
-        raise FileNotFoundError(f"data.train_file not found: {cfg.data.train_file}")
-    if cfg.data.eval_file and not Path(cfg.data.eval_file).exists():
-        raise FileNotFoundError(f"data.eval_file not found: {cfg.data.eval_file}")
+    _validate_jsonl_file(cfg.data.train_file, "data.train_file")
+    if cfg.data.eval_file:
+        _validate_jsonl_file(cfg.data.eval_file, "data.eval_file")
     if isinstance(cfg.train.deepspeed, str) and not Path(cfg.train.deepspeed).exists():
         raise FileNotFoundError(f"train.deepspeed config not found: {cfg.train.deepspeed}")
     if cfg.train.deepspeed is not None and cfg.train.fsdp:
         raise ValueError("Set only one backend: train.deepspeed or train.fsdp (not both).")
     if cfg.train.learning_rate <= 0.0:
         raise ValueError("train.learning_rate must be > 0.")
+    if cfg.train.num_train_epochs <= 0:
+        raise ValueError("train.num_train_epochs must be > 0.")
     if cfg.train.global_batch_size <= 0:
         raise ValueError("train.global_batch_size must be > 0.")
+    if cfg.train.max_steps < -1 or cfg.train.max_steps == 0:
+        raise ValueError("train.max_steps must be -1 or > 0.")
     if cfg.train.max_seq_length <= 0:
         raise ValueError("train.max_seq_length must be > 0")
+    if cfg.train.weight_decay < 0.0:
+        raise ValueError("train.weight_decay must be >= 0.")
+    if cfg.train.dataloader_num_workers < 0:
+        raise ValueError("train.dataloader_num_workers must be >= 0.")
+    if cfg.train.logging_steps <= 0:
+        raise ValueError("train.logging_steps must be > 0.")
+    if cfg.train.save_steps <= 0:
+        raise ValueError("train.save_steps must be > 0.")
+    if cfg.train.eval_steps <= 0:
+        raise ValueError("train.eval_steps must be > 0.")
     if cfg.train.expected_world_size is not None and cfg.train.expected_world_size <= 0:
         raise ValueError("train.expected_world_size must be > 0 when set.")
+    if cfg.train.resume_from_checkpoint is not None and not Path(cfg.train.resume_from_checkpoint).exists():
+        raise FileNotFoundError(
+            f"train.resume_from_checkpoint not found: {cfg.train.resume_from_checkpoint}"
+        )
     if cfg.data.preprocessing_num_workers < 0:
         raise ValueError("data.preprocessing_num_workers must be >= 0")
     if cfg.data.log_text_samples < 0:
@@ -228,6 +282,10 @@ def load_config(path: str | Path) -> SFTConfig:
         raise ValueError("data.max_train_samples must be > 0 when set.")
     if cfg.data.max_eval_samples is not None and cfg.data.max_eval_samples <= 0:
         raise ValueError("data.max_eval_samples must be > 0 when set.")
+    if not str(cfg.data.source_field).strip():
+        raise ValueError("data.source_field must not be empty.")
+    if not str(cfg.data.target_field).strip():
+        raise ValueError("data.target_field must not be empty.")
     if not cfg.data.source_lang_code_field and not str(cfg.data.source_lang_code).strip():
         raise ValueError("Set data.source_lang_code or data.source_lang_code_field.")
     if not cfg.data.target_lang_code_field and not str(cfg.data.target_lang_code).strip():

@@ -82,7 +82,6 @@ def run(cfg: SFTConfig) -> None:
     output_dir = Path(cfg.train.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     _apply_runtime_compat_overrides(cfg)
-    dump_config(cfg, output_dir / "resolved_config.yaml")
     _validate_launch(cfg)
 
     tokenizer = _load_tokenizer(cfg)
@@ -159,6 +158,7 @@ def run(cfg: SFTConfig) -> None:
         has_eval=eval_ds is not None,
         hf_gradient_checkpointing=use_hf_gradient_ckpt,
     )
+    dump_config(cfg, output_dir / "resolved_config.yaml")
     collator = DataCollatorCausalLM(
         tokenizer=tokenizer,
         pad_to_multiple_of=8,

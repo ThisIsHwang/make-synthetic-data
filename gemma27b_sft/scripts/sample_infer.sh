@@ -7,77 +7,24 @@ set -euo pipefail
 #   SRC_TEXT="..." ./scripts/sample_infer.sh
 #   CONFIG_PATH=configs/train_8xh100_deepspeed.yaml ./scripts/sample_infer.sh
 
-is_loadable_model_dir() {
-  local dir="$1"
-  [[ -d "${dir}" ]] || return 1
-  [[ -f "${dir}/config.json" ]] || return 1
-  compgen -G "${dir}/model.safetensors*" >/dev/null \
-    || compgen -G "${dir}/pytorch_model.bin*" >/dev/null \
-    || compgen -G "${dir}/adapter_model.safetensors*" >/dev/null \
-    || compgen -G "${dir}/adapter_model.bin*" >/dev/null
-}
-
-pick_latest_checkpoint() {
-  local base_dir="$1"
-  ls -dt "${base_dir}"/checkpoint-* 2>/dev/null | head -1 || true
-}
-
-pick_newer_path() {
-  local left="${1:-}"
-  local right="${2:-}"
-  if [[ -z "${left}" ]]; then
-    printf '%s' "${right}"
-    return
-  fi
-  if [[ -z "${right}" ]]; then
-    printf '%s' "${left}"
-    return
-  fi
-  if [[ "${left}" -nt "${right}" ]]; then
-    printf '%s' "${left}"
-  else
-    printf '%s' "${right}"
-  fi
-}
-
 MODEL_DIR="${MODEL_DIR:-}"
-if [[ -z "${MODEL_DIR}" ]]; then
-  DEFAULT_DS_DIR="../outputs/gemma3-27b-it-sft-deepspeed"
-  DEFAULT_FSDP_DIR="../outputs/gemma3-27b-it-sft-fsdp"
-  root_candidate=""
-  if is_loadable_model_dir "${DEFAULT_DS_DIR}"; then
-    root_candidate="${DEFAULT_DS_DIR}"
-  fi
-  if is_loadable_model_dir "${DEFAULT_FSDP_DIR}"; then
-    root_candidate="$(pick_newer_path "${root_candidate}" "${DEFAULT_FSDP_DIR}")"
-  fi
-  MODEL_DIR="${root_candidate}"
-fi
-if [[ -z "${MODEL_DIR}" ]]; then
-  ds_checkpoint="$(pick_latest_checkpoint "../outputs/gemma3-27b-it-sft-deepspeed")"
-  fsdp_checkpoint="$(pick_latest_checkpoint "../outputs/gemma3-27b-it-sft-fsdp")"
-  MODEL_DIR="$(pick_newer_path "${ds_checkpoint}" "${fsdp_checkpoint}")"
-fi
-if [[ -z "${MODEL_DIR}" ]]; then
-  if [[ -d "../outputs/gemma3-27b-it-sft-deepspeed" ]]; then
-    MODEL_DIR="../outputs/gemma3-27b-it-sft-deepspeed"
-  elif [[ -d "../outputs/gemma3-27b-it-sft-fsdp" ]]; then
-    MODEL_DIR="../outputs/gemma3-27b-it-sft-fsdp"
-  fi
-fi
+TOKENIZER_NAME_OR_PATH="${TOKENIZER_NAME_OR_PATH:-}"
 
-if [[ ! -d "${MODEL_DIR}" ]]; then
-  echo "Model directory not found: ${MODEL_DIR}" >&2
-  exit 1
-fi
-
-CONFIG_PATH="${CONFIG_PATH:-configs/train_8xh100_deepspeed.yaml}"
-if [[ ! -f "${CONFIG_PATH}" ]]; then
-  CONFIG_PATH="configs/train_8xh100_fsdp.yaml"
-fi
-if [[ ! -f "${CONFIG_PATH}" ]]; then
-  echo "Config file not found: ${CONFIG_PATH}" >&2
-  exit 1
+REQUESTED_CONFIG_PATH="${CONFIG_PATH:-}"
+if [[ -n "${REQUESTED_CONFIG_PATH}" ]]; then
+  if [[ ! -f "${REQUESTED_CONFIG_PATH}" ]]; then
+    echo "Config file not found: ${REQUESTED_CONFIG_PATH}" >&2
+    exit 1
+  fi
+  CONFIG_PATH="${REQUESTED_CONFIG_PATH}"
+else
+  CONFIG_PATH="configs/train_8xh100_deepspeed.yaml"
+  if [[ ! -f "${CONFIG_PATH}" ]]; then
+    CONFIG_PATH="configs/train_8xh100_fsdp.yaml"
+  fi
+  if [[ ! -f "${CONFIG_PATH}" ]]; then
+    CONFIG_PATH=""
+  fi
 fi
 
 SRC_TEXT="${SRC_TEXT:-The weather is lovely today. Let us go for a walk by the river.}"
@@ -93,25 +40,184 @@ if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
 fi
 
 echo "MODEL_DIR=${MODEL_DIR}"
+echo "TOKENIZER_NAME_OR_PATH=${TOKENIZER_NAME_OR_PATH}"
 echo "CONFIG_PATH=${CONFIG_PATH}"
 echo "SRC_TEXT=${SRC_TEXT}"
 echo "PYTHON_BIN=${PYTHON_BIN}"
 
-MODEL_DIR="${MODEL_DIR}" CONFIG_PATH="${CONFIG_PATH}" SRC_TEXT="${SRC_TEXT}" "${PYTHON_BIN}" - <<'PY'
+MODEL_DIR="${MODEL_DIR}" TOKENIZER_NAME_OR_PATH="${TOKENIZER_NAME_OR_PATH}" CONFIG_PATH="${CONFIG_PATH}" SRC_TEXT="${SRC_TEXT}" "${PYTHON_BIN}" - <<'PY'
 import os
+from pathlib import Path
 import torch
 import yaml
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from gemma27b_sft.config import SFTConfig, _coerce_dataclass
 
-model_dir = os.environ["MODEL_DIR"]
-config_path = os.environ["CONFIG_PATH"]
+requested_model_dir = os.environ["MODEL_DIR"].strip()
+requested_tokenizer_name_or_path = os.environ["TOKENIZER_NAME_OR_PATH"].strip()
+requested_config_path = os.environ["CONFIG_PATH"].strip()
+config_path = Path(requested_config_path).expanduser().resolve() if requested_config_path else None
 src = os.environ["SRC_TEXT"]
 
+def _resolve_path(path: str | None, base_dir: Path) -> str | None:
+    if path is None:
+        return None
+    raw = str(path).strip()
+    if not raw:
+        return None
+    p = Path(raw).expanduser()
+    if p.is_absolute():
+        return str(p)
+    return str((base_dir / p).resolve())
+
+
+def _resolve_local_model_ref(path: str | None, base_dir: Path) -> str | None:
+    if path is None:
+        return None
+    raw = str(path).strip()
+    if not raw:
+        return None
+    p = Path(raw).expanduser()
+    if p.is_absolute():
+        return str(p)
+    if raw.startswith(("./", "../", "~")):
+        return str((base_dir / p).resolve())
+    return raw
+
+
+def _load_partial_config(path: Path | None) -> tuple[SFTConfig, Path | None]:
+    if path is None:
+        return SFTConfig(), None
+    payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+    if payload is None:
+        payload = {}
+    cfg = _coerce_dataclass(SFTConfig, payload, path="config")
+    base_dir = path.parent.resolve()
+    cfg.train.output_dir = _resolve_path(cfg.train.output_dir, base_dir) or cfg.train.output_dir
+    cfg.model.name_or_path = _resolve_local_model_ref(cfg.model.name_or_path, base_dir) or cfg.model.name_or_path
+    tokenizer_name_or_path = _resolve_local_model_ref(cfg.model.tokenizer_name_or_path, base_dir)
+    if tokenizer_name_or_path is not None:
+        cfg.model.tokenizer_name_or_path = tokenizer_name_or_path
+    resume_from_checkpoint = _resolve_path(cfg.train.resume_from_checkpoint, base_dir)
+    if resume_from_checkpoint is not None:
+        cfg.train.resume_from_checkpoint = resume_from_checkpoint
+    return cfg, path.resolve()
+
+
+def _is_loadable_model_dir(path: Path) -> bool:
+    return path.is_dir() and (path / "config.json").exists() and any(
+        path.glob(pattern)
+        for pattern in (
+            "model.safetensors*",
+            "pytorch_model.bin*",
+            "adapter_model.safetensors*",
+            "adapter_model.bin*",
+        )
+    )
+
+
+def _has_tokenizer_artifacts(path: Path) -> bool:
+    if not path.is_dir():
+        return False
+    candidates = (
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "spiece.model",
+        "tokenizer.model",
+        "vocab.json",
+    )
+    return any((path / name).exists() for name in candidates)
+
+
+def _pick_latest_checkpoint(path: Path) -> Path | None:
+    checkpoints = [p for p in path.glob("checkpoint-*") if p.is_dir()]
+    if not checkpoints:
+        return None
+    checkpoints.sort(key=lambda item: item.stat().st_mtime, reverse=True)
+    return checkpoints[0].resolve()
+
+
+def _find_run_config_path(base_cfg: SFTConfig, fallback_path: Path | None, model_dir: Path | None) -> Path | None:
+    candidates: list[Path] = []
+    if model_dir is not None:
+        candidates.append(model_dir / "resolved_config.yaml")
+        if model_dir.name.startswith("checkpoint-"):
+            candidates.append(model_dir.parent / "resolved_config.yaml")
+    output_dir = str(base_cfg.train.output_dir or "").strip()
+    if output_dir:
+        candidates.append(Path(output_dir).expanduser().resolve() / "resolved_config.yaml")
+    if fallback_path is not None:
+        candidates.append(fallback_path)
+    seen: set[Path] = set()
+    for candidate in candidates:
+        resolved = candidate.expanduser().resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if resolved.exists():
+            return resolved
+    return fallback_path
+
+
+def _default_model_dir_from_cfg(cfg: SFTConfig) -> Path | None:
+    output_dir_raw = str(cfg.train.output_dir or "").strip()
+    if output_dir_raw:
+        output_dir = Path(output_dir_raw).expanduser().resolve()
+        if _is_loadable_model_dir(output_dir):
+            return output_dir
+        checkpoint_dir = _pick_latest_checkpoint(output_dir)
+        if checkpoint_dir is not None:
+            return checkpoint_dir
+    for fallback in (
+        Path("../outputs/gemma3-27b-it-sft-deepspeed"),
+        Path("../outputs/gemma3-27b-it-sft-fsdp"),
+    ):
+        resolved = fallback.expanduser().resolve()
+        if _is_loadable_model_dir(resolved):
+            return resolved
+        checkpoint_dir = _pick_latest_checkpoint(resolved)
+        if checkpoint_dir is not None:
+            return checkpoint_dir
+    return None
+
+
+cfg, selected_config_path = _load_partial_config(config_path)
+model_dir = Path(requested_model_dir).expanduser().resolve() if requested_model_dir else _default_model_dir_from_cfg(cfg)
+selected_config_path = _find_run_config_path(cfg, selected_config_path, model_dir)
+cfg, selected_config_path = _load_partial_config(selected_config_path)
+if model_dir is None and not requested_model_dir:
+    model_dir = _default_model_dir_from_cfg(cfg)
+if model_dir is None:
+    raise FileNotFoundError("Could not determine a model directory. Set MODEL_DIR explicitly or check train.output_dir.")
+if not model_dir.exists():
+    raise FileNotFoundError(f"Model directory not found: {model_dir}")
+
+tokenizer_name_or_path = requested_tokenizer_name_or_path
+if not tokenizer_name_or_path:
+    tokenizer_name_or_path = str(cfg.model.tokenizer_name_or_path or "").strip()
+if not tokenizer_name_or_path:
+    if _has_tokenizer_artifacts(model_dir):
+        tokenizer_name_or_path = str(model_dir)
+    else:
+        output_dir_raw = str(cfg.train.output_dir or "").strip()
+        if output_dir_raw:
+            output_dir = Path(output_dir_raw).expanduser().resolve()
+            if _has_tokenizer_artifacts(output_dir):
+                tokenizer_name_or_path = str(output_dir)
+if not tokenizer_name_or_path:
+    tokenizer_name_or_path = str(cfg.model.name_or_path).strip() or str(model_dir)
+
+trust_remote_code = bool(cfg.model.trust_remote_code)
+print(f"USING_CONFIG_PATH={selected_config_path or '<none>'}")
+print(f"USING_MODEL_DIR={model_dir}")
+print(f"USING_TOKENIZER_NAME_OR_PATH={tokenizer_name_or_path}")
+print(f"TRUST_REMOTE_CODE={trust_remote_code}")
+
+tokenizer_kwargs = {"trust_remote_code": trust_remote_code}
 try:
-    tokenizer = AutoTokenizer.from_pretrained(model_dir, use_fast=True)
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name_or_path, use_fast=True, **tokenizer_kwargs)
 except Exception:
-    tokenizer = AutoTokenizer.from_pretrained(model_dir, use_fast=False)
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name_or_path, use_fast=False, **tokenizer_kwargs)
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 
@@ -119,19 +225,19 @@ dtype = torch.float32
 if torch.cuda.is_available():
     dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 
+attn_implementation = str(cfg.model.attn_implementation or "auto").strip().lower()
+if attn_implementation in {"", "auto"}:
+    attn_implementation = "sdpa"
+
 model = AutoModelForCausalLM.from_pretrained(
-    model_dir,
+    str(model_dir),
     torch_dtype=dtype,
     device_map="auto",
-    attn_implementation="sdpa",
+    attn_implementation=attn_implementation,
+    trust_remote_code=trust_remote_code,
 )
 model.eval()
 
-with open(config_path, "r", encoding="utf-8") as f:
-    payload = yaml.safe_load(f)
-if payload is None:
-    payload = {}
-cfg = _coerce_dataclass(SFTConfig, payload, path="config")
 data_cfg = cfg.data
 
 prompt_template = str(data_cfg.prompt_template)

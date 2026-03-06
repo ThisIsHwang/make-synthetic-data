@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import statistics
 from dataclasses import asdict
 from pathlib import Path
@@ -18,7 +19,9 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from gemma27b_sft.config import DataConfig, ModelConfig, SFTConfig, _coerce_dataclass
-from gemma27b_sft.data import _messages
+from gemma27b_sft.data import _messages, _restore_escaped_newlines, _safe_string as _data_safe_string
+
+logger = logging.getLogger(__name__)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -64,7 +67,21 @@ def _resolve_path(path: str | Path | None, base_dir: Path) -> Path | None:
     return (base_dir / p).resolve()
 
 
-def _load_partial_config(config_path: Path) -> tuple[DataConfig, ModelConfig, Path | None]:
+def _resolve_local_model_ref(path: str | None, base_dir: Path) -> str | None:
+    if path is None:
+        return None
+    raw = str(path).strip()
+    if not raw:
+        return None
+    p = Path(raw).expanduser()
+    if p.is_absolute():
+        return str(p)
+    if raw.startswith(("./", "../", "~")):
+        return str((base_dir / p).resolve())
+    return raw
+
+
+def _load_partial_config(config_path: Path) -> tuple[DataConfig, ModelConfig, Path | None, Path]:
     payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     if payload is None:
         payload = {}
@@ -76,43 +93,140 @@ def _load_partial_config(config_path: Path) -> tuple[DataConfig, ModelConfig, Pa
     base_dir = config_path.parent.resolve()
     data_cfg.train_file = str(_resolve_path(data_cfg.train_file, base_dir))
     data_cfg.eval_file = str(_resolve_path(data_cfg.eval_file, base_dir)) if data_cfg.eval_file else None
+    model_cfg.name_or_path = _resolve_local_model_ref(model_cfg.name_or_path, base_dir) or model_cfg.name_or_path
+    tokenizer_name_or_path = _resolve_local_model_ref(model_cfg.tokenizer_name_or_path, base_dir)
+    if tokenizer_name_or_path is not None:
+        model_cfg.tokenizer_name_or_path = tokenizer_name_or_path
     train_output_path = _resolve_path(train_output, base_dir) if train_output else None
-    return data_cfg, model_cfg, train_output_path
+    return data_cfg, model_cfg, train_output_path, config_path.resolve()
 
 
-def _safe_string(value: Any) -> str:
-    if value is None:
-        return ""
-    return str(value).strip()
+def _find_run_config_path(
+    train_output_dir: Path | None,
+    fallback_path: Path,
+    model_dir: Path | None,
+) -> Path:
+    candidates: list[Path] = []
+    if model_dir is not None:
+        candidates.append(model_dir / "resolved_config.yaml")
+        if model_dir.name.startswith("checkpoint-"):
+            candidates.append(model_dir.parent / "resolved_config.yaml")
+    if train_output_dir is not None:
+        candidates.append(train_output_dir / "resolved_config.yaml")
+    candidates.append(fallback_path)
+    seen: set[Path] = set()
+    for candidate in candidates:
+        resolved = candidate.expanduser().resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if resolved.exists():
+            return resolved
+    return fallback_path.resolve()
 
 
-def _load_eval_rows(eval_file: Path, source_field: str, target_field: str, max_samples: int) -> list[dict[str, Any]]:
+def _normalize_source_text(value: Any) -> str:
+    text = _data_safe_string(value)
+    restored, _ = _restore_escaped_newlines(text)
+    return restored
+
+
+def _normalize_target_text(value: Any) -> str:
+    text = _data_safe_string(value)
+    restored, _ = _restore_escaped_newlines(text)
+    return restored
+
+
+def _has_text_content(text: str) -> bool:
+    return bool(text.strip())
+
+
+def _requires_target_text(skip_xcomet: bool, use_reference: bool) -> bool:
+    return (not skip_xcomet) and use_reference
+
+
+def _load_eval_rows(
+    eval_file: Path,
+    source_field: str,
+    target_field: str,
+    max_samples: int,
+    require_target: bool,
+) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     with eval_file.open("r", encoding="utf-8") as f:
-        for line in f:
+        bad_json = 0
+        for line_no, line in enumerate(f, start=1):
             raw = line.strip()
             if not raw:
                 continue
-            row = json.loads(raw)
-            src = _safe_string(row.get(source_field))
-            tgt = _safe_string(row.get(target_field))
-            if not src or not tgt:
+            try:
+                row = json.loads(raw)
+            except json.JSONDecodeError:
+                bad_json += 1
+                if bad_json <= 3:
+                    logger.warning("Skipping invalid JSON line=%s in %s", line_no, eval_file)
+                continue
+            if not isinstance(row, dict):
+                continue
+            src = _normalize_source_text(row.get(source_field))
+            tgt = _normalize_target_text(row.get(target_field))
+            if not _has_text_content(src):
+                continue
+            if require_target and not _has_text_content(tgt):
                 continue
             rows.append(row)
             if len(rows) >= max_samples:
                 break
+    if bad_json > 0:
+        logger.warning("Ignored invalid JSON lines=%s while reading %s", bad_json, eval_file)
     return rows
 
 
-def _load_tokenizer(tokenizer_name_or_path: str):
+def _load_tokenizer(tokenizer_name_or_path: str, trust_remote_code: bool):
     try:
-        tokenizer = AutoTokenizer.from_pretrained(tokenizer_name_or_path, use_fast=True)
+        tokenizer = AutoTokenizer.from_pretrained(
+            tokenizer_name_or_path,
+            use_fast=True,
+            trust_remote_code=trust_remote_code,
+        )
     except Exception:
-        tokenizer = AutoTokenizer.from_pretrained(tokenizer_name_or_path, use_fast=False)
+        tokenizer = AutoTokenizer.from_pretrained(
+            tokenizer_name_or_path,
+            use_fast=False,
+            trust_remote_code=trust_remote_code,
+        )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
     return tokenizer
+
+
+def _is_flash_attn_available() -> bool:
+    try:
+        import importlib.util
+
+        return torch.cuda.is_available() and importlib.util.find_spec("flash_attn") is not None
+    except Exception:
+        return False
+
+
+def _resolve_attn_implementation(model_cfg: ModelConfig) -> str | None:
+    requested = str(model_cfg.attn_implementation or "auto").strip().lower()
+    if requested in {"", "auto"}:
+        return "flash_attention_2" if _is_flash_attn_available() else "sdpa"
+    return model_cfg.attn_implementation
+
+
+def _generation_model_kwargs(model_cfg: ModelConfig, dtype: torch.dtype) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {
+        "torch_dtype": dtype,
+        "low_cpu_mem_usage": True,
+        "trust_remote_code": bool(model_cfg.trust_remote_code),
+    }
+    attn_implementation = _resolve_attn_implementation(model_cfg)
+    if attn_implementation is not None:
+        kwargs["attn_implementation"] = attn_implementation
+    return kwargs
 
 
 def _render_prompt(tokenizer, prompt_messages: list[dict[str, str]]) -> str:
@@ -141,6 +255,21 @@ def _prepare_generation_device(requested: str) -> str:
             return req
         return "cuda:0"
     return "cpu"
+
+
+def _effective_positive_int(value: int, minimum: int) -> int:
+    return max(minimum, int(value))
+
+
+def _effective_runtime_settings(args: argparse.Namespace) -> dict[str, int | str]:
+    return {
+        "generation_batch_size": _effective_positive_int(args.generation_batch_size, 1),
+        "max_input_tokens": _effective_positive_int(args.max_input_tokens, 32),
+        "max_new_tokens": _effective_positive_int(args.max_new_tokens, 8),
+        "gen_device": _prepare_generation_device(args.gen_device),
+        "xcomet_batch_size": _effective_positive_int(args.xcomet_batch_size, 1),
+        "xcomet_device": _prepare_generation_device(args.xcomet_device),
+    }
 
 
 def _move_to_device(batch: Any, device: str) -> Any:
@@ -188,8 +317,8 @@ def _generate_translations(
         batch_rows = rows[start : start + generation_batch_size]
         prompts: list[str] = []
         for row in batch_rows:
-            src = _safe_string(row.get(data_cfg.source_field))
-            tgt = _safe_string(row.get(data_cfg.target_field))
+            src = _normalize_source_text(row.get(data_cfg.source_field))
+            tgt = _normalize_target_text(row.get(data_cfg.target_field))
             prompt_messages, _ = _messages(data_cfg, row, src, tgt)
             prompts.append(_render_prompt(tokenizer, prompt_messages))
 
@@ -255,9 +384,9 @@ def _score_xcomet(
         batch_hyp = hypotheses[start : start + batch_size]
         payload: list[dict[str, str]] = []
         for row, hyp in zip(batch_rows, batch_hyp):
-            item = {"src": _safe_string(row.get(source_field)), "mt": hyp}
+            item = {"src": _normalize_source_text(row.get(source_field)), "mt": hyp}
             if use_reference:
-                item["ref"] = _safe_string(row.get(target_field))
+                item["ref"] = _normalize_target_text(row.get(target_field))
             payload.append(item)
 
         batch_inputs = scorer.prepare_for_inference(payload)
@@ -279,7 +408,11 @@ def main() -> int:
     if not config_path.exists():
         raise FileNotFoundError(f"Config not found: {config_path}")
 
-    data_cfg, model_cfg, train_output_dir = _load_partial_config(config_path)
+    requested_model_dir = args.model_dir.expanduser().resolve() if args.model_dir else None
+    data_cfg, model_cfg, train_output_dir, selected_config_path = _load_partial_config(config_path)
+    selected_config_path = _find_run_config_path(train_output_dir, selected_config_path, requested_model_dir)
+    if selected_config_path != config_path:
+        data_cfg, model_cfg, train_output_dir, selected_config_path = _load_partial_config(selected_config_path)
     if args.source_field:
         data_cfg.source_field = args.source_field
     if args.target_field:
@@ -293,7 +426,7 @@ def main() -> int:
     if not eval_file.exists():
         raise FileNotFoundError(f"Eval file not found: {eval_file}")
 
-    model_dir = args.model_dir.expanduser().resolve() if args.model_dir else train_output_dir
+    model_dir = requested_model_dir if requested_model_dir is not None else train_output_dir
     if model_dir is None:
         raise ValueError("No model dir. Set --model-dir or train.output_dir in config.")
     if not model_dir.exists():
@@ -319,6 +452,10 @@ def main() -> int:
         source_field=data_cfg.source_field,
         target_field=data_cfg.target_field,
         max_samples=max(1, args.max_samples),
+        require_target=_requires_target_text(
+            skip_xcomet=bool(args.skip_xcomet),
+            use_reference=bool(args.use_reference),
+        ),
     )
     if not rows:
         raise ValueError(f"No usable eval rows in {eval_file}")
@@ -328,18 +465,27 @@ def main() -> int:
         or model_cfg.tokenizer_name_or_path
         or str(model_dir)
     )
-    tokenizer = _load_tokenizer(tokenizer_name_or_path)
+    tokenizer = _load_tokenizer(tokenizer_name_or_path, trust_remote_code=bool(model_cfg.trust_remote_code))
 
-    gen_device = _prepare_generation_device(args.gen_device)
+    runtime_settings = _effective_runtime_settings(args)
+    effective_generation_batch_size = int(runtime_settings["generation_batch_size"])
+    effective_max_input_tokens = int(runtime_settings["max_input_tokens"])
+    effective_max_new_tokens = int(runtime_settings["max_new_tokens"])
+    gen_device = str(runtime_settings["gen_device"])
+    effective_xcomet_batch_size = int(runtime_settings["xcomet_batch_size"])
+    effective_xcomet_device = str(runtime_settings["xcomet_device"])
     dtype = torch.float32
     if gen_device.startswith("cuda"):
         dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 
-    model = AutoModelForCausalLM.from_pretrained(
-        str(model_dir),
-        torch_dtype=dtype,
-        low_cpu_mem_usage=True,
-    )
+    model_load_kwargs = _generation_model_kwargs(model_cfg, dtype)
+    print(f"USING_CONFIG_PATH={selected_config_path}")
+    print(f"USING_MODEL_DIR={model_dir}")
+    print(f"USING_TOKENIZER_NAME_OR_PATH={tokenizer_name_or_path}")
+    print(f"TRUST_REMOTE_CODE={bool(model_cfg.trust_remote_code)}")
+    print(f"ATTN_IMPLEMENTATION={model_load_kwargs.get('attn_implementation')}")
+
+    model = AutoModelForCausalLM.from_pretrained(str(model_dir), **model_load_kwargs)
     model.to(gen_device)
     model.eval()
 
@@ -348,9 +494,9 @@ def main() -> int:
         tokenizer=tokenizer,
         data_cfg=data_cfg,
         rows=rows,
-        generation_batch_size=max(1, args.generation_batch_size),
-        max_input_tokens=max(32, args.max_input_tokens),
-        max_new_tokens=max(8, args.max_new_tokens),
+        generation_batch_size=effective_generation_batch_size,
+        max_input_tokens=effective_max_input_tokens,
+        max_new_tokens=effective_max_new_tokens,
         device=gen_device,
     )
 
@@ -361,8 +507,7 @@ def main() -> int:
 
     xcomet_scores: list[float] = []
     if not args.skip_xcomet:
-        xcomet_device = _prepare_generation_device(args.xcomet_device)
-        scorer = _load_xcomet(args.xcomet_model, xcomet_device)
+        scorer = _load_xcomet(args.xcomet_model, effective_xcomet_device)
         xcomet_scores = _score_xcomet(
             scorer=scorer,
             rows=rows,
@@ -370,16 +515,16 @@ def main() -> int:
             source_field=data_cfg.source_field,
             target_field=data_cfg.target_field,
             use_reference=bool(args.use_reference),
-            batch_size=max(1, args.xcomet_batch_size),
-            device=xcomet_device,
+            batch_size=effective_xcomet_batch_size,
+            device=effective_xcomet_device,
         )
 
     with output_predictions.open("w", encoding="utf-8") as f:
         for idx, (row, hyp) in enumerate(zip(rows, hypotheses)):
             out = {
                 "idx": idx,
-                "source_text": _safe_string(row.get(data_cfg.source_field)),
-                "reference_text": _safe_string(row.get(data_cfg.target_field)),
+                "source_text": _normalize_source_text(row.get(data_cfg.source_field)),
+                "reference_text": _normalize_target_text(row.get(data_cfg.target_field)),
                 "hypothesis_text": hyp,
             }
             if idx < len(xcomet_scores):
@@ -387,22 +532,26 @@ def main() -> int:
             f.write(json.dumps(out, ensure_ascii=False) + "\n")
 
     summary: dict[str, Any] = {
+        "config_path": str(selected_config_path),
         "model_dir": str(model_dir),
         "tokenizer_name_or_path": tokenizer_name_or_path,
         "eval_file": str(eval_file),
         "num_samples": len(rows),
         "config_data": asdict(data_cfg),
+        "config_model": asdict(model_cfg),
         "generation": {
             "device": gen_device,
-            "batch_size": int(args.generation_batch_size),
-            "max_input_tokens": int(args.max_input_tokens),
-            "max_new_tokens": int(args.max_new_tokens),
+            "batch_size": effective_generation_batch_size,
+            "max_input_tokens": effective_max_input_tokens,
+            "max_new_tokens": effective_max_new_tokens,
+            "attn_implementation": model_load_kwargs.get("attn_implementation"),
+            "trust_remote_code": bool(model_cfg.trust_remote_code),
         },
         "xcomet": {
             "enabled": not args.skip_xcomet,
             "model": args.xcomet_model,
-            "device": args.xcomet_device,
-            "batch_size": int(args.xcomet_batch_size),
+            "device": effective_xcomet_device,
+            "batch_size": effective_xcomet_batch_size,
             "use_reference": bool(args.use_reference),
         },
         "outputs": {

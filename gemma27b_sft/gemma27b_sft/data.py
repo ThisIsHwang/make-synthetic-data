@@ -294,7 +294,8 @@ def _truncate_prompt_keep_generation_suffix(
     required_suffix_ids: list[int],
 ) -> tuple[list[int], bool]:
     if prompt_budget <= 0:
-        return [], not required_suffix_ids
+        # A target-bearing row without any prompt tokens becomes unconditional LM.
+        return [], False
     if len(prompt_ids) <= prompt_budget:
         return list(prompt_ids), True
 
@@ -378,12 +379,16 @@ def _build_tokenize_fn(cfg: SFTConfig, tokenizer: PreTrainedTokenizerBase):
         target_text = str(example[data_cfg.target_field])
         source_has_content = bool(source_text_original.strip())
         source_shrink_steps = 0
+        raw_prompt_tokens = 0
         prompt_ids: list[int] = []
         full_ids: list[int] = []
         labels: list[int] = []
         non_ignored = 0
         use_template_target = False
         template_target_ends_with_eot = False
+        prompt_was_truncated = False
+        target_was_truncated = False
+        any_truncation_seen = False
 
         target_ids_fallback = list(
             tokenizer(
@@ -413,6 +418,8 @@ def _build_tokenize_fn(cfg: SFTConfig, tokenizer: PreTrainedTokenizerBase):
                 prompt_with_generation=prompt_ids_raw,
             )
             target_ids_effective = target_ids_fallback
+            prompt_was_truncated = False
+            target_was_truncated = False
             template_span = _extract_template_target_span(
                 tokenizer=tokenizer,
                 prompt_messages=prompt_messages,
@@ -434,6 +441,8 @@ def _build_tokenize_fn(cfg: SFTConfig, tokenizer: PreTrainedTokenizerBase):
                         max_seq_length=max_len,
                         prompt_with_generation=prompt_ids_raw,
                     )
+            if source_shrink_steps == 0:
+                raw_prompt_tokens = len(prompt_ids_raw)
 
             if not has_target:
                 prompt_ids, _ = _truncate_prompt_keep_generation_suffix(
@@ -441,6 +450,7 @@ def _build_tokenize_fn(cfg: SFTConfig, tokenizer: PreTrainedTokenizerBase):
                     prompt_budget=max_len,
                     required_suffix_ids=generation_suffix_ids,
                 )
+                prompt_was_truncated = len(prompt_ids) < len(prompt_ids_raw)
                 target_ids = []
             else:
                 prompt_has_generation_suffix = True
@@ -455,11 +465,14 @@ def _build_tokenize_fn(cfg: SFTConfig, tokenizer: PreTrainedTokenizerBase):
                         prompt_budget=prompt_budget,
                         required_suffix_ids=generation_suffix_ids,
                     )
+                    prompt_was_truncated = len(prompt_ids) < len(prompt_ids_raw)
                     if prompt_has_generation_suffix:
                         target_budget = max(0, max_len - len(prompt_ids))
                         target_ids = target_ids_effective[:target_budget]
+                        target_was_truncated = len(target_ids) < len(target_ids_effective)
                     else:
                         target_ids = []
+                        target_was_truncated = True
 
                 if prompt_has_generation_suffix:
                     if use_template_target and template_target_ends_with_eot and eot_token_id is not None:
@@ -484,14 +497,25 @@ def _build_tokenize_fn(cfg: SFTConfig, tokenizer: PreTrainedTokenizerBase):
                             elif prompt_ids:
                                 prompt_ids = prompt_ids[:-1]
                                 target_ids = [int(eos_token_id)]
+            any_truncation_seen = any_truncation_seen or prompt_was_truncated or target_was_truncated
 
             full_ids = prompt_ids + target_ids
             labels = ([-100] * len(prompt_ids)) + target_ids
             non_ignored = len(target_ids)
 
-            if non_ignored > 0 or not has_target or len(source_text) <= 1 or source_shrink_steps >= 6:
+            # Retry with a shorter source whenever truncation is still degrading supervision.
+            should_retry_with_shorter_source = (
+                has_target
+                and len(source_text) > 1
+                and source_shrink_steps < 6
+                and (non_ignored <= 0 or prompt_was_truncated or target_was_truncated)
+            )
+            if not should_retry_with_shorter_source:
                 break
-            source_text = source_text[: max(1, len(source_text) // 2)]
+            next_source_text = source_text[: max(1, len(source_text) // 2)]
+            if next_source_text == source_text:
+                break
+            source_text = next_source_text
             source_shrink_steps += 1
 
         output = {
@@ -500,6 +524,10 @@ def _build_tokenize_fn(cfg: SFTConfig, tokenizer: PreTrainedTokenizerBase):
             "labels": labels,
             "num_target_tokens": non_ignored,
             "prompt_tokens": len(prompt_ids),
+            "raw_prompt_tokens": raw_prompt_tokens,
+            "prompt_truncated": int(prompt_was_truncated),
+            "target_truncated": int(target_was_truncated),
+            "truncation_seen": int(any_truncation_seen),
             "full_tokens": len(full_ids),
             "source_chars": len(source_text),
             "source_has_content": int(source_has_content),
@@ -583,6 +611,8 @@ def _safe_load_json_dataset(path: str, cfg: DataConfig) -> Dataset:
         "missing_counts": {field: 0 for field in required_fields},
         "source_escaped_newline_rows": 0,
         "source_escaped_newline_replacements": 0,
+        "target_escaped_newline_rows": 0,
+        "target_escaped_newline_replacements": 0,
         "sample_cast_logs": 0,
     }
 
@@ -627,6 +657,11 @@ def _safe_load_json_dataset(path: str, cfg: DataConfig) -> Dataset:
                         if replaced > 0:
                             stats["source_escaped_newline_rows"] += 1
                             stats["source_escaped_newline_replacements"] += replaced
+                    elif field == cfg.target_field:
+                        text_value, replaced = _restore_escaped_newlines(text_value)
+                        if replaced > 0:
+                            stats["target_escaped_newline_rows"] += 1
+                            stats["target_escaped_newline_replacements"] += replaced
                     out[field] = text_value
                 stats["rows"] += 1
                 if stats["rows"] % 50000 == 0:
@@ -658,6 +693,12 @@ def _safe_load_json_dataset(path: str, cfg: DataConfig) -> Dataset:
             stats["source_escaped_newline_rows"],
             stats["source_escaped_newline_replacements"],
         )
+    if stats["target_escaped_newline_rows"] > 0:
+        logger.info(
+            "Restored escaped newlines in target field rows=%s replacements=%s",
+            stats["target_escaped_newline_rows"],
+            stats["target_escaped_newline_replacements"],
+        )
     return ds
 
 
@@ -677,6 +718,9 @@ def _summarize_tokenization(dataset: Dataset, max_seq_length: int, sample_limit:
             "empty_target_text_count": 0,
             "empty_source_text_count": 0,
             "prompt_ge_max_count": 0,
+            "prompt_truncated_count": 0,
+            "target_truncated_count": 0,
+            "truncation_seen_count": 0,
             "full_ge_max_count": 0,
             "max_prompt_tokens": 0,
             "max_full_tokens": 0,
@@ -688,6 +732,10 @@ def _summarize_tokenization(dataset: Dataset, max_seq_length: int, sample_limit:
     sampled = dataset.select(range(sample_size))
     num_target_tokens = [int(v) for v in sampled["num_target_tokens"]]
     prompt_tokens = [int(v) for v in sampled["prompt_tokens"]]
+    raw_prompt_tokens = [int(v) for v in sampled["raw_prompt_tokens"]]
+    prompt_truncated = [int(v) for v in sampled["prompt_truncated"]]
+    target_truncated = [int(v) for v in sampled["target_truncated"]]
+    truncation_seen = [int(v) for v in sampled["truncation_seen"]]
     full_tokens = [int(v) for v in sampled["full_tokens"]]
     target_chars = [int(v) for v in sampled["target_chars"]]
     source_has_content = [int(v) for v in sampled["source_has_content"]]
@@ -696,9 +744,12 @@ def _summarize_tokenization(dataset: Dataset, max_seq_length: int, sample_limit:
     zero_target_count = sum(1 for v in num_target_tokens if v <= 0)
     empty_target_text_count = sum(1 for v in target_chars if v <= 0)
     empty_source_text_count = sum(1 for v in source_has_content if v <= 0)
-    prompt_ge_max_count = sum(1 for v in prompt_tokens if v >= max_seq_length)
+    prompt_ge_max_count = sum(1 for v in raw_prompt_tokens if v >= max_seq_length)
+    prompt_truncated_count = sum(1 for v in prompt_truncated if v > 0)
+    target_truncated_count = sum(1 for v in target_truncated if v > 0)
+    truncation_seen_count = sum(1 for v in truncation_seen if v > 0)
     full_ge_max_count = sum(1 for v in full_tokens if v >= max_seq_length)
-    max_prompt_tokens = max(prompt_tokens, default=0)
+    max_prompt_tokens = max(raw_prompt_tokens, default=0)
     max_full_tokens = max(full_tokens, default=0)
     mean_target_tokens = float(sum(num_target_tokens)) / float(sample_size)
     source_shrunk_count = sum(1 for v in source_shrink_steps if v > 0)
@@ -710,6 +761,9 @@ def _summarize_tokenization(dataset: Dataset, max_seq_length: int, sample_limit:
         "empty_target_text_count": empty_target_text_count,
         "empty_source_text_count": empty_source_text_count,
         "prompt_ge_max_count": prompt_ge_max_count,
+        "prompt_truncated_count": prompt_truncated_count,
+        "target_truncated_count": target_truncated_count,
+        "truncation_seen_count": truncation_seen_count,
         "full_ge_max_count": full_ge_max_count,
         "max_prompt_tokens": max_prompt_tokens,
         "max_full_tokens": max_full_tokens,
@@ -725,24 +779,57 @@ def _warn_tokenization_risks(split_name: str, stats: dict[str, int | float], max
         return
 
     prompt_ge_max = int(stats.get("prompt_ge_max_count", 0) or 0)
+    prompt_truncated = int(stats.get("prompt_truncated_count", 0) or 0)
+    target_truncated = int(stats.get("target_truncated_count", 0) or 0)
+    truncation_seen = int(stats.get("truncation_seen_count", 0) or 0)
     full_ge_max = int(stats.get("full_ge_max_count", 0) or 0)
     source_shrunk = int(stats.get("source_shrunk_count", 0) or 0)
     empty_source = int(stats.get("empty_source_text_count", 0) or 0)
     mean_target = float(stats.get("mean_target_tokens", 0.0) or 0.0)
 
     prompt_ge_max_ratio = float(prompt_ge_max) / float(sample_size)
+    prompt_truncated_ratio = float(prompt_truncated) / float(sample_size)
+    target_truncated_ratio = float(target_truncated) / float(sample_size)
+    truncation_seen_ratio = float(truncation_seen) / float(sample_size)
     full_ge_max_ratio = float(full_ge_max) / float(sample_size)
     source_shrunk_ratio = float(source_shrunk) / float(sample_size)
     empty_source_ratio = float(empty_source) / float(sample_size)
 
     if prompt_ge_max_ratio >= 0.20:
         logger.warning(
-            "%s tokenization risk: %.1f%% prompts reach max_seq_length=%s "
-            "(prompt_ge_max_count=%s/%s). Potential supervision loss from truncation.",
+            "%s tokenization risk: %.1f%% raw prompts reach/exceed max_seq_length=%s "
+            "(prompt_ge_max_count=%s/%s). Source/prompt text may need shortening.",
             split_name,
             prompt_ge_max_ratio * 100.0,
             max_seq_length,
             prompt_ge_max,
+            sample_size,
+        )
+    if truncation_seen_ratio >= 0.10:
+        logger.warning(
+            "%s tokenization risk: truncation was observed in %.1f%% samples "
+            "(truncation_seen_count=%s/%s) before any source shrink recovery.",
+            split_name,
+            truncation_seen_ratio * 100.0,
+            truncation_seen,
+            sample_size,
+        )
+    if prompt_truncated_ratio > 0.0:
+        logger.warning(
+            "%s tokenization risk: final prompt remains truncated in %.1f%% samples "
+            "(prompt_truncated_count=%s/%s).",
+            split_name,
+            prompt_truncated_ratio * 100.0,
+            prompt_truncated,
+            sample_size,
+        )
+    if target_truncated_ratio > 0.0:
+        logger.warning(
+            "%s tokenization risk: final target remains truncated in %.1f%% samples "
+            "(target_truncated_count=%s/%s).",
+            split_name,
+            target_truncated_ratio * 100.0,
+            target_truncated,
             sample_size,
         )
     if full_ge_max_ratio >= 0.30:
@@ -790,7 +877,8 @@ def _raise_empty_train_dataset_error(cfg: SFTConfig, raw_rows: int, token_stats:
         f"- sampled_rows={token_stats['sample_size']} sampled_zero_target={token_stats['zero_target_count']}\n"
         f"- sampled_empty_target_text={token_stats['empty_target_text_count']}\n"
         f"- sampled_empty_source_text={token_stats['empty_source_text_count']}\n"
-        f"- sampled_prompt_ge_max_seq={token_stats['prompt_ge_max_count']} (max_seq_length={cfg.train.max_seq_length})\n"
+        f"- sampled_prompt_ge_max_seq={token_stats['prompt_ge_max_count']} (raw prompts, max_seq_length={cfg.train.max_seq_length})\n"
+        f"- sampled_prompt_truncated={token_stats['prompt_truncated_count']} sampled_target_truncated={token_stats['target_truncated_count']}\n"
         f"- sampled_source_shrunk={token_stats['source_shrunk_count']} max_shrink_steps={token_stats['max_source_shrink_steps']}\n"
         f"- sampled_max_prompt_tokens={token_stats['max_prompt_tokens']} sampled_max_full_tokens={token_stats['max_full_tokens']}\n"
         "Likely causes:\n"
@@ -1000,12 +1088,15 @@ def build_datasets(cfg: SFTConfig, tokenizer: PreTrainedTokenizerBase) -> tuple[
     )
     train_stats = _summarize_tokenization(train_mapped, cfg.train.max_seq_length)
     logger.info(
-        "Train tokenization stats sample_size=%s zero_target=%s empty_target=%s empty_source=%s prompt_ge_max=%s source_shrunk=%s max_shrink_steps=%s max_prompt=%s max_full=%s mean_target_tokens=%.2f",
+        "Train tokenization stats sample_size=%s zero_target=%s empty_target=%s empty_source=%s prompt_ge_max=%s truncation_seen=%s prompt_truncated=%s target_truncated=%s source_shrunk=%s max_shrink_steps=%s max_prompt=%s max_full=%s mean_target_tokens=%.2f",
         train_stats["sample_size"],
         train_stats["zero_target_count"],
         train_stats["empty_target_text_count"],
         train_stats["empty_source_text_count"],
         train_stats["prompt_ge_max_count"],
+        train_stats["truncation_seen_count"],
+        train_stats["prompt_truncated_count"],
+        train_stats["target_truncated_count"],
         train_stats["source_shrunk_count"],
         train_stats["max_source_shrink_steps"],
         train_stats["max_prompt_tokens"],
@@ -1033,12 +1124,15 @@ def build_datasets(cfg: SFTConfig, tokenizer: PreTrainedTokenizerBase) -> tuple[
         )
         eval_stats = _summarize_tokenization(eval_mapped, cfg.train.max_seq_length)
         logger.info(
-            "Eval tokenization stats sample_size=%s zero_target=%s empty_target=%s empty_source=%s prompt_ge_max=%s source_shrunk=%s max_shrink_steps=%s max_prompt=%s max_full=%s mean_target_tokens=%.2f",
+            "Eval tokenization stats sample_size=%s zero_target=%s empty_target=%s empty_source=%s prompt_ge_max=%s truncation_seen=%s prompt_truncated=%s target_truncated=%s source_shrunk=%s max_shrink_steps=%s max_prompt=%s max_full=%s mean_target_tokens=%.2f",
             eval_stats["sample_size"],
             eval_stats["zero_target_count"],
             eval_stats["empty_target_text_count"],
             eval_stats["empty_source_text_count"],
             eval_stats["prompt_ge_max_count"],
+            eval_stats["truncation_seen_count"],
+            eval_stats["prompt_truncated_count"],
+            eval_stats["target_truncated_count"],
             eval_stats["source_shrunk_count"],
             eval_stats["max_source_shrink_steps"],
             eval_stats["max_prompt_tokens"],
