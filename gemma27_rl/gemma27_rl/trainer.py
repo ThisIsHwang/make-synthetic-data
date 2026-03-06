@@ -14,6 +14,7 @@ import socket
 from statistics import mean
 import subprocess
 import sys
+import traceback
 from typing import Any, Callable
 
 import torch
@@ -3544,6 +3545,24 @@ def _save_deepspeed_resume_checkpoint(
     )
 
 
+def _is_deepspeed_resume_shard_mismatch_error(exc: BaseException) -> bool:
+    text = str(exc)
+    if ("ckpt_list" in text) or ("len(self.ckpt_list)" in text):
+        return True
+    tb = getattr(exc, "__traceback__", None)
+    if tb is None:
+        return False
+    for frame in traceback.extract_tb(tb):
+        filename = str(frame.filename or "")
+        func = str(frame.name or "")
+        line = str(frame.line or "")
+        if filename.endswith("state_dict_factory.py") and (
+            func == "check_ckpt_list" or "ckpt_list" in line or "len(self.ckpt_list)" in line
+        ):
+            return True
+    return False
+
+
 def _is_deepspeed_checkpoint_dir(path: Path) -> bool:
     if not path.exists() or not path.is_dir():
         return False
@@ -3920,7 +3939,7 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
                 # missing for current rank/world-size. In that case, keep model
                 # weights already loaded from `policy_source` and reset optimizer.
                 text = str(exc)
-                if ("ckpt_list" in text) or ("len(self.ckpt_list)" in text):
+                if _is_deepspeed_resume_shard_mismatch_error(exc):
                     ds_resume_failed = True
                     if rank0:
                         logger.warning(

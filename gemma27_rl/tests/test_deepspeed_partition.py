@@ -14,6 +14,7 @@ from gemma27_rl import trainer as trainer_mod
 from gemma27_rl.trainer import (
     _build_zero3_peft_state_dict,
     _configure_nccl_heartbeat_timeout,
+    _is_deepspeed_resume_shard_mismatch_error,
     _register_qwen35_zero3_external_parameters,
     _load_policy_model,
     _validate_deepspeed_partition_strict,
@@ -355,3 +356,22 @@ def test_load_policy_model_falls_back_when_resume_adapter_artifacts_are_zero_siz
 
     assert model is fallback_model
     assert captured["fallback_args"] == (base_model, "LORA_CFG")
+
+
+def test_is_deepspeed_resume_shard_mismatch_error_matches_text() -> None:
+    exc = AssertionError("assert len(self.ckpt_list) > 0")
+    assert _is_deepspeed_resume_shard_mismatch_error(exc) is True
+
+
+def test_is_deepspeed_resume_shard_mismatch_error_matches_state_dict_factory_traceback() -> None:
+    namespace: dict[str, object] = {}
+    code = compile(
+        "def check_ckpt_list():\n    assert len(self.ckpt_list) > 0\n\ncheck_ckpt_list()\n",
+        "state_dict_factory.py",
+        "exec",
+    )
+    try:
+        exec(code, {"self": SimpleNamespace(ckpt_list=[])}, namespace)
+        raise AssertionError("expected AssertionError")
+    except AssertionError as exc:
+        assert _is_deepspeed_resume_shard_mismatch_error(exc) is True
