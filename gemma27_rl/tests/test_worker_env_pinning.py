@@ -43,6 +43,7 @@ def test_scorer_worker_env_strips_dist_vars(monkeypatch) -> None:
     monkeypatch.setenv("WORLD_SIZE", "8")
     monkeypatch.setenv("MASTER_ADDR", "127.0.0.1")
     monkeypatch.setenv("MASTER_PORT", "29500")
+    monkeypatch.setenv("PYTHONHOME", "/tmp/scorer-home")
     monkeypatch.setattr("gemma27_rl.rewards.subprocess.Popen", _fake_popen)
     monkeypatch.setattr(_ScorerSubprocessClient, "request", lambda self, payload: {"ok": True})
 
@@ -62,6 +63,7 @@ def test_scorer_worker_env_strips_dist_vars(monkeypatch) -> None:
     assert "WORLD_SIZE" not in env
     assert "MASTER_ADDR" not in env
     assert "MASTER_PORT" not in env
+    assert "PYTHONHOME" not in env
 
 
 def test_metricx_worker_device_is_pinned_to_cuda0(monkeypatch) -> None:
@@ -104,6 +106,7 @@ def test_reference_worker_env_strips_dist_vars(monkeypatch) -> None:
     monkeypatch.setenv("WORLD_SIZE", "8")
     monkeypatch.setenv("MASTER_ADDR", "127.0.0.1")
     monkeypatch.setenv("MASTER_PORT", "29501")
+    monkeypatch.setenv("PYTHONHOME", "/tmp/ref-home")
     monkeypatch.setattr("gemma27_rl.trainer.subprocess.Popen", _fake_popen)
     monkeypatch.setattr(ReferenceLogprobClient, "request", lambda self, payload: {"ok": True})
 
@@ -122,6 +125,7 @@ def test_reference_worker_env_strips_dist_vars(monkeypatch) -> None:
     assert "WORLD_SIZE" not in env
     assert "MASTER_ADDR" not in env
     assert "MASTER_PORT" not in env
+    assert "PYTHONHOME" not in env
 
 
 def test_scorer_worker_remote_launch_uses_ssh(monkeypatch) -> None:
@@ -192,3 +196,11 @@ def test_reference_worker_remote_launch_uses_ssh(monkeypatch) -> None:
     env = captured["env"]
     assert isinstance(env, dict)
     assert "CUDA_VISIBLE_DEVICES" not in env
+
+
+def test_reference_worker_rejects_invalid_logprobs_row_payload() -> None:
+    client = object.__new__(ReferenceLogprobClient)
+    client.request = lambda payload: {"ok": True, "logprobs_rows": [123]}  # type: ignore[attr-defined]
+
+    with pytest.raises(RuntimeError, match="invalid logprobs row"):
+        client.score_logprobs_batch([([1, 2], [3])])

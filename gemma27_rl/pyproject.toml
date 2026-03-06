@@ -11,6 +11,7 @@ requires-python = ">=3.10"
 dependencies = [
   "PyYAML>=6.0.1",
   "datasets>=2.21.0",
+  "peft>=0.17.0",
   "sentencepiece>=0.2.0",
   "torch>=2.2.0",
   "transformers>=4.44.0",

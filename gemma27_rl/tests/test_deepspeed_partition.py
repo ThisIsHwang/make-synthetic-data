@@ -60,6 +60,19 @@ def test_deepspeed_partition_remote_reference_overlap_allowed(monkeypatch: pytes
     _validate_deepspeed_partition_strict(cfg)
 
 
+def test_deepspeed_partition_colocated_reference_overlap_allowed(monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = _base_cfg()
+    cfg.model.policy_gpu_ids = [0, 1, 2, 3, 4, 5, 6, 7]
+    cfg.model.reference_gpu_ids = [0, 1, 2, 3, 4, 5, 6, 7]
+    cfg.model.reference_runtime = "colocate"
+    cfg.model.policy_runtime_mode = "colocate"
+    cfg.model.lora.enabled = True
+    monkeypatch.setenv("WORLD_SIZE", "8")
+    monkeypatch.setenv("LOCAL_RANK", "0")
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1,2,3,4,5,6,7")
+    _validate_deepspeed_partition_strict(cfg)
+
+
 def test_assign_disjoint_keeps_physical_reserved_ids_under_deepspeed_include(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -105,3 +118,55 @@ def test_configure_nccl_heartbeat_timeout_ignored_for_native(monkeypatch: pytest
     monkeypatch.delenv("TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC", raising=False)
     _configure_nccl_heartbeat_timeout(cfg)
     assert os.environ.get("TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC") is None
+
+
+def test_save_deepspeed_checkpoint_wrapper_passes_hf_model(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    captured: dict[str, object] = {}
+
+    def _fake_save(**kwargs):
+        captured.update(kwargs)
+        return kwargs["ckpt_dir"]
+
+    monkeypatch.setattr(trainer_mod, "_save_deepspeed_checkpoint_to_dir", _fake_save)
+
+    hf_model = object()
+    result = trainer_mod._save_deepspeed_checkpoint(
+        output_dir=tmp_path,
+        update_idx=7,
+        engine=object(),
+        tokenizer=object(),
+        hf_model=hf_model,
+        trainer_state={"update_idx": 7},
+    )
+
+    assert result == tmp_path / "checkpoint-7"
+    assert captured["hf_model"] is hf_model
+
+
+def test_save_deepspeed_resume_checkpoint_wrapper_passes_hf_model(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def _fake_save(**kwargs):
+        captured.update(kwargs)
+        return kwargs["ckpt_dir"]
+
+    monkeypatch.setattr(trainer_mod, "_save_deepspeed_checkpoint_to_dir", _fake_save)
+
+    hf_model = object()
+    result = trainer_mod._save_deepspeed_resume_checkpoint(
+        output_dir=tmp_path,
+        update_idx=9,
+        engine=object(),
+        tokenizer=object(),
+        hf_model=hf_model,
+        trainer_state={"best_eval_update": 8},
+    )
+
+    assert result == tmp_path / "resume_latest"
+    assert captured["hf_model"] is hf_model
+    trainer_state = captured["trainer_state"]
+    assert isinstance(trainer_state, dict)
+    assert trainer_state["update_idx"] == 9

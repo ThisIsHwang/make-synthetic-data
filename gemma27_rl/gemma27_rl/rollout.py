@@ -185,23 +185,48 @@ def _forward_with_optional_token_type_ids(
     return model(**kwargs)
 
 
-def _resolve_model_vocab_size(model: PreTrainedModel) -> int | None:
+def _as_positive_vocab_size(value: Any) -> int | None:
     try:
-        emb = model.get_input_embeddings()
+        size = int(value)
     except Exception:
-        emb = None
-    if emb is not None and hasattr(emb, "num_embeddings"):
-        try:
-            return int(emb.num_embeddings)
-        except Exception:
-            pass
-    cfg = getattr(model, "config", None)
-    if cfg is not None and hasattr(cfg, "vocab_size"):
-        try:
-            return int(cfg.vocab_size)
-        except Exception:
-            pass
-    return None
+        return None
+    return size if size > 0 else None
+
+
+def _get_embedding_vocab_size(candidate: Any) -> int | None:
+    if candidate is None:
+        return None
+    return _as_positive_vocab_size(getattr(candidate, "num_embeddings", 0) or 0)
+
+
+_COMMON_TOKEN_EMBEDDING_NAMES = {
+    "embed_tokens",
+    "wte",
+    "shared",
+    "emb",
+    "word_embeddings",
+    "tok_embeddings",
+}
+
+
+def _get_named_module_vocab_size(model: PreTrainedModel) -> int | None:
+    embedding_cls = getattr(getattr(torch, "nn", None), "Embedding", None)
+    if embedding_cls is None:
+        return None
+
+    fallback_size: int | None = None
+    for module_name, module in model.named_modules():
+        if not isinstance(module, embedding_cls):
+            continue
+        size = _get_embedding_vocab_size(module)
+        if size is None:
+            continue
+        if fallback_size is None:
+            fallback_size = size
+        name_tail = str(module_name or "").split(".")[-1]
+        if name_tail in _COMMON_TOKEN_EMBEDDING_NAMES:
+            return size
+    return fallback_size
 
 
 def _validate_token_ids_in_vocab(
@@ -225,18 +250,20 @@ def _get_model_vocab_size(model: PreTrainedModel) -> int | None:
     getter = getattr(model, "get_input_embeddings", None)
     if callable(getter):
         try:
-            embeddings = getter()
-            size = int(getattr(embeddings, "num_embeddings", 0) or 0)
-            if size > 0:
+            size = _get_embedding_vocab_size(getter())
+            if size is not None:
                 return size
         except Exception:
             pass
+    for attr_name in ("embed_tokens", "wte", "shared", "emb", "word_embeddings", "tok_embeddings"):
+        size = _get_embedding_vocab_size(getattr(model, attr_name, None))
+        if size is not None:
+            return size
     config_obj = getattr(model, "config", None)
-    try:
-        size = int(getattr(config_obj, "vocab_size", 0) or 0)
-    except Exception:
-        size = 0
-    return size if size > 0 else None
+    size = _as_positive_vocab_size(getattr(config_obj, "vocab_size", 0) if config_obj is not None else 0)
+    if size is not None:
+        return size
+    return _get_named_module_vocab_size(model)
 
 
 def _validate_item_token_ids(
@@ -812,13 +839,13 @@ def compute_completion_logprobs(
 
     if len(prompt_input_ids) == 0:
         raise ValueError("prompt_input_ids must be non-empty")
-    vocab_size = _resolve_model_vocab_size(model)
+    vocab_size = _get_model_vocab_size(model)
     _validate_token_ids_in_vocab(prompt_input_ids, vocab_size=vocab_size, context="prompt_input_ids")
     _validate_token_ids_in_vocab(completion_token_ids, vocab_size=vocab_size, context="completion_token_ids")
 
     _validate_item_token_ids(
         items=[([int(v) for v in prompt_input_ids], [int(v) for v in completion_token_ids])],
-        vocab_size=_get_model_vocab_size(model),
+        vocab_size=vocab_size,
         tag="compute_completion_logprobs",
     )
 
@@ -874,7 +901,7 @@ def compute_completion_logprobs_batch(
         )
 
     parsed_items: list[tuple[list[int], list[int]]] = []
-    vocab_size = _resolve_model_vocab_size(model)
+    vocab_size = _get_model_vocab_size(model)
     for prompt_input_ids, completion_token_ids in items:
         if len(prompt_input_ids) == 0:
             raise ValueError("prompt_input_ids must be non-empty")
@@ -889,7 +916,7 @@ def compute_completion_logprobs_batch(
 
     _validate_item_token_ids(
         items=parsed_items,
-        vocab_size=_get_model_vocab_size(model),
+        vocab_size=vocab_size,
         tag="compute_completion_logprobs_batch",
     )
 

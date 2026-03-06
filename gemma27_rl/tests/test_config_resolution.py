@@ -90,3 +90,67 @@ def test_disable_reference_model_allows_reference_gpu_settings_without_deepspeed
     cfg = load_config(cfg_path)
     assert cfg.model.use_reference_model is False
     assert cfg.model.reference_gpu_ids == [0, 1]
+
+
+def test_colocated_reference_with_lora_allows_overlapping_gpu_ids(tmp_path: Path) -> None:
+    cfg_path = tmp_path / "train.yaml"
+    cfg_path.write_text(
+        "\n".join(
+            [
+                "data:",
+                "  hf_dataset_name: dummy/dataset",
+                "model:",
+                "  policy_name_or_path: /tmp/base-model",
+                "  reference_runtime: colocate",
+                "  policy_runtime_mode: colocate",
+                "  policy_gpu_ids: [0, 1, 2, 3, 4, 5, 6, 7]",
+                "  reference_gpu_ids: [0, 1, 2, 3, 4, 5, 6, 7]",
+                "  lora:",
+                "    enabled: true",
+                "rl:",
+                "  backend: deepspeed",
+                "reward:",
+                "  xcomet:",
+                "    enabled: false",
+                "  mqm:",
+                "    enabled: false",
+                "  esa:",
+                "    enabled: false",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    cfg = load_config(cfg_path)
+    assert cfg.model.reference_runtime == "colocate"
+    assert cfg.model.lora.enabled is True
+    assert cfg.model.policy_gpu_ids == [0, 1, 2, 3, 4, 5, 6, 7]
+    assert cfg.model.reference_gpu_ids == [0, 1, 2, 3, 4, 5, 6, 7]
+
+
+def test_colocated_reference_requires_lora(tmp_path: Path) -> None:
+    cfg_path = tmp_path / "train.yaml"
+    cfg_path.write_text(
+        "\n".join(
+            [
+                "data:",
+                "  hf_dataset_name: dummy/dataset",
+                "model:",
+                "  reference_runtime: colocate",
+                "  policy_runtime_mode: colocate",
+                "reward:",
+                "  xcomet:",
+                "    enabled: false",
+                "  mqm:",
+                "    enabled: false",
+                "  esa:",
+                "    enabled: false",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="model.reference_runtime=colocate requires model.lora.enabled=true"):
+        _ = load_config(cfg_path)

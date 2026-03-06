@@ -35,7 +35,7 @@ class ModelConfig:
     reference_device: str | None = None
     policy_gpu_ids: list[int] = field(default_factory=list)
     reference_gpu_ids: list[int] = field(default_factory=list)
-    reference_runtime: str = "worker"  # worker|in_process|cpu
+    reference_runtime: str = "worker"  # worker|in_process|cpu|colocate
     reference_logprob_micro_batch_size: int = 2
     reference_python_executable: str | None = None
     reference_subprocess_timeout_sec: float = 600.0
@@ -44,6 +44,27 @@ class ModelConfig:
     # colocate: share one policy instance for rollout/eval/update.
     # separate: load a dedicated rollout/eval policy copy (native backend only).
     policy_runtime_mode: str = "colocate"  # colocate|separate
+    lora: LoRAConfig = field(default_factory=lambda: LoRAConfig())
+
+
+@dataclass
+class LoRAConfig:
+    enabled: bool = False
+    r: int = 64
+    alpha: int = 128
+    dropout: float = 0.05
+    bias: str = "none"  # none|all|lora_only
+    target_modules: list[str] = field(
+        default_factory=lambda: [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+        ]
+    )
 
 
 @dataclass
@@ -446,11 +467,13 @@ def _validate_config(cfg: RLPostTrainConfig) -> None:
         raise ValueError("rl.backend must be native|deepspeed")
     if int(cfg.logging.keep_last_n_checkpoints) < 0:
         raise ValueError("logging.keep_last_n_checkpoints must be >= 0")
-    if cfg.model.reference_runtime not in {"worker", "in_process", "cpu"}:
-        raise ValueError("model.reference_runtime must be worker|in_process|cpu")
-    if str(cfg.model.policy_runtime_mode).strip().lower() not in {"colocate", "separate"}:
+    reference_runtime = str(cfg.model.reference_runtime or "worker").strip().lower()
+    if reference_runtime not in {"worker", "in_process", "cpu", "colocate"}:
+        raise ValueError("model.reference_runtime must be worker|in_process|cpu|colocate")
+    policy_runtime_mode = str(cfg.model.policy_runtime_mode).strip().lower()
+    if policy_runtime_mode not in {"colocate", "separate"}:
         raise ValueError("model.policy_runtime_mode must be colocate|separate")
-    if cfg.rl.backend == "deepspeed" and str(cfg.model.policy_runtime_mode).strip().lower() == "separate":
+    if cfg.rl.backend == "deepspeed" and policy_runtime_mode == "separate":
         raise ValueError("model.policy_runtime_mode=separate is not supported with rl.backend=deepspeed")
     if float(cfg.model.reference_subprocess_timeout_sec) <= 0:
         raise ValueError("model.reference_subprocess_timeout_sec must be > 0.")
@@ -460,6 +483,22 @@ def _validate_config(cfg: RLPostTrainConfig) -> None:
         raise ValueError("model.disable_policy_flash_attention must be a bool.")
     if int(cfg.model.reference_logprob_micro_batch_size) <= 0:
         raise ValueError("model.reference_logprob_micro_batch_size must be > 0.")
+    if not isinstance(cfg.model.lora.enabled, bool):
+        raise ValueError("model.lora.enabled must be a bool.")
+    if int(cfg.model.lora.r) <= 0:
+        raise ValueError("model.lora.r must be > 0.")
+    if int(cfg.model.lora.alpha) <= 0:
+        raise ValueError("model.lora.alpha must be > 0.")
+    lora_dropout = float(cfg.model.lora.dropout)
+    if lora_dropout < 0.0 or lora_dropout >= 1.0:
+        raise ValueError("model.lora.dropout must be in [0, 1).")
+    if str(cfg.model.lora.bias or "").strip().lower() not in {"none", "all", "lora_only"}:
+        raise ValueError("model.lora.bias must be one of: none, all, lora_only")
+    if not isinstance(cfg.model.lora.target_modules, list) or not cfg.model.lora.target_modules:
+        raise ValueError("model.lora.target_modules must be a non-empty list.")
+    for idx, module_name in enumerate(cfg.model.lora.target_modules):
+        if not str(module_name).strip():
+            raise ValueError(f"model.lora.target_modules[{idx}] must not be empty.")
     if int(cfg.rl.deepspeed_zero_stage) not in {0, 1, 2, 3}:
         raise ValueError("rl.deepspeed_zero_stage must be one of 0,1,2,3")
     if cfg.generation.chat_template_kwargs is not None and not isinstance(cfg.generation.chat_template_kwargs, dict):
@@ -567,6 +606,19 @@ def _validate_config(cfg: RLPostTrainConfig) -> None:
     cfg.model.policy_gpu_ids = _normalize_gpu_ids(cfg.model.policy_gpu_ids, "model.policy_gpu_ids")
     cfg.model.reference_gpu_ids = _normalize_gpu_ids(cfg.model.reference_gpu_ids, "model.reference_gpu_ids")
     reference_enabled = bool(cfg.model.use_reference_model and float(cfg.rl.kl_coef) > 0.0)
+    reference_uses_colocated_policy = bool(reference_enabled and reference_runtime == "colocate")
+
+    if reference_uses_colocated_policy:
+        if not cfg.model.lora.enabled:
+            raise ValueError("model.reference_runtime=colocate requires model.lora.enabled=true")
+        if policy_runtime_mode != "colocate":
+            raise ValueError("model.reference_runtime=colocate requires model.policy_runtime_mode=colocate")
+        ref_name = str(cfg.model.reference_name_or_path or "").strip()
+        if ref_name and ref_name != str(cfg.model.policy_name_or_path or "").strip():
+            raise ValueError(
+                "model.reference_runtime=colocate requires model.reference_name_or_path to be unset "
+                "or equal to model.policy_name_or_path."
+            )
 
     reference_host = _effective_worker_host(cfg.model.reference_worker_host, cfg.misc.aux_worker_host)
     metricx_host = _effective_worker_host(cfg.reward.metricx.worker_host, cfg.misc.aux_worker_host)
@@ -582,13 +634,17 @@ def _validate_config(cfg: RLPostTrainConfig) -> None:
                 "model.policy_gpu_ids with length > 1 requires rl.backend=deepspeed "
                 "(device_map=auto path is disabled)."
             )
-        if reference_enabled and len(cfg.model.reference_gpu_ids) > 1:
+        if reference_enabled and (not reference_uses_colocated_policy) and len(cfg.model.reference_gpu_ids) > 1:
             raise ValueError(
                 "model.reference_gpu_ids with length > 1 is not supported without deepspeed."
             )
 
     policy_set = set(cfg.model.policy_gpu_ids)
-    ref_set = set(cfg.model.reference_gpu_ids) if (reference_enabled and reference_host is None) else set()
+    ref_set = (
+        set(cfg.model.reference_gpu_ids)
+        if (reference_enabled and (not reference_uses_colocated_policy) and reference_host is None)
+        else set()
+    )
     overlap = sorted(policy_set & ref_set)
     if overlap:
         raise ValueError(
@@ -600,9 +656,9 @@ def _validate_config(cfg: RLPostTrainConfig) -> None:
     metricx_idx = _parse_cuda_index(cfg.reward.metricx.device if cfg.reward.metricx.enabled else None)
     xcomet_idx = _parse_cuda_index(cfg.reward.xcomet.device if cfg.reward.xcomet.enabled else None)
     reference_idx = None
-    if reference_enabled and cfg.model.reference_gpu_ids:
+    if reference_enabled and (not reference_uses_colocated_policy) and cfg.model.reference_gpu_ids:
         reference_idx = int(cfg.model.reference_gpu_ids[0])
-    elif reference_enabled and cfg.model.reference_runtime != "cpu":
+    elif reference_enabled and (not reference_uses_colocated_policy) and reference_runtime != "cpu":
         reference_idx = _parse_cuda_index(cfg.model.reference_device)
 
     if metricx_host is None and metricx_idx is not None and metricx_idx in reserved:

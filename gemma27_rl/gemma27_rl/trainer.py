@@ -14,7 +14,7 @@ import socket
 from statistics import mean
 import subprocess
 import sys
-from typing import Any
+from typing import Any, Callable
 
 import torch
 import yaml
@@ -24,6 +24,14 @@ try:
     import deepspeed
 except Exception:  # pragma: no cover - optional dependency
     deepspeed = None  # type: ignore[assignment]
+
+try:
+    from peft import LoraConfig, PeftModel, TaskType, get_peft_model
+except Exception:  # pragma: no cover - optional dependency
+    LoraConfig = None  # type: ignore[assignment]
+    PeftModel = None  # type: ignore[assignment]
+    TaskType = None  # type: ignore[assignment]
+    get_peft_model = None  # type: ignore[assignment]
 
 from .advantage import (
     apply_group_relative_advantage,
@@ -993,6 +1001,8 @@ class ReferenceLogprobClient:
         env = dict(os.environ)
         for key in ("LOCAL_RANK", "RANK", "WORLD_SIZE", "MASTER_ADDR", "MASTER_PORT"):
             env.pop(key, None)
+        # PYTHONHOME can break venv resolution and make installed packages invisible.
+        env.pop("PYTHONHOME", None)
         if self._env_overrides and not self._remote_host:
             for key, value in self._env_overrides.items():
                 env[str(key)] = str(value)
@@ -1107,10 +1117,12 @@ class ReferenceLogprobClient:
             if not isinstance(rows_raw, list):
                 raise RuntimeError("reference worker score_batch returned invalid logprobs_rows payload")
             rows: list[list[float]] = []
-            for row in rows_raw:
+            for row_idx, row in enumerate(rows_raw):
                 if not isinstance(row, list):
-                    rows.append([])
-                    continue
+                    raise RuntimeError(
+                        "reference worker score_batch returned invalid logprobs row "
+                        f"at index={row_idx}: type={type(row).__name__}"
+                    )
                 rows.append([float(v) for v in row])
             if len(rows) != len(items):
                 raise RuntimeError(
@@ -1255,7 +1267,7 @@ def _validate_deepspeed_partition_strict(cfg: RLPostTrainConfig) -> None:
     reference_host = _effective_worker_host(cfg.model.reference_worker_host, cfg.misc.aux_worker_host)
     metricx_host = _effective_worker_host(cfg.reward.metricx.worker_host, cfg.misc.aux_worker_host)
     xcomet_host = _effective_worker_host(cfg.reward.xcomet.worker_host, cfg.misc.aux_worker_host)
-    if reference_gpu_ids and reference_host is None:
+    if reference_gpu_ids and reference_host is None and not _reference_uses_colocated_policy(cfg):
         reserved_map["reference"] = int(reference_gpu_ids[0])
     if cfg.reward.metricx.enabled and metricx_host is None:
         metricx_idx = _parse_cuda_index(cfg.reward.metricx.device)
@@ -1372,7 +1384,9 @@ def _assign_disjoint_gpu_devices(cfg: RLPostTrainConfig) -> None:
     reference_host = _effective_worker_host(cfg.model.reference_worker_host, cfg.misc.aux_worker_host)
     metricx_host = _effective_worker_host(cfg.reward.metricx.worker_host, cfg.misc.aux_worker_host)
     xcomet_host = _effective_worker_host(cfg.reward.xcomet.worker_host, cfg.misc.aux_worker_host)
-    local_reference_ids = explicit_reference_ids if reference_host is None else []
+    local_reference_ids = (
+        explicit_reference_ids if (reference_host is None and not _reference_uses_colocated_policy(cfg)) else []
+    )
 
     if explicit_policy_ids or explicit_reference_ids:
         # In DeepSpeed launcher mode, CUDA_VISIBLE_DEVICES may expose only policy GPUs
@@ -1407,8 +1421,13 @@ def _assign_disjoint_gpu_devices(cfg: RLPostTrainConfig) -> None:
             cfg.misc.device = f"cuda:{explicit_policy_ids[0]}"
         cfg.model.policy_gpu_ids = explicit_policy_ids
 
-        if explicit_reference_ids:
+        if explicit_reference_ids and not _reference_uses_colocated_policy(cfg):
             cfg.model.reference_device = f"cuda:{explicit_reference_ids[0]}"
+        elif explicit_reference_ids:
+            logger.info(
+                "Ignoring model.reference_gpu_ids=%s because model.reference_runtime=colocate reuses the policy LoRA base.",
+                explicit_reference_ids,
+            )
         cfg.model.reference_gpu_ids = explicit_reference_ids
 
         # For explicit DeepSpeed partition, keep reward device ids exactly as configured
@@ -1888,6 +1907,92 @@ def _resolve_reference_attn_implementation(
     return base_attn_impl
 
 
+_ADAPTER_CONFIG_FILENAME = "adapter_config.json"
+
+
+def _lora_enabled(cfg: RLPostTrainConfig) -> bool:
+    return bool(getattr(getattr(cfg.model, "lora", None), "enabled", False))
+
+
+def _reference_uses_colocated_policy(cfg: RLPostTrainConfig) -> bool:
+    if not _reference_kl_enabled(cfg):
+        return False
+    return str(cfg.model.reference_runtime or "worker").strip().lower() == "colocate"
+
+
+def _require_peft_for_lora() -> None:
+    if LoraConfig is None or PeftModel is None or TaskType is None or get_peft_model is None:
+        raise RuntimeError(
+            "model.lora.enabled=true requires the `peft` package with a compatible transformers install."
+        )
+
+
+def _read_local_adapter_base_model_name_or_path(model_name_or_path: str) -> str | None:
+    path = Path(str(model_name_or_path)).expanduser()
+    cfg_path = path / _ADAPTER_CONFIG_FILENAME
+    if not cfg_path.exists():
+        return None
+    try:
+        payload = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise RuntimeError(f"Failed to read LoRA adapter config: {cfg_path}") from exc
+    base_source = str(payload.get("base_model_name_or_path") or "").strip()
+    return base_source or None
+
+
+def _checkpoint_has_model_artifacts(path: Path | None) -> bool:
+    if path is None or (not path.is_dir()):
+        return False
+    return (path / "config.json").exists() or (path / _ADAPTER_CONFIG_FILENAME).exists()
+
+
+def _build_lora_config(cfg: RLPostTrainConfig) -> Any:
+    _require_peft_for_lora()
+    return LoraConfig(
+        r=int(cfg.model.lora.r),
+        lora_alpha=int(cfg.model.lora.alpha),
+        lora_dropout=float(cfg.model.lora.dropout),
+        bias=str(cfg.model.lora.bias).strip().lower(),
+        target_modules=[str(name).strip() for name in cfg.model.lora.target_modules],
+        task_type=TaskType.CAUSAL_LM,
+    )
+
+
+def _log_trainable_parameter_summary(model: Any, *, tag: str) -> None:
+    total = 0
+    trainable = 0
+    for param in model.parameters():
+        count = int(param.numel())
+        total += count
+        if param.requires_grad:
+            trainable += count
+    pct = (100.0 * trainable / total) if total > 0 else 0.0
+    logger.info("%s trainable parameters: %s / %s (%.4f%%)", tag, trainable, total, pct)
+
+
+class _AdapterDisabledReferenceProxy(torch.nn.Module):
+    def __init__(self, wrapped_model: Any) -> None:
+        super().__init__()
+        self.wrapped_model = wrapped_model
+
+    def forward(self, *args, **kwargs):
+        disable_adapter = getattr(self.wrapped_model, "disable_adapter", None)
+        if not callable(disable_adapter):
+            return self.wrapped_model(*args, **kwargs)
+        with disable_adapter():
+            return self.wrapped_model(*args, **kwargs)
+
+    def get_input_embeddings(self):
+        getter = getattr(self.wrapped_model, "get_input_embeddings", None)
+        if callable(getter):
+            return getter()
+        raise AttributeError("wrapped model has no get_input_embeddings()")
+
+    @property
+    def config(self):
+        return getattr(self.wrapped_model, "config", None)
+
+
 def _load_causal_lm(
     model_name_or_path: str,
     kwargs: dict[str, Any],
@@ -1911,7 +2016,7 @@ def _load_policy_model(
     cfg: RLPostTrainConfig,
     device: str,
     model_name_or_path: str | None = None,
-) -> AutoModelForCausalLM:
+) -> Any:
     dtype, attn_impl = _resolve_model_dtype_and_attn(cfg, device)
     if cfg.model.disable_policy_flash_attention:
         attn_text = str(attn_impl or "").strip().lower()
@@ -1932,20 +2037,52 @@ def _load_policy_model(
 
     source = model_name_or_path or cfg.model.policy_name_or_path
     policy_gpu_ids = [] if cfg.rl.backend == "deepspeed" else cfg.model.policy_gpu_ids
-    return _load_causal_lm(
-        model_name_or_path=source,
+    adapter_base_source = _read_local_adapter_base_model_name_or_path(source)
+    if adapter_base_source is not None and not _lora_enabled(cfg):
+        raise RuntimeError(
+            f"Policy source {source} is a LoRA adapter checkpoint, but model.lora.enabled=false."
+        )
+
+    base_source = adapter_base_source or source
+    model = _load_causal_lm(
+        model_name_or_path=base_source,
         kwargs=kwargs,
         single_device=device,
         gpu_ids=policy_gpu_ids,
         component_name="policy",
     )
+    if adapter_base_source is not None:
+        _require_peft_for_lora()
+        model = PeftModel.from_pretrained(model, source, is_trainable=True)
+        logger.info("Loaded policy LoRA adapter checkpoint from %s (base=%s).", source, adapter_base_source)
+    elif _lora_enabled(cfg):
+        _require_peft_for_lora()
+        model = get_peft_model(model, _build_lora_config(cfg))
+        logger.info(
+            "Enabled policy LoRA: r=%s alpha=%s dropout=%s targets=%s",
+            cfg.model.lora.r,
+            cfg.model.lora.alpha,
+            cfg.model.lora.dropout,
+            [str(name) for name in cfg.model.lora.target_modules],
+        )
+
+    if _lora_enabled(cfg):
+        enable_input_require_grads = getattr(model, "enable_input_require_grads", None)
+        if callable(enable_input_require_grads):
+            try:
+                enable_input_require_grads()
+            except Exception as exc:
+                logger.warning("Failed to enable input grads for LoRA training: %s", exc)
+        _log_trainable_parameter_summary(model, tag="Policy")
+
+    return model
 
 
 def _reference_kl_enabled(cfg: RLPostTrainConfig) -> bool:
     return bool(cfg.model.use_reference_model and float(cfg.rl.kl_coef) > 0.0)
 
 
-def _load_reference_model(cfg: RLPostTrainConfig, default_device: str) -> tuple[AutoModelForCausalLM | None, str | None]:
+def _load_reference_model(cfg: RLPostTrainConfig, default_device: str) -> tuple[Any | None, str | None]:
     if not _reference_kl_enabled(cfg):
         return None, None
 
@@ -1974,13 +2111,18 @@ def _load_reference_model(cfg: RLPostTrainConfig, default_device: str) -> tuple[
     if attn_impl:
         kwargs["attn_implementation"] = attn_impl
 
+    adapter_base_source = _read_local_adapter_base_model_name_or_path(ref_name)
     model = _load_causal_lm(
-        model_name_or_path=ref_name,
+        model_name_or_path=adapter_base_source or ref_name,
         kwargs=kwargs,
         single_device=ref_device,
         gpu_ids=reference_gpu_ids[:1],
         component_name="reference",
     )
+    if adapter_base_source is not None:
+        _require_peft_for_lora()
+        model = PeftModel.from_pretrained(model, ref_name, is_trainable=False)
+        logger.info("Loaded reference LoRA adapter checkpoint from %s (base=%s).", ref_name, adapter_base_source)
     cfg_obj = getattr(model, "config", None)
     if cfg_obj is not None and getattr(cfg_obj, "use_cache", None):
         cfg_obj.use_cache = False
@@ -1988,6 +2130,209 @@ def _load_reference_model(cfg: RLPostTrainConfig, default_device: str) -> tuple[
     for p in model.parameters():
         p.requires_grad = False
     return model, ref_device
+
+
+def _create_colocated_reference_logprob_batch_fn(
+    cfg: RLPostTrainConfig,
+    policy_model: Any,
+    *,
+    device: str,
+) -> tuple[Callable[[list[tuple[list[int], list[int]]]], list[list[float]]], str]:
+    if not _lora_enabled(cfg):
+        raise RuntimeError("model.reference_runtime=colocate requires model.lora.enabled=true.")
+    disable_adapter = getattr(policy_model, "disable_adapter", None)
+    if not callable(disable_adapter):
+        raise RuntimeError(
+            "model.reference_runtime=colocate requires a PEFT policy model with disable_adapter() support."
+        )
+
+    proxy = _AdapterDisabledReferenceProxy(policy_model)
+    model_device = str(next(policy_model.parameters()).device)
+    micro_batch = max(1, int(cfg.model.reference_logprob_micro_batch_size))
+
+    def _score(items: list[tuple[list[int], list[int]]]) -> list[list[float]]:
+        rows = compute_completion_logprobs_batch(
+            model=proxy,
+            items=items,
+            device=device,
+            micro_batch_size=micro_batch,
+        )
+        return [[float(v) for v in row.tolist()] for row in rows]
+
+    logger.info(
+        "Using colocated reference logprob path from the policy LoRA base (device=%s micro_batch=%s).",
+        model_device,
+        micro_batch,
+    )
+    return _score, model_device
+
+
+def _score_reference_requests_with_batch_fn(
+    *,
+    requests: list[tuple[int, tuple[list[int], list[int]]]],
+    ref_logprob_batch_fn: Callable[[list[tuple[list[int], list[int]]]], list[list[float]]],
+    update_idx: int,
+    source_label: str,
+) -> tuple[dict[int, list[float]], int, int]:
+    if not requests:
+        return {}, 0, 1
+
+    batch_chunk = _env_int("GEMMA27_RL_REF_FILL_CHUNK", default=16, minimum=1)
+    responses_by_idx: dict[int, list[float]] = {}
+    batch_calls = 0
+    cursor = 0
+    while cursor < len(requests):
+        remaining = len(requests) - cursor
+        chunk_size = min(batch_chunk, remaining)
+        chunk = requests[cursor:cursor + chunk_size]
+        try:
+            chunk_rows = ref_logprob_batch_fn([pair for _, pair in chunk])
+            batch_calls += 1
+        except Exception as exc:
+            if chunk_size > 1:
+                batch_chunk = max(1, chunk_size // 2)
+                logger.warning(
+                    "%s failed at update=%s; reducing chunk size to %s and retrying. error=%s",
+                    source_label,
+                    update_idx,
+                    batch_chunk,
+                    exc,
+                )
+                continue
+            bad_idx = chunk[0][0]
+            logger.error(
+                "%s failed for one rollout at update=%s idx=%s; skipping KL for this sample. error=%s",
+                source_label,
+                update_idx,
+                bad_idx,
+                exc,
+            )
+            cursor += 1
+            continue
+
+        if len(chunk_rows) != len(chunk):
+            logger.warning(
+                "%s returned mismatched size at update=%s requested=%s got=%s; retrying with smaller chunks.",
+                source_label,
+                update_idx,
+                len(chunk),
+                len(chunk_rows),
+            )
+            if chunk_size > 1:
+                batch_chunk = max(1, chunk_size // 2)
+                continue
+            cursor += 1
+            continue
+
+        for (rollout_idx, _), row in zip(chunk, chunk_rows):
+            responses_by_idx[rollout_idx] = [float(v) for v in row]
+        cursor += chunk_size
+
+    return responses_by_idx, batch_calls, batch_chunk
+
+
+def _fill_missing_reference_logprobs_distributed_colocate(
+    *,
+    merged_rollouts: list[Rollout] | None,
+    cfg: RLPostTrainConfig,
+    update_idx: int,
+    ref_logprob_batch_fn: Callable[[list[tuple[list[int], list[int]]]], list[list[float]]],
+    rank: int,
+) -> int:
+    if (merged_rollouts is None and _is_rank0()) or (not _reference_kl_enabled(cfg)):
+        return 0
+
+    requests_by_rank: list[list[tuple[int, tuple[list[int], list[int]]]]] | None = None
+    total_missing = 0
+    if _is_rank0():
+        assert merged_rollouts is not None
+        missing_idx = [i for i, rollout in enumerate(merged_rollouts) if rollout.ref_logprobs is None]
+        if missing_idx:
+            for idx in list(missing_idx):
+                if merged_rollouts[idx].completion_token_ids:
+                    continue
+                merged_rollouts[idx].ref_logprobs = []
+            missing_idx = [i for i in missing_idx if merged_rollouts[i].ref_logprobs is None]
+        total_missing = len(missing_idx)
+        requests: list[tuple[int, tuple[list[int], list[int]]]] = [
+            (
+                idx,
+                (
+                    merged_rollouts[idx].prompt_input_ids,
+                    merged_rollouts[idx].completion_token_ids,
+                ),
+            )
+            for idx in missing_idx
+        ]
+        world_size = max(1, _distributed_world_size())
+        requests_by_rank = [[] for _ in range(world_size)]
+        for req_idx, item in enumerate(requests):
+            requests_by_rank[req_idx % world_size].append(item)
+
+    shared_meta: list[Any] = [total_missing if _is_rank0() else 0]
+    _broadcast_object_list(shared_meta, src=0)
+    total_missing = int(shared_meta[0] or 0)
+    local_requests_raw = _scatter_object_from_rank0(requests_by_rank if _is_rank0() else None, rank=rank)
+    local_requests = local_requests_raw if isinstance(local_requests_raw, list) else []
+
+    local_rows, local_batch_calls, local_chunk = _score_reference_requests_with_batch_fn(
+        requests=[
+            (int(idx), (list(prompt_ids), list(completion_ids)))
+            for idx, (prompt_ids, completion_ids) in local_requests
+        ],
+        ref_logprob_batch_fn=ref_logprob_batch_fn,
+        update_idx=update_idx,
+        source_label="Reference colocated score_batch",
+    )
+    gathered = _gather_object_to_rank0(
+        {
+            "rows": local_rows,
+            "batch_calls": int(local_batch_calls),
+            "chunk": int(local_chunk),
+        }
+    )
+
+    if not _is_rank0():
+        return 0
+
+    assert merged_rollouts is not None
+    merged_rows: dict[int, list[float]] = {}
+    batch_calls_total = 0
+    chunk_sizes: list[int] = []
+    for payload in gathered or []:
+        if not isinstance(payload, dict):
+            continue
+        batch_calls_total += int(payload.get("batch_calls", 0) or 0)
+        chunk_raw = int(payload.get("chunk", 0) or 0)
+        if chunk_raw > 0:
+            chunk_sizes.append(chunk_raw)
+        rows_payload = payload.get("rows")
+        if not isinstance(rows_payload, dict):
+            continue
+        for idx_raw, row in rows_payload.items():
+            try:
+                rollout_idx = int(idx_raw)
+            except Exception:
+                continue
+            if isinstance(row, list):
+                merged_rows[rollout_idx] = [float(v) for v in row]
+
+    filled = 0
+    for idx, row in merged_rows.items():
+        if 0 <= idx < len(merged_rollouts):
+            merged_rollouts[idx].ref_logprobs = row
+            filled += 1
+
+    logger.info(
+        "Filled colocated reference logprobs on rank0 for %s/%s gathered rollouts at update=%s "
+        "(distributed batch_calls=%s chunk_candidates=%s).",
+        filled,
+        total_missing,
+        update_idx,
+        batch_calls_total,
+        sorted(set(chunk_sizes)),
+    )
+    return filled
 
 
 def _create_reference_logprob_client(
@@ -2896,8 +3241,9 @@ def _fill_missing_reference_logprobs(
     merged_rollouts: list[Rollout],
     cfg: RLPostTrainConfig,
     update_idx: int,
+    ref_logprob_batch_fn: Callable[[list[tuple[list[int], list[int]]]], list[list[float]]] | None,
     ref_logprob_client: ReferenceLogprobClient | None,
-    ref_model: AutoModelForCausalLM | None,
+    ref_model: Any | None,
     ref_device: str | None,
     device: str,
 ) -> int:
@@ -2922,8 +3268,7 @@ def _fill_missing_reference_logprobs(
     if not missing_idx:
         return 0
 
-    if ref_logprob_client is not None:
-        batch_chunk = _env_int("GEMMA27_RL_REF_FILL_CHUNK", default=16, minimum=1)
+    if ref_logprob_batch_fn is not None or ref_logprob_client is not None:
         requests: list[tuple[int, tuple[list[int], list[int]]]] = [
             (
                 i,
@@ -2934,52 +3279,17 @@ def _fill_missing_reference_logprobs(
             )
             for i in missing_idx
         ]
-        responses_by_idx: dict[int, list[float]] = {}
-        batch_calls = 0
-        cursor = 0
-        while cursor < len(requests):
-            remaining = len(requests) - cursor
-            chunk_size = min(batch_chunk, remaining)
-            chunk = requests[cursor:cursor + chunk_size]
-            try:
-                chunk_rows = ref_logprob_client.score_logprobs_batch([pair for _, pair in chunk])
-                batch_calls += 1
-            except Exception as exc:
-                if chunk_size > 1:
-                    batch_chunk = max(1, chunk_size // 2)
-                    logger.warning(
-                        "Reference score_batch failed at update=%s; reducing chunk size to %s and retrying. error=%s",
-                        update_idx,
-                        batch_chunk,
-                        exc,
-                    )
-                    continue
-                bad_idx = chunk[0][0]
-                logger.error(
-                    "Reference score failed for one rollout at update=%s idx=%s; skipping KL for this sample. error=%s",
-                    update_idx,
-                    bad_idx,
-                    exc,
-                )
-                cursor += 1
-                continue
-
-            if len(chunk_rows) != len(chunk):
-                logger.warning(
-                    "reference score_batch returned mismatched size at update=%s requested=%s got=%s; retrying with smaller chunks.",
-                    update_idx,
-                    len(chunk),
-                    len(chunk_rows),
-                )
-                if chunk_size > 1:
-                    batch_chunk = max(1, chunk_size // 2)
-                    continue
-                cursor += 1
-                continue
-
-            for (rollout_idx, _), row in zip(chunk, chunk_rows):
-                responses_by_idx[rollout_idx] = [float(v) for v in row]
-            cursor += chunk_size
+        source_label = "Reference colocated score_batch" if ref_logprob_batch_fn is not None else "Reference worker score_batch"
+        responses_by_idx, batch_calls, batch_chunk = _score_reference_requests_with_batch_fn(
+            requests=requests,
+            ref_logprob_batch_fn=(
+                ref_logprob_batch_fn
+                if ref_logprob_batch_fn is not None
+                else (lambda items: ref_logprob_client.score_logprobs_batch(items))  # type: ignore[union-attr]
+            ),
+            update_idx=update_idx,
+            source_label=source_label,
+        )
 
         filled = 0
         for idx in missing_idx:
@@ -2990,10 +3300,12 @@ def _fill_missing_reference_logprobs(
             filled += 1
 
         logger.info(
-            "Filled reference logprobs on rank0 for %s/%s gathered rollouts at update=%s (batch_calls=%s chunk=%s).",
+            "Filled reference logprobs on rank0 for %s/%s gathered rollouts at update=%s "
+            "(source=%s batch_calls=%s chunk=%s).",
             filled,
             len(missing_idx),
             update_idx,
+            "colocate" if ref_logprob_batch_fn is not None else "worker",
             batch_calls,
             batch_chunk,
         )
@@ -3083,6 +3395,7 @@ def _save_deepspeed_checkpoint(
     update_idx: int,
     engine: Any,
     tokenizer,
+    hf_model: AutoModelForCausalLM | None = None,
     trainer_state: dict[str, Any] | None = None,
 ) -> Path:
     ckpt_dir = output_dir / f"checkpoint-{update_idx}"
@@ -3090,6 +3403,7 @@ def _save_deepspeed_checkpoint(
         ckpt_dir=ckpt_dir,
         engine=engine,
         tokenizer=tokenizer,
+        hf_model=hf_model,
         trainer_state=trainer_state,
     )
 
@@ -3119,6 +3433,7 @@ def _save_deepspeed_resume_checkpoint(
     update_idx: int,
     engine: Any,
     tokenizer,
+    hf_model: AutoModelForCausalLM | None = None,
     trainer_state: dict[str, Any] | None = None,
 ) -> Path:
     ckpt_dir = output_dir / "resume_latest"
@@ -3128,6 +3443,7 @@ def _save_deepspeed_resume_checkpoint(
         ckpt_dir=ckpt_dir,
         engine=engine,
         tokenizer=tokenizer,
+        hf_model=hf_model,
         trainer_state=state,
     )
 
@@ -3322,9 +3638,7 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
     if tokenizer.pad_token is None and tokenizer.eos_token is not None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    resume_has_hf_artifacts = bool(
-        resume_ckpt is not None and resume_ckpt.is_dir() and (resume_ckpt / "config.json").exists()
-    )
+    resume_has_hf_artifacts = _checkpoint_has_model_artifacts(resume_ckpt)
     if use_deepspeed:
         # Prefer resume dir as model init when it includes HF artifacts (e.g., `best`).
         # Optimizer/lr states are still restored through DeepSpeed shards when present.
@@ -3364,14 +3678,21 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
     ref_model: AutoModelForCausalLM | None = None
     ref_device: str | None = None
     ref_logprob_client: ReferenceLogprobClient | None = None
+    ref_logprob_batch_fn: Callable[[list[tuple[list[int], list[int]]]], list[list[float]]] | None = None
     reference_kl_enabled = _reference_kl_enabled(cfg)
+    reference_runtime = str(cfg.model.reference_runtime or "worker").strip().lower()
     if rank0 and (float(cfg.rl.kl_coef) > 0.0) and (not reference_kl_enabled):
         logger.info(
             "Reference model is disabled (model.use_reference_model=false); KL-to-reference term will be skipped."
         )
-    if (not use_deepspeed) or rank0:
+    if reference_kl_enabled and reference_runtime == "colocate":
+        ref_logprob_batch_fn, ref_device = _create_colocated_reference_logprob_batch_fn(
+            cfg,
+            policy_eval_model,
+            device=device,
+        )
+    elif (not use_deepspeed) or rank0:
         if reference_kl_enabled:
-            reference_runtime = str(cfg.model.reference_runtime or "worker").strip().lower()
             if reference_runtime == "worker":
                 ref_logprob_client, ref_device = _create_reference_logprob_client(cfg, default_device=device)
             elif reference_runtime == "cpu":
@@ -3849,8 +4170,10 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
             gathered_rollouts = _gather_object_to_rank0(local_rollouts)
             per_rank_payload: list[Any] | None = None
             shared_stats: list[Any] = [reward_stats if rank0 else {}, adv_stats if rank0 else {}]
+            per_rank_rollouts: list[list[Rollout]] = []
+            merged_rollouts: list[Rollout] = []
+            merged_advantages: list[list[float]] = []
             if rank0:
-                per_rank_rollouts: list[list[Rollout]] = []
                 for shard_idx in range(world_size):
                     shard_rollouts: list[Rollout] = []
                     if gathered_rollouts is not None and shard_idx < len(gathered_rollouts):
@@ -3859,15 +4182,41 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
                             shard_rollouts = [r for r in raw_shard if isinstance(r, Rollout)]
                     per_rank_rollouts.append(shard_rollouts)
 
-                merged_rollouts: list[Rollout] = []
                 for shard_rollouts in per_rank_rollouts:
                     merged_rollouts.extend(shard_rollouts)
 
-                merged_advantages: list[list[float]] = []
                 if merged_rollouts:
-                    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="rank0-step") as step_executor:
-                        reward_future = step_executor.submit(
-                            _prepare_rewards_and_advantages,
+                    if reference_kl_enabled and ref_logprob_batch_fn is None:
+                        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="rank0-step") as step_executor:
+                            reward_future = step_executor.submit(
+                                _prepare_rewards_and_advantages,
+                                rollouts=merged_rollouts,
+                                cfg=cfg,
+                                metricx_scorer=metricx_scorer,
+                                xcomet_scorer=xcomet_scorer,
+                                mqm_scorer=mqm_scorer,
+                                esa_scorer=esa_scorer,
+                                metricx_cache=metricx_cache,
+                                xcomet_cache=xcomet_cache,
+                                mqm_cache=mqm_cache,
+                                esa_cache=esa_cache,
+                                tokenizer=tokenizer,
+                            )
+                            ref_fill_future = step_executor.submit(
+                                _fill_missing_reference_logprobs,
+                                merged_rollouts=merged_rollouts,
+                                cfg=cfg,
+                                update_idx=update_idx,
+                                ref_logprob_batch_fn=ref_logprob_batch_fn,
+                                ref_logprob_client=ref_logprob_client,
+                                ref_model=ref_model,
+                                ref_device=ref_device,
+                                device=device,
+                            )
+                            merged_advantages, reward_stats, adv_stats = reward_future.result()
+                            ref_fill_future.result()
+                    else:
+                        merged_advantages, reward_stats, adv_stats = _prepare_rewards_and_advantages(
                             rollouts=merged_rollouts,
                             cfg=cfg,
                             metricx_scorer=metricx_scorer,
@@ -3880,24 +4229,19 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
                             esa_cache=esa_cache,
                             tokenizer=tokenizer,
                         )
-                        ref_fill_future = None
-                        if reference_kl_enabled:
-                            ref_fill_future = step_executor.submit(
-                                _fill_missing_reference_logprobs,
-                                merged_rollouts=merged_rollouts,
-                                cfg=cfg,
-                                update_idx=update_idx,
-                                ref_logprob_client=ref_logprob_client,
-                                ref_model=ref_model,
-                                ref_device=ref_device,
-                                device=device,
-                            )
-                        merged_advantages, reward_stats, adv_stats = reward_future.result()
-                        if ref_fill_future is not None:
-                            ref_fill_future.result()
                 else:
                     logger.warning("No rollouts generated at update=%s; skipping step.", update_idx)
 
+            if reference_kl_enabled and ref_logprob_batch_fn is not None:
+                _ = _fill_missing_reference_logprobs_distributed_colocate(
+                    merged_rollouts=merged_rollouts if rank0 else None,
+                    cfg=cfg,
+                    update_idx=update_idx,
+                    ref_logprob_batch_fn=ref_logprob_batch_fn,
+                    rank=rank,
+                )
+
+            if rank0:
                 shard_sizes = [len(shard) for shard in per_rank_rollouts]
                 can_shard_update = (
                     bool(merged_rollouts)
@@ -4000,6 +4344,7 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
                         merged_rollouts=rollouts,
                         cfg=cfg,
                         update_idx=update_idx,
+                        ref_logprob_batch_fn=ref_logprob_batch_fn,
                         ref_logprob_client=ref_logprob_client,
                         ref_model=ref_model,
                         ref_device=ref_device,
@@ -4086,12 +4431,14 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
             keep_recent_n = int(cfg.logging.keep_last_n_checkpoints)
             save_periodic_checkpoint = bool(keep_recent_n > 0 or (not cfg.logging.save_only_best))
             if use_deepspeed:
+                hf_checkpoint_model = policy_eval_model if _lora_enabled(cfg) else None
                 if save_periodic_checkpoint:
                     ckpt = _save_deepspeed_checkpoint(
                         output_dir=output_dir,
                         update_idx=update_idx,
                         engine=train_model,
                         tokenizer=tokenizer,
+                        hf_model=hf_checkpoint_model,
                         trainer_state=trainer_state_payload,
                     )
                     if rank0:
@@ -4116,6 +4463,7 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
                         update_idx=update_idx,
                         engine=train_model,
                         tokenizer=tokenizer,
+                        hf_model=hf_checkpoint_model,
                         trainer_state=trainer_state_payload,
                     )
                     if rank0:

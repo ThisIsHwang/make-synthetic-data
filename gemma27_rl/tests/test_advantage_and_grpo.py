@@ -27,6 +27,43 @@ class TinyCausalLM(nn.Module):
         return SimpleNamespace(logits=logits)
 
 
+class WrappedTinyCausalLM(nn.Module):
+    def __init__(self, vocab_size: int = 32, hidden_size: int = 16):
+        super().__init__()
+        self.inner = TinyCausalLM(vocab_size=vocab_size, hidden_size=hidden_size)
+
+    def forward(self, input_ids, attention_mask=None):
+        return self.inner(input_ids, attention_mask=attention_mask)
+
+
+class TinyCausalLMWithPosition(nn.Module):
+    def __init__(self, vocab_size: int = 32, hidden_size: int = 16, max_positions: int = 64):
+        super().__init__()
+        self.pos_emb = nn.Embedding(max_positions, hidden_size)
+        self.emb = nn.Embedding(vocab_size, hidden_size)
+        self.proj = nn.Linear(hidden_size, vocab_size)
+
+    def forward(self, input_ids, attention_mask=None):
+        del attention_mask
+        positions = torch.arange(input_ids.shape[1], device=input_ids.device)
+        x = self.emb(input_ids) + self.pos_emb(positions).unsqueeze(0)
+        logits = self.proj(x)
+        return SimpleNamespace(logits=logits)
+
+
+class WrappedTinyCausalLMWithPosition(nn.Module):
+    def __init__(self, vocab_size: int = 32, hidden_size: int = 16, max_positions: int = 64):
+        super().__init__()
+        self.inner = TinyCausalLMWithPosition(
+            vocab_size=vocab_size,
+            hidden_size=hidden_size,
+            max_positions=max_positions,
+        )
+
+    def forward(self, input_ids, attention_mask=None):
+        return self.inner(input_ids, attention_mask=attention_mask)
+
+
 def test_advantage_normalization_mean_std() -> None:
     normalized, stats = normalize_advantages([[1.0, 2.0], [3.0]], eps=1e-8)
     flat = [v for row in normalized for v in row]
@@ -97,5 +134,27 @@ def test_compute_completion_logprobs_batch_rejects_out_of_vocab_token_ids() -> N
         _ = compute_completion_logprobs_batch(
             model=model,
             items=[([1, 2], [3]), ([4], [10])],
+            device="cpu",
+        )
+
+
+def test_compute_completion_logprobs_rejects_out_of_vocab_token_ids_for_wrapped_model() -> None:
+    model = WrappedTinyCausalLM(vocab_size=8, hidden_size=8)
+    with pytest.raises(ValueError, match="token id out of range"):
+        _ = compute_completion_logprobs(
+            model=model,
+            prompt_input_ids=[1, 2, 9],
+            completion_token_ids=[3],
+            device="cpu",
+        )
+
+
+def test_compute_completion_logprobs_rejects_out_of_vocab_token_ids_for_wrapped_model_with_position_embedding() -> None:
+    model = WrappedTinyCausalLMWithPosition(vocab_size=8, hidden_size=8, max_positions=64)
+    with pytest.raises(ValueError, match="token id out of range"):
+        _ = compute_completion_logprobs(
+            model=model,
+            prompt_input_ids=[1, 2, 9],
+            completion_token_ids=[3],
             device="cpu",
         )

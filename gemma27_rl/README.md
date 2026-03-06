@@ -35,12 +35,16 @@ uv pip install -e .
 
 기본 예시: `configs/train_toy.yaml`
 WMT24pp 빠른 테스트 예시: `configs/train_wmt24pp_enko_toy.yaml`
+27B LoRA + colocated reference 예시: `configs/train_27b_8gpu_lora_colocate.yaml`
 Qwen3.5 + MQM 전용 예시: `configs/qwen35_mqm/`
 
 핵심값:
 - `model.policy_name_or_path`: SFT 결과 체크포인트 경로
 - `model.policy_gpu_ids`: policy 모델에 할당할 GPU 인덱스 목록 (예: `[0,1,2]`)
 - `model.reference_gpu_ids`: reference 모델에 할당할 GPU 인덱스 목록 (예: `[3,4,5]`)
+- `model.lora.*`: 27B 같은 대형 모델을 adapter-only로 RL 업데이트할 때 사용
+- `model.reference_runtime`: `worker|in_process|cpu|colocate`
+  - `colocate`: LoRA policy의 adapter를 잠시 끄고 같은 policy base로 reference logprob를 계산
 - `data.train_file`: RL 학습용 JSONL/JSON/Parquet
 - 또는 `data.hf_dataset_name` + `data.hf_dataset_config_name` + `data.hf_train_split`
 - SFT eval set을 쓰려면 `data.eval_file`(권장) 또는 `data.hf_eval_split`을
@@ -80,6 +84,9 @@ GPU 배치(명시적 8-GPU 분할):
 - `device_map=auto` 경로는 비활성화되어 있습니다.
 - policy를 여러 GPU에 올리려면 `rl.backend: deepspeed`를 사용하고 `deepspeed` launcher로 실행하세요.
 - reference 모델은 단일 GPU(`reference_gpu_ids` 첫 번째)만 사용합니다.
+- 단, `model.reference_runtime: colocate` + `model.lora.enabled: true`면 별도 reference 모델을 띄우지 않고
+  policy LoRA base를 그대로 reference로 재사용합니다. 이 경우 `policy_gpu_ids: [0..7]`로 8 GPU 전체를 policy에 줄 수 있습니다.
+- 위 colocate 모드에서는 로컬 8 GPU를 policy가 모두 쓰므로 MetricX/XCOMET은 aux host로 빼거나 비활성화해야 합니다.
 - MetricX/XCOMET은 `reward.metricx.device`, `reward.xcomet.device`로 단일 GPU를 직접 지정하세요.
 - 예시(6/1/1): `policy=[0,1,2,3,4,5]`, `reference=[6]`, `metricx=cuda:7`.
 
