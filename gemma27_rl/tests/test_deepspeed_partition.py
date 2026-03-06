@@ -11,7 +11,11 @@ from torch import nn
 
 from gemma27_rl.config import RLPostTrainConfig
 from gemma27_rl import trainer as trainer_mod
-from gemma27_rl.trainer import _configure_nccl_heartbeat_timeout, _validate_deepspeed_partition_strict
+from gemma27_rl.trainer import (
+    _configure_nccl_heartbeat_timeout,
+    _register_qwen35_zero3_external_parameters,
+    _validate_deepspeed_partition_strict,
+)
 
 
 def _base_cfg() -> RLPostTrainConfig:
@@ -208,3 +212,53 @@ def test_create_colocated_reference_logprob_batch_fn_scores_without_name_error()
     assert len(rows) == 2
     assert len(rows[0]) == 1
     assert len(rows[1]) == 2
+
+
+class Qwen3_5GatedDeltaNet(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.conv1d = nn.Conv1d(4, 4, kernel_size=3, groups=4, bias=False)
+
+
+class _FakeQwen35PolicyModel(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.block = Qwen3_5GatedDeltaNet()
+        self.other = nn.Linear(4, 4)
+
+
+def test_register_qwen35_zero3_external_parameters_registers_conv_weight(monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = _base_cfg()
+    cfg.rl.deepspeed_zero_stage = 3
+
+    captured: list[tuple[nn.Module, torch.nn.Parameter]] = []
+
+    class _FakeZero:
+        @staticmethod
+        def register_external_parameter(module: nn.Module, parameter: torch.nn.Parameter) -> None:
+            captured.append((module, parameter))
+
+    monkeypatch.setattr(trainer_mod, "deepspeed", SimpleNamespace(zero=_FakeZero()))
+
+    model = _FakeQwen35PolicyModel()
+    _register_qwen35_zero3_external_parameters(model, cfg)
+
+    assert captured == [(model.block, model.block.conv1d.weight)]
+
+
+def test_register_qwen35_zero3_external_parameters_skips_non_zero3(monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = _base_cfg()
+    cfg.rl.deepspeed_zero_stage = 2
+
+    captured: list[tuple[nn.Module, torch.nn.Parameter]] = []
+
+    class _FakeZero:
+        @staticmethod
+        def register_external_parameter(module: nn.Module, parameter: torch.nn.Parameter) -> None:
+            captured.append((module, parameter))
+
+    monkeypatch.setattr(trainer_mod, "deepspeed", SimpleNamespace(zero=_FakeZero()))
+
+    _register_qwen35_zero3_external_parameters(_FakeQwen35PolicyModel(), cfg)
+
+    assert captured == []

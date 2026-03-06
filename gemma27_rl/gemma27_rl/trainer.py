@@ -1010,6 +1010,7 @@ class ReferenceLogprobClient:
         cmd = build_worker_launch_command(
             python_executable=self._python_executable,
             worker_script=self._worker_script,
+            worker_module="gemma27_rl.reference_worker",
             remote_host=self._remote_host or None,
             remote_workdir=self._remote_workdir,
             remote_env=self._env_overrides if self._remote_host else None,
@@ -2012,6 +2013,38 @@ def _load_causal_lm(
     )
 
 
+def _register_qwen35_zero3_external_parameters(model: Any, cfg: RLPostTrainConfig) -> None:
+    if str(cfg.rl.backend).strip().lower() != "deepspeed":
+        return
+    if int(cfg.rl.deepspeed_zero_stage) != 3:
+        return
+    if deepspeed is None:
+        return
+    zero = getattr(deepspeed, "zero", None)
+    register_external_parameter = getattr(zero, "register_external_parameter", None)
+    if not callable(register_external_parameter):
+        return
+
+    registered = 0
+    for module in model.modules():
+        conv1d = getattr(module, "conv1d", None)
+        if type(module).__name__ != "Qwen3_5GatedDeltaNet":
+            continue
+        weight = getattr(conv1d, "weight", None)
+        if isinstance(weight, torch.nn.Parameter):
+            register_external_parameter(module, weight)
+            registered += 1
+        bias = getattr(conv1d, "bias", None)
+        if isinstance(bias, torch.nn.Parameter):
+            register_external_parameter(module, bias)
+            registered += 1
+    if registered:
+        logger.info(
+            "Registered %s external parameter(s) for Qwen3.5 gated-delta conv1d under DeepSpeed ZeRO-3.",
+            registered,
+        )
+
+
 def _load_policy_model(
     cfg: RLPostTrainConfig,
     device: str,
@@ -2065,6 +2098,8 @@ def _load_policy_model(
             cfg.model.lora.dropout,
             [str(name) for name in cfg.model.lora.target_modules],
         )
+
+    _register_qwen35_zero3_external_parameters(model, cfg)
 
     if _lora_enabled(cfg):
         enable_input_require_grads = getattr(model, "enable_input_require_grads", None)

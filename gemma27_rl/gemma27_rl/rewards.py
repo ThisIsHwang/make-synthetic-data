@@ -111,6 +111,7 @@ class _ScorerSubprocessClient:
         cmd = build_worker_launch_command(
             python_executable=python_executable,
             worker_script=worker_script,
+            worker_module="gemma27_rl.scorer_worker",
             worker_args=["--backend", backend],
             remote_host=self._remote_host or None,
             remote_workdir=remote_workdir,

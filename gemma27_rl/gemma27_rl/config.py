@@ -366,6 +366,38 @@ def _resolve_command_or_path(value: str | None, base_dir: Path) -> str | None:
     return os.path.abspath(str(base_dir / path))
 
 
+def _resolve_remote_command_or_path(value: str | None, base_dir: Path) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return value
+    if "/" not in text and "\\" not in text and not text.startswith(".") and not text.startswith("~"):
+        return text
+    if text.startswith("~"):
+        return text
+    path = Path(text)
+    if path.is_absolute():
+        return text
+
+    project_root: Path | None = None
+    for parent in (base_dir, *base_dir.parents):
+        if (parent / "pyproject.toml").exists() or (parent / "requirements.txt").exists():
+            project_root = parent
+            break
+        if parent.name == "configs":
+            project_root = parent.parent
+            break
+
+    local_path = (base_dir / path).resolve()
+    if project_root is None:
+        return text
+    try:
+        return local_path.relative_to(project_root).as_posix()
+    except ValueError:
+        return text
+
+
 def _resolve_model_name_or_path(value: str | None, base_dir: Path) -> str | None:
     if value is None:
         return None
@@ -712,16 +744,31 @@ def load_config(path: str | Path) -> RLPostTrainConfig:
     cfg.logging.output_dir = _resolve_optional_path(cfg.logging.output_dir, base_dir) or cfg.logging.output_dir
     cfg.logging.resume_from_checkpoint = _resolve_optional_path(cfg.logging.resume_from_checkpoint, base_dir)
     cfg.misc.huggingface_cache_dir = _resolve_optional_path(cfg.misc.huggingface_cache_dir, base_dir)
-    cfg.misc.aux_worker_remote_workdir = _resolve_optional_path(cfg.misc.aux_worker_remote_workdir, base_dir)
     cfg.rl.deepspeed_config_path = _resolve_optional_path(cfg.rl.deepspeed_config_path, base_dir)
-    cfg.model.reference_worker_remote_workdir = _resolve_optional_path(
-        cfg.model.reference_worker_remote_workdir, base_dir
+    cfg.misc.aux_worker_remote_workdir = _normalize_optional_text(cfg.misc.aux_worker_remote_workdir)
+    cfg.model.reference_worker_remote_workdir = _normalize_optional_text(cfg.model.reference_worker_remote_workdir)
+    cfg.reward.metricx.worker_remote_workdir = _normalize_optional_text(cfg.reward.metricx.worker_remote_workdir)
+    cfg.reward.xcomet.worker_remote_workdir = _normalize_optional_text(cfg.reward.xcomet.worker_remote_workdir)
+
+    reference_remote_host = _effective_worker_host(cfg.model.reference_worker_host, cfg.misc.aux_worker_host)
+    metricx_remote_host = _effective_worker_host(cfg.reward.metricx.worker_host, cfg.misc.aux_worker_host)
+    xcomet_remote_host = _effective_worker_host(cfg.reward.xcomet.worker_host, cfg.misc.aux_worker_host)
+
+    cfg.reward.metricx.python_executable = (
+        _resolve_remote_command_or_path(cfg.reward.metricx.python_executable, base_dir)
+        if metricx_remote_host is not None
+        else _resolve_command_or_path(cfg.reward.metricx.python_executable, base_dir)
     )
-    cfg.reward.metricx.worker_remote_workdir = _resolve_optional_path(cfg.reward.metricx.worker_remote_workdir, base_dir)
-    cfg.reward.xcomet.worker_remote_workdir = _resolve_optional_path(cfg.reward.xcomet.worker_remote_workdir, base_dir)
-    cfg.reward.metricx.python_executable = _resolve_command_or_path(cfg.reward.metricx.python_executable, base_dir)
-    cfg.reward.xcomet.python_executable = _resolve_command_or_path(cfg.reward.xcomet.python_executable, base_dir)
-    cfg.model.reference_python_executable = _resolve_command_or_path(cfg.model.reference_python_executable, base_dir)
+    cfg.reward.xcomet.python_executable = (
+        _resolve_remote_command_or_path(cfg.reward.xcomet.python_executable, base_dir)
+        if xcomet_remote_host is not None
+        else _resolve_command_or_path(cfg.reward.xcomet.python_executable, base_dir)
+    )
+    cfg.model.reference_python_executable = (
+        _resolve_remote_command_or_path(cfg.model.reference_python_executable, base_dir)
+        if reference_remote_host is not None
+        else _resolve_command_or_path(cfg.model.reference_python_executable, base_dir)
+    )
 
     _validate_config(cfg)
     return cfg

@@ -162,11 +162,21 @@ def build_worker_launch_command(
     *,
     python_executable: str,
     worker_script: str | Path,
+    worker_module: str | None = None,
     worker_args: list[str] | None = None,
     remote_host: str | None = None,
     remote_workdir: str | None = None,
     remote_env: dict[str, str] | None = None,
 ) -> list[str]:
+    def _quote_remote_token(text: str, *, preserve_tilde: bool = False) -> str:
+        raw = str(text)
+        if preserve_tilde and raw.startswith("~"):
+            head, sep, tail = raw.partition("/")
+            if not sep:
+                return head
+            return head + "/" + shlex.quote(tail)
+        return shlex.quote(raw)
+
     script_path = str(worker_script)
     args = [str(v) for v in (worker_args or [])]
     host = str(remote_host).strip() if remote_host else ""
@@ -176,7 +186,7 @@ def build_worker_launch_command(
     parts: list[str] = []
     workdir = str(remote_workdir).strip() if remote_workdir else ""
     if workdir:
-        parts.append(f"cd {shlex.quote(workdir)}")
+        parts.append(f"cd {_quote_remote_token(workdir, preserve_tilde=True)}")
         parts.append("&&")
 
     if remote_env:
@@ -188,8 +198,12 @@ def build_worker_launch_command(
             parts.append(" ".join(env_tokens))
 
     parts.append("exec")
-    parts.append(shlex.quote(str(python_executable)))
-    parts.append(shlex.quote(script_path))
+    parts.append(_quote_remote_token(str(python_executable), preserve_tilde=True))
+    if worker_module:
+        parts.append("-m")
+        parts.append(shlex.quote(str(worker_module)))
+    else:
+        parts.append(shlex.quote(script_path))
     parts.extend(shlex.quote(arg) for arg in args)
     remote_cmd = " ".join(parts)
     # Avoid interactive SSH prompts (host key/password) that can block worker init indefinitely.

@@ -42,6 +42,69 @@ def test_python_executable_resolution_preserves_venv_symlink(tmp_path: Path) -> 
     assert cfg.reward.metricx.python_executable == str(venv_python)
 
 
+def test_remote_worker_paths_preserve_remote_home_expressions(tmp_path: Path) -> None:
+    cfg_path = tmp_path / "train.yaml"
+    cfg_path.write_text(
+        "\n".join(
+            [
+                "data:",
+                "  hf_dataset_name: dummy/dataset",
+                "misc:",
+                "  aux_worker_host: aux-node-1",
+                "  aux_worker_remote_workdir: ~/rl_project",
+                "reward:",
+                "  metricx:",
+                "    python_executable: ~/venv_metricx/bin/python",
+                "  xcomet:",
+                "    enabled: false",
+                "  mqm:",
+                "    enabled: false",
+                "  esa:",
+                "    enabled: false",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    cfg = load_config(cfg_path)
+    assert cfg.misc.aux_worker_remote_workdir == "~/rl_project"
+    assert cfg.reward.metricx.python_executable == "~/venv_metricx/bin/python"
+
+
+def test_remote_python_executable_resolution_becomes_project_relative(tmp_path: Path) -> None:
+    project_root = tmp_path / "project"
+    config_dir = project_root / "configs" / "exp"
+    config_dir.mkdir(parents=True)
+
+    cfg_path = config_dir / "train.yaml"
+    cfg_path.write_text(
+        "\n".join(
+            [
+                "data:",
+                "  hf_dataset_name: dummy/dataset",
+                "misc:",
+                "  aux_worker_host: aux-node-1",
+                "  aux_worker_remote_workdir: /remote/repo",
+                "reward:",
+                "  metricx:",
+                "    python_executable: ../../.venv_metricx/bin/python",
+                "  xcomet:",
+                "    enabled: false",
+                "  mqm:",
+                "    enabled: false",
+                "  esa:",
+                "    enabled: false",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    cfg = load_config(cfg_path)
+    assert cfg.reward.metricx.python_executable == ".venv_metricx/bin/python"
+
+
 def test_keep_last_n_checkpoints_must_be_non_negative(tmp_path: Path) -> None:
     cfg_path = tmp_path / "train.yaml"
     cfg_path.write_text(
