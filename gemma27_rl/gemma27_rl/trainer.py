@@ -26,12 +26,13 @@ except Exception:  # pragma: no cover - optional dependency
     deepspeed = None  # type: ignore[assignment]
 
 try:
-    from peft import LoraConfig, PeftModel, TaskType, get_peft_model
+    from peft import LoraConfig, PeftModel, TaskType, get_peft_model, get_peft_model_state_dict
 except Exception:  # pragma: no cover - optional dependency
     LoraConfig = None  # type: ignore[assignment]
     PeftModel = None  # type: ignore[assignment]
     TaskType = None  # type: ignore[assignment]
     get_peft_model = None  # type: ignore[assignment]
+    get_peft_model_state_dict = None  # type: ignore[assignment]
 
 from .advantage import (
     apply_group_relative_advantage,
@@ -2086,8 +2087,28 @@ def _load_policy_model(
     )
     if adapter_base_source is not None:
         _require_peft_for_lora()
-        model = PeftModel.from_pretrained(model, source, is_trainable=True)
-        logger.info("Loaded policy LoRA adapter checkpoint from %s (base=%s).", source, adapter_base_source)
+        try:
+            model = PeftModel.from_pretrained(model, source, is_trainable=True)
+            logger.info("Loaded policy LoRA adapter checkpoint from %s (base=%s).", source, adapter_base_source)
+        except Exception as exc:
+            source_path = Path(str(source)).expanduser()
+            text = str(exc)
+            can_fallback_to_deepspeed_resume = (
+                str(cfg.rl.backend).strip().lower() == "deepspeed"
+                and _is_deepspeed_checkpoint_dir(source_path)
+                and _lora_enabled(cfg)
+                and (("size mismatch" in text) or ("torch.Size([0])" in text))
+            )
+            if not can_fallback_to_deepspeed_resume:
+                raise
+            logger.warning(
+                "LoRA adapter artifacts at %s appear invalid for resume (%s). "
+                "Falling back to fresh adapter init from base model %s and relying on DeepSpeed shards.",
+                source,
+                text or type(exc).__name__,
+                adapter_base_source,
+            )
+            model = get_peft_model(model, _build_lora_config(cfg))
     elif _lora_enabled(cfg):
         _require_peft_for_lora()
         model = get_peft_model(model, _build_lora_config(cfg))
@@ -3383,6 +3404,46 @@ def _save_checkpoint_to_dir(
     return ckpt_dir
 
 
+def _build_zero3_peft_state_dict(model: Any) -> dict[str, Any] | None:
+    if PeftModel is None or get_peft_model_state_dict is None:
+        return None
+    if not isinstance(model, PeftModel):
+        return None
+    if deepspeed is None or _distributed_world_size() <= 1:
+        return None
+    zero = getattr(deepspeed, "zero", None)
+    gathered_parameters = getattr(zero, "GatheredParameters", None)
+    if gathered_parameters is None:
+        return None
+
+    params_to_gather = [param for param in model.parameters() if param.requires_grad]
+    if not params_to_gather:
+        return None
+
+    with gathered_parameters(params_to_gather, modifier_rank=0):
+        if not _is_rank0():
+            return None
+        state_dict = get_peft_model_state_dict(model, state_dict=model.state_dict())
+        out: dict[str, Any] = {}
+        for key, value in state_dict.items():
+            if torch.is_tensor(value):
+                out[key] = value.detach().cpu().clone()
+            else:
+                out[key] = value
+        return out
+
+
+def _save_pretrained_model(model: Any, output_dir: Path) -> None:
+    zero3_state_dict = _build_zero3_peft_state_dict(model)
+    _dist_barrier()
+    if _is_rank0():
+        if zero3_state_dict is None:
+            model.save_pretrained(output_dir)
+        else:
+            model.save_pretrained(output_dir, state_dict=zero3_state_dict)
+    _dist_barrier()
+
+
 def _save_deepspeed_checkpoint_to_dir(
     ckpt_dir: Path,
     engine: Any,
@@ -3397,9 +3458,9 @@ def _save_deepspeed_checkpoint_to_dir(
     _dist_barrier()
     engine.save_checkpoint(str(ckpt_dir), tag="state")
     _dist_barrier()
+    if hf_model is not None:
+        _save_pretrained_model(hf_model, ckpt_dir)
     if _is_rank0():
-        if hf_model is not None:
-            hf_model.save_pretrained(ckpt_dir)
         tokenizer.save_pretrained(ckpt_dir)
         if trainer_state:
             _save_trainer_state(ckpt_dir, trainer_state)
@@ -4588,16 +4649,25 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
     if async_json_writer is not None:
         async_json_writer.flush()
 
-    if (not use_deepspeed) or rank0:
-        final_dir = output_dir / "final"
-        if final_dir.exists():
-            shutil.rmtree(final_dir)
-        if best_eval_update is not None and best_dir.exists():
+    final_dir = output_dir / "final"
+    if rank0 and final_dir.exists():
+        shutil.rmtree(final_dir)
+    _dist_barrier()
+    if best_eval_update is not None and best_dir.exists():
+        if rank0:
             shutil.copytree(best_dir, final_dir)
-        else:
+    else:
+        if rank0:
             final_dir.mkdir(parents=True, exist_ok=True)
+        _dist_barrier()
+        if use_deepspeed:
+            _save_pretrained_model(policy_eval_model, final_dir)
+            if rank0:
+                tokenizer.save_pretrained(final_dir)
+        elif rank0:
             policy_eval_model.save_pretrained(final_dir)
             tokenizer.save_pretrained(final_dir)
+    if (not use_deepspeed) or rank0:
         artifacts["final_model_dir"] = str(final_dir)
         artifacts["best_model_dir"] = str(best_dir) if best_eval_update is not None and best_dir.exists() else None
         artifacts["best_eval_update"] = best_eval_update

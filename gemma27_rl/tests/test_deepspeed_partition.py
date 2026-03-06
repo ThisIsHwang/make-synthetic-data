@@ -12,8 +12,10 @@ from torch import nn
 from gemma27_rl.config import RLPostTrainConfig
 from gemma27_rl import trainer as trainer_mod
 from gemma27_rl.trainer import (
+    _build_zero3_peft_state_dict,
     _configure_nccl_heartbeat_timeout,
     _register_qwen35_zero3_external_parameters,
+    _load_policy_model,
     _validate_deepspeed_partition_strict,
 )
 
@@ -262,3 +264,94 @@ def test_register_qwen35_zero3_external_parameters_skips_non_zero3(monkeypatch: 
     _register_qwen35_zero3_external_parameters(_FakeQwen35PolicyModel(), cfg)
 
     assert captured == []
+
+
+class _FakePeftModelBase(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.lora = nn.Parameter(torch.ones(2, 3))
+        self.base = nn.Parameter(torch.zeros(4, 5), requires_grad=False)
+
+
+def test_build_zero3_peft_state_dict_gathers_trainable_params(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+
+    class _FakeGatheredParameters:
+        def __init__(self, params, modifier_rank=0):  # type: ignore[no-untyped-def]
+            captured["params"] = list(params)
+            captured["modifier_rank"] = modifier_rank
+
+        def __enter__(self):  # type: ignore[no-untyped-def]
+            captured["entered"] = True
+            return self
+
+        def __exit__(self, exc_type, exc, tb):  # type: ignore[no-untyped-def]
+            captured["exited"] = True
+            return False
+
+    monkeypatch.setattr(trainer_mod, "PeftModel", _FakePeftModelBase)
+    monkeypatch.setattr(
+        trainer_mod,
+        "get_peft_model_state_dict",
+        lambda model, state_dict=None: {"lora": state_dict["lora"].clone()},
+    )
+    monkeypatch.setattr(
+        trainer_mod,
+        "deepspeed",
+        SimpleNamespace(zero=SimpleNamespace(GatheredParameters=_FakeGatheredParameters)),
+    )
+    monkeypatch.setattr(trainer_mod, "_distributed_world_size", lambda: 8)
+    monkeypatch.setattr(trainer_mod, "_is_rank0", lambda: True)
+
+    model = _FakePeftModelBase()
+    state_dict = _build_zero3_peft_state_dict(model)
+
+    assert isinstance(state_dict, dict)
+    assert tuple(state_dict["lora"].shape) == (2, 3)
+    params = captured["params"]
+    assert isinstance(params, list)
+    assert params == [model.lora]
+    assert captured["modifier_rank"] == 0
+
+
+def test_load_policy_model_falls_back_when_resume_adapter_artifacts_are_zero_sized(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    cfg = _base_cfg()
+    cfg.model.lora.enabled = True
+    cfg.model.policy_name_or_path = "base-model"
+
+    resume_dir = tmp_path / "resume_latest"
+    resume_dir.mkdir()
+    (resume_dir / "adapter_config.json").write_text('{"base_model_name_or_path": "base-model"}', encoding="utf-8")
+    (resume_dir / "latest").write_text("state", encoding="utf-8")
+
+    base_model = nn.Linear(2, 2)
+    fallback_model = object()
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(trainer_mod, "_load_causal_lm", lambda **kwargs: base_model)
+    monkeypatch.setattr(trainer_mod, "_require_peft_for_lora", lambda: None)
+    monkeypatch.setattr(trainer_mod, "_register_qwen35_zero3_external_parameters", lambda model, cfg: None)
+    monkeypatch.setattr(trainer_mod, "_log_trainable_parameter_summary", lambda model, tag: None)
+    monkeypatch.setattr(trainer_mod, "_build_lora_config", lambda cfg: "LORA_CFG")
+    def _fake_get_peft_model(model, config):  # type: ignore[no-untyped-def]
+        captured["fallback_args"] = (model, config)
+        return fallback_model
+
+    monkeypatch.setattr(trainer_mod, "get_peft_model", _fake_get_peft_model)
+    monkeypatch.setattr(
+        trainer_mod,
+        "PeftModel",
+        SimpleNamespace(
+            from_pretrained=lambda model, source, is_trainable=True: (_ for _ in ()).throw(
+                RuntimeError("size mismatch for base_model ... copying a param with shape torch.Size([0])")
+            )
+        ),
+    )
+
+    model = _load_policy_model(cfg, device="cpu", model_name_or_path=str(resume_dir))
+
+    assert model is fallback_model
+    assert captured["fallback_args"] == (base_model, "LORA_CFG")

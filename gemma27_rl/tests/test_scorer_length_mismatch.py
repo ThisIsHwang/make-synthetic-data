@@ -6,6 +6,8 @@ import pytest
 
 pytest.importorskip("torch")
 
+from gemma27_rl.config import XCometConfig
+from gemma27_rl.rewards import XCometXLScorer, extract_error_spans
 from gemma27_rl.rl_types import RewardOutput, SampleForScoring
 from gemma27_rl.trainer import (
     _score_with_cache_esa,
@@ -88,6 +90,55 @@ def test_xcomet_cache_helper_raises_on_span_length_mismatch() -> None:
             cache={},
             use_cache=False,
         )
+
+
+def test_extract_error_spans_raises_on_metadata_list_length_mismatch() -> None:
+    with pytest.raises(ValueError, match="xCOMET metadata returned mismatched error_spans length"):
+        _ = extract_error_spans(
+            metadata=[{"error_spans": [{"start": 0, "end": 1, "severity": "MINOR"}]}],
+            expected=2,
+        )
+
+
+def test_extract_error_spans_raises_on_unbatched_spans_for_batched_output() -> None:
+    with pytest.raises(ValueError, match="xCOMET metadata returned mismatched error_spans length"):
+        _ = extract_error_spans(
+            metadata={"error_spans": [{"start": 0, "end": 1, "severity": "MINOR"}]},
+            expected=2,
+        )
+
+
+def test_xcomet_worker_raises_on_span_length_mismatch_directly() -> None:
+    class _FakeWorker:
+        def request(self, payload):  # type: ignore[no-untyped-def]
+            assert payload["type"] == "score"
+            return {
+                "ok": True,
+                "scores": [0.2, 0.3],
+                "error_spans": [[{"start": 0, "end": 1, "severity": "MINOR"}]],
+            }
+
+        def close(self) -> None:
+            return None
+
+    scorer = XCometXLScorer(cfg=XCometConfig(enabled=True), predict_fn=lambda payload: None)
+    scorer._worker = _FakeWorker()  # type: ignore[assignment]
+
+    with pytest.raises(RuntimeError, match="xCOMET worker returned mismatched error_spans length"):
+        _ = scorer.score_batch(_samples())
+
+
+def test_xcomet_predict_raises_on_span_length_mismatch_directly() -> None:
+    scorer = XCometXLScorer(
+        cfg=XCometConfig(enabled=True),
+        predict_fn=lambda payload: {
+            "scores": [0.2, 0.3],
+            "metadata": {"error_spans": [{"start": 0, "end": 1, "severity": "MINOR"}]},
+        },
+    )
+
+    with pytest.raises(ValueError, match="xCOMET prediction returned mismatched error_spans length"):
+        _ = scorer.score_batch(_samples())
 
 
 def test_mqm_cache_helper_raises_on_sequence_length_mismatch() -> None:

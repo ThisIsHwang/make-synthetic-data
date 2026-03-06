@@ -1338,12 +1338,16 @@ class XCometXLScorer:
                 runtime_text = f"\nworker_runtime:\n{worker_runtime}" if worker_runtime else ""
                 raise RuntimeError(f"xCOMET worker scoring failed: {err}{tb_text}{runtime_text}")
             scores = [float(v) for v in list(resp.get("scores", []))]
-            spans = resp.get("error_spans", [[] for _ in scores])
             if len(scores) != len(samples):
                 raise RuntimeError(
                     f"xCOMET worker returned mismatched score length: expected={len(samples)} got={len(scores)}"
                 )
-            if not isinstance(spans, list) or len(spans) != len(samples):
+            if "error_spans" in resp:
+                try:
+                    spans = extract_error_spans(resp, expected=len(samples), source="xCOMET worker")
+                except ValueError as exc:
+                    raise RuntimeError(str(exc)) from exc
+            else:
                 spans = [[] for _ in scores]
             return RewardOutput(sequence_scores=scores, metadata={"error_spans": spans})
 
@@ -1386,7 +1390,11 @@ class XCometXLScorer:
                 metadata = pred.get("metadata")
             else:
                 metadata = getattr(pred, "metadata", None)
-            batch_spans = extract_error_spans(metadata, expected=batch_size)
+            batch_spans = extract_error_spans(
+                metadata,
+                expected=batch_size,
+                source="xCOMET predict_step metadata",
+            )
 
             all_scores.extend(float(v) for v in batch_scores)
             all_spans.extend(batch_spans)
@@ -1428,7 +1436,7 @@ class XCometXLScorer:
         if scores is None:
             raise ValueError("Unsupported xCOMET prediction output format.")
 
-        spans = extract_error_spans(metadata, expected=expected)
+        spans = extract_error_spans(metadata, expected=expected, source="xCOMET prediction")
         if len(scores) != expected:
             raise ValueError(f"xCOMET score length mismatch expected={expected} got={len(scores)}")
         return scores, spans
@@ -1923,7 +1931,12 @@ class OpenAICompatibleESAScorer:
         return (clipped - lo) / max(1e-8, hi - lo)
 
 
-def extract_error_spans(metadata: Any, expected: int) -> list[list[dict[str, Any]]]:
+def extract_error_spans(
+    metadata: Any,
+    expected: int,
+    *,
+    source: str = "xCOMET metadata",
+) -> list[list[dict[str, Any]]]:
     if metadata is None:
         return [[] for _ in range(expected)]
 
@@ -1939,32 +1952,48 @@ def extract_error_spans(metadata: Any, expected: int) -> list[list[dict[str, Any
             return [span for span in item if isinstance(span, dict)]
         return []
 
+    def _length_mismatch(actual: int) -> ValueError:
+        return ValueError(f"{source} returned mismatched error_spans length: expected={expected} got={actual}")
+
     # Common format: metadata is list of per-sample dicts.
     if isinstance(metadata, list):
+        if len(metadata) != expected:
+            raise _length_mismatch(len(metadata))
         out = [_normalize_one(item) for item in metadata]
-        if len(out) < expected:
-            out.extend([[] for _ in range(expected - len(out))])
-        return out[:expected]
+        return out
 
     # Dict with direct `error_spans` entry.
     if isinstance(metadata, dict):
-        spans = metadata.get("error_spans")
-        if isinstance(spans, list):
+        if "error_spans" in metadata:
+            spans = metadata.get("error_spans")
+            if not isinstance(spans, list):
+                raise ValueError(
+                    f"{source} returned non-list error_spans (type={type(spans).__name__})."
+                )
             if spans and isinstance(spans[0], list):
+                if len(spans) != expected:
+                    raise _length_mismatch(len(spans))
                 out = [_normalize_one(item) for item in spans]
             elif spans and isinstance(spans[0], dict):
-                out = [_normalize_one(spans)] if expected == 1 else [[*spans]] + [[] for _ in range(expected - 1)]
+                if expected != 1:
+                    raise _length_mismatch(1)
+                out = [_normalize_one(spans)]
             else:
-                out = [[] for _ in range(expected)]
-            if len(out) < expected:
-                out.extend([[] for _ in range(expected - len(out))])
-            return out[:expected]
+                if expected != 1:
+                    raise _length_mismatch(1)
+                out = [[]]
+            return out
 
-        if "samples" in metadata and isinstance(metadata["samples"], list):
-            out = [_normalize_one(item) for item in metadata["samples"]]
-            if len(out) < expected:
-                out.extend([[] for _ in range(expected - len(out))])
-            return out[:expected]
+        if "samples" in metadata:
+            samples = metadata["samples"]
+            if not isinstance(samples, list):
+                raise ValueError(
+                    f"{source} returned non-list samples metadata (type={type(samples).__name__})."
+                )
+            if len(samples) != expected:
+                raise _length_mismatch(len(samples))
+            out = [_normalize_one(item) for item in samples]
+            return out
 
     return [[] for _ in range(expected)]
 
