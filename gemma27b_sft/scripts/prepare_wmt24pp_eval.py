@@ -119,9 +119,9 @@ def main() -> int:
     kept = 0
     with out_path.open("w", encoding="utf-8") as fout:
         for row in dataset:
-            total += 1
             if args.max_samples is not None and kept >= args.max_samples:
                 break
+            total += 1
 
             is_bad_source = bool(row.get("is_bad_source", False))
             if is_bad_source:

@@ -260,6 +260,52 @@ def _tail_contains_token(token_ids: list[int], token_id: int | None, window: int
     return int(token_id) in tail
 
 
+def _generation_prompt_suffix_ids(
+    tokenizer: PreTrainedTokenizerBase,
+    prompt_messages: list[dict[str, str]],
+    max_seq_length: int,
+    prompt_with_generation: list[int] | None = None,
+) -> list[int]:
+    prompt_ids_with_generation = (
+        list(prompt_with_generation)
+        if prompt_with_generation is not None
+        else _apply_chat_template(
+            tokenizer=tokenizer,
+            messages=prompt_messages,
+            add_generation_prompt=True,
+            max_seq_length=max_seq_length,
+            truncate=False,
+        )
+    )
+    prompt_ids_without_generation = _apply_chat_template(
+        tokenizer=tokenizer,
+        messages=prompt_messages,
+        add_generation_prompt=False,
+        max_seq_length=max_seq_length,
+        truncate=False,
+    )
+    prefix_len = _common_prefix_len(prompt_ids_without_generation, prompt_ids_with_generation)
+    return prompt_ids_with_generation[prefix_len:]
+
+
+def _truncate_prompt_keep_generation_suffix(
+    prompt_ids: list[int],
+    prompt_budget: int,
+    required_suffix_ids: list[int],
+) -> tuple[list[int], bool]:
+    if prompt_budget <= 0:
+        return [], not required_suffix_ids
+    if len(prompt_ids) <= prompt_budget:
+        return list(prompt_ids), True
+
+    truncated = prompt_ids[-prompt_budget:]
+    if not required_suffix_ids:
+        return truncated, True
+    if len(truncated) < len(required_suffix_ids):
+        return truncated, False
+    return truncated, truncated[-len(required_suffix_ids) :] == required_suffix_ids
+
+
 def _extract_template_target_span(
     tokenizer: PreTrainedTokenizerBase,
     prompt_messages: list[dict[str, str]],
@@ -330,6 +376,7 @@ def _build_tokenize_fn(cfg: SFTConfig, tokenizer: PreTrainedTokenizerBase):
         source_text_original = str(example[data_cfg.source_field])
         source_text = source_text_original
         target_text = str(example[data_cfg.target_field])
+        source_has_content = bool(source_text_original.strip())
         source_shrink_steps = 0
         prompt_ids: list[int] = []
         full_ids: list[int] = []
@@ -359,6 +406,12 @@ def _build_tokenize_fn(cfg: SFTConfig, tokenizer: PreTrainedTokenizerBase):
                 max_seq_length=max_len,
                 truncate=False,
             )
+            generation_suffix_ids = _generation_prompt_suffix_ids(
+                tokenizer=tokenizer,
+                prompt_messages=prompt_messages,
+                max_seq_length=max_len,
+                prompt_with_generation=prompt_ids_raw,
+            )
             target_ids_effective = target_ids_fallback
             template_span = _extract_template_target_span(
                 tokenizer=tokenizer,
@@ -375,43 +428,62 @@ def _build_tokenize_fn(cfg: SFTConfig, tokenizer: PreTrainedTokenizerBase):
                     template_target_ends_with_eot = bool(
                         eot_token_id is not None and template_target_ids[-1] == eot_token_id
                     )
+                    generation_suffix_ids = _generation_prompt_suffix_ids(
+                        tokenizer=tokenizer,
+                        prompt_messages=prompt_messages,
+                        max_seq_length=max_len,
+                        prompt_with_generation=prompt_ids_raw,
+                    )
 
             if not has_target:
-                prompt_ids = prompt_ids_raw[:max_len]
+                prompt_ids, _ = _truncate_prompt_keep_generation_suffix(
+                    prompt_ids=prompt_ids_raw,
+                    prompt_budget=max_len,
+                    required_suffix_ids=generation_suffix_ids,
+                )
                 target_ids = []
             else:
+                prompt_has_generation_suffix = True
                 if len(prompt_ids_raw) + len(target_ids_effective) <= max_len:
                     prompt_ids = prompt_ids_raw
                     target_ids = list(target_ids_effective)
                 else:
                     target_reserve = min(len(target_ids_effective), max(32, max_len // 8))
                     prompt_budget = max(0, max_len - target_reserve)
-                    prompt_ids = prompt_ids_raw[:prompt_budget]
-                    target_budget = max(0, max_len - len(prompt_ids))
-                    target_ids = target_ids_effective[:target_budget]
+                    prompt_ids, prompt_has_generation_suffix = _truncate_prompt_keep_generation_suffix(
+                        prompt_ids=prompt_ids_raw,
+                        prompt_budget=prompt_budget,
+                        required_suffix_ids=generation_suffix_ids,
+                    )
+                    if prompt_has_generation_suffix:
+                        target_budget = max(0, max_len - len(prompt_ids))
+                        target_ids = target_ids_effective[:target_budget]
+                    else:
+                        target_ids = []
 
-                if use_template_target and template_target_ends_with_eot and eot_token_id is not None:
-                    if not target_ids:
-                        if prompt_ids:
-                            prompt_ids = prompt_ids[:-1]
-                            target_ids = [int(eot_token_id)]
-                    elif target_ids[-1] != eot_token_id:
-                        if len(prompt_ids) + len(target_ids) < max_len:
-                            target_ids.append(int(eot_token_id))
-                        else:
-                            target_ids[-1] = int(eot_token_id)
-                elif not use_template_target and eos_token_id is not None:
-                    # For template-derived targets (Qwen/Gemma chat templates), do not force-append EOS.
-                    # They usually already include turn-end markers and forced EOS can duplicate terminal tokens.
-                    eos_in_tail = _tail_contains_token(target_ids, int(eos_token_id), window=8)
-                    if not eos_in_tail:
-                        if len(prompt_ids) + len(target_ids) < max_len:
-                            target_ids.append(int(eos_token_id))
-                        elif target_ids:
-                            target_ids[-1] = int(eos_token_id)
-                        elif prompt_ids:
-                            prompt_ids = prompt_ids[:-1]
-                            target_ids = [int(eos_token_id)]
+                if prompt_has_generation_suffix:
+                    if use_template_target and template_target_ends_with_eot and eot_token_id is not None:
+                        if not target_ids:
+                            if prompt_ids:
+                                prompt_ids = prompt_ids[:-1]
+                                target_ids = [int(eot_token_id)]
+                        elif target_ids[-1] != eot_token_id:
+                            if len(prompt_ids) + len(target_ids) < max_len:
+                                target_ids.append(int(eot_token_id))
+                            else:
+                                target_ids[-1] = int(eot_token_id)
+                    elif not use_template_target and eos_token_id is not None:
+                        # For template-derived targets (Qwen/Gemma chat templates), do not force-append EOS.
+                        # They usually already include turn-end markers and forced EOS can duplicate terminal tokens.
+                        eos_in_tail = _tail_contains_token(target_ids, int(eos_token_id), window=8)
+                        if not eos_in_tail:
+                            if len(prompt_ids) + len(target_ids) < max_len:
+                                target_ids.append(int(eos_token_id))
+                            elif target_ids:
+                                target_ids[-1] = int(eos_token_id)
+                            elif prompt_ids:
+                                prompt_ids = prompt_ids[:-1]
+                                target_ids = [int(eos_token_id)]
 
             full_ids = prompt_ids + target_ids
             labels = ([-100] * len(prompt_ids)) + target_ids
@@ -430,6 +502,7 @@ def _build_tokenize_fn(cfg: SFTConfig, tokenizer: PreTrainedTokenizerBase):
             "prompt_tokens": len(prompt_ids),
             "full_tokens": len(full_ids),
             "source_chars": len(source_text),
+            "source_has_content": int(source_has_content),
             "source_chars_original": len(source_text_original),
             "source_shrink_steps": source_shrink_steps,
             "target_chars": len(target_text),
@@ -602,6 +675,7 @@ def _summarize_tokenization(dataset: Dataset, max_seq_length: int, sample_limit:
             "sample_size": 0,
             "zero_target_count": 0,
             "empty_target_text_count": 0,
+            "empty_source_text_count": 0,
             "prompt_ge_max_count": 0,
             "full_ge_max_count": 0,
             "max_prompt_tokens": 0,
@@ -616,10 +690,12 @@ def _summarize_tokenization(dataset: Dataset, max_seq_length: int, sample_limit:
     prompt_tokens = [int(v) for v in sampled["prompt_tokens"]]
     full_tokens = [int(v) for v in sampled["full_tokens"]]
     target_chars = [int(v) for v in sampled["target_chars"]]
+    source_has_content = [int(v) for v in sampled["source_has_content"]]
     source_shrink_steps = [int(v) for v in sampled["source_shrink_steps"]]
 
     zero_target_count = sum(1 for v in num_target_tokens if v <= 0)
     empty_target_text_count = sum(1 for v in target_chars if v <= 0)
+    empty_source_text_count = sum(1 for v in source_has_content if v <= 0)
     prompt_ge_max_count = sum(1 for v in prompt_tokens if v >= max_seq_length)
     full_ge_max_count = sum(1 for v in full_tokens if v >= max_seq_length)
     max_prompt_tokens = max(prompt_tokens, default=0)
@@ -632,6 +708,7 @@ def _summarize_tokenization(dataset: Dataset, max_seq_length: int, sample_limit:
         "sample_size": sample_size,
         "zero_target_count": zero_target_count,
         "empty_target_text_count": empty_target_text_count,
+        "empty_source_text_count": empty_source_text_count,
         "prompt_ge_max_count": prompt_ge_max_count,
         "full_ge_max_count": full_ge_max_count,
         "max_prompt_tokens": max_prompt_tokens,
@@ -650,11 +727,13 @@ def _warn_tokenization_risks(split_name: str, stats: dict[str, int | float], max
     prompt_ge_max = int(stats.get("prompt_ge_max_count", 0) or 0)
     full_ge_max = int(stats.get("full_ge_max_count", 0) or 0)
     source_shrunk = int(stats.get("source_shrunk_count", 0) or 0)
+    empty_source = int(stats.get("empty_source_text_count", 0) or 0)
     mean_target = float(stats.get("mean_target_tokens", 0.0) or 0.0)
 
     prompt_ge_max_ratio = float(prompt_ge_max) / float(sample_size)
     full_ge_max_ratio = float(full_ge_max) / float(sample_size)
     source_shrunk_ratio = float(source_shrunk) / float(sample_size)
+    empty_source_ratio = float(empty_source) / float(sample_size)
 
     if prompt_ge_max_ratio >= 0.20:
         logger.warning(
@@ -685,6 +764,15 @@ def _warn_tokenization_risks(split_name: str, stats: dict[str, int | float], max
             source_shrunk,
             sample_size,
         )
+    if empty_source_ratio > 0.0:
+        logger.warning(
+            "%s tokenization risk: source text is empty in %.1f%% samples "
+            "(empty_source_text_count=%s/%s). Check data.source_field and input JSONL.",
+            split_name,
+            empty_source_ratio * 100.0,
+            empty_source,
+            sample_size,
+        )
     if mean_target < 16.0:
         logger.warning(
             "%s tokenization risk: mean_target_tokens is low (%.2f). "
@@ -701,13 +789,15 @@ def _raise_empty_train_dataset_error(cfg: SFTConfig, raw_rows: int, token_stats:
         f"- rows_before_filter={raw_rows}\n"
         f"- sampled_rows={token_stats['sample_size']} sampled_zero_target={token_stats['zero_target_count']}\n"
         f"- sampled_empty_target_text={token_stats['empty_target_text_count']}\n"
+        f"- sampled_empty_source_text={token_stats['empty_source_text_count']}\n"
         f"- sampled_prompt_ge_max_seq={token_stats['prompt_ge_max_count']} (max_seq_length={cfg.train.max_seq_length})\n"
         f"- sampled_source_shrunk={token_stats['source_shrunk_count']} max_shrink_steps={token_stats['max_source_shrink_steps']}\n"
         f"- sampled_max_prompt_tokens={token_stats['max_prompt_tokens']} sampled_max_full_tokens={token_stats['max_full_tokens']}\n"
         "Likely causes:\n"
-        "1) data.target_field points to empty/wrong column.\n"
-        "2) Prompt + source text is too long and truncates away assistant tokens.\n"
-        "3) train.max_seq_length is too small for this prompt template.\n"
+        "1) data.source_field points to empty/wrong column.\n"
+        "2) data.target_field points to empty/wrong column.\n"
+        "3) Prompt + source text is too long and truncates away assistant tokens.\n"
+        "4) train.max_seq_length is too small for this prompt template.\n"
         "Try increasing train.max_seq_length, shortening source/prompt, or checking source/target fields."
     )
 
@@ -910,10 +1000,11 @@ def build_datasets(cfg: SFTConfig, tokenizer: PreTrainedTokenizerBase) -> tuple[
     )
     train_stats = _summarize_tokenization(train_mapped, cfg.train.max_seq_length)
     logger.info(
-        "Train tokenization stats sample_size=%s zero_target=%s empty_target=%s prompt_ge_max=%s source_shrunk=%s max_shrink_steps=%s max_prompt=%s max_full=%s mean_target_tokens=%.2f",
+        "Train tokenization stats sample_size=%s zero_target=%s empty_target=%s empty_source=%s prompt_ge_max=%s source_shrunk=%s max_shrink_steps=%s max_prompt=%s max_full=%s mean_target_tokens=%.2f",
         train_stats["sample_size"],
         train_stats["zero_target_count"],
         train_stats["empty_target_text_count"],
+        train_stats["empty_source_text_count"],
         train_stats["prompt_ge_max_count"],
         train_stats["source_shrunk_count"],
         train_stats["max_source_shrink_steps"],
@@ -923,8 +1014,8 @@ def build_datasets(cfg: SFTConfig, tokenizer: PreTrainedTokenizerBase) -> tuple[
     )
     _warn_tokenization_risks("Train", train_stats, cfg.train.max_seq_length)
     train_filtered = train_mapped.filter(
-        lambda row: int(row.get("num_target_tokens", 0)) > 0,
-        desc="Train filtering non-empty target",
+        lambda row: int(row.get("num_target_tokens", 0)) > 0 and int(row.get("source_has_content", 0)) > 0,
+        desc="Train filtering non-empty source/target",
     )
     train_kept = len(train_filtered)
     logger.info("Train filtering kept=%s dropped=%s", train_kept, len(train_mapped) - train_kept)
@@ -942,10 +1033,11 @@ def build_datasets(cfg: SFTConfig, tokenizer: PreTrainedTokenizerBase) -> tuple[
         )
         eval_stats = _summarize_tokenization(eval_mapped, cfg.train.max_seq_length)
         logger.info(
-            "Eval tokenization stats sample_size=%s zero_target=%s empty_target=%s prompt_ge_max=%s source_shrunk=%s max_shrink_steps=%s max_prompt=%s max_full=%s mean_target_tokens=%.2f",
+            "Eval tokenization stats sample_size=%s zero_target=%s empty_target=%s empty_source=%s prompt_ge_max=%s source_shrunk=%s max_shrink_steps=%s max_prompt=%s max_full=%s mean_target_tokens=%.2f",
             eval_stats["sample_size"],
             eval_stats["zero_target_count"],
             eval_stats["empty_target_text_count"],
+            eval_stats["empty_source_text_count"],
             eval_stats["prompt_ge_max_count"],
             eval_stats["source_shrunk_count"],
             eval_stats["max_source_shrink_steps"],
@@ -955,8 +1047,8 @@ def build_datasets(cfg: SFTConfig, tokenizer: PreTrainedTokenizerBase) -> tuple[
         )
         _warn_tokenization_risks("Eval", eval_stats, cfg.train.max_seq_length)
         eval_filtered = eval_mapped.filter(
-            lambda row: int(row.get("num_target_tokens", 0)) > 0,
-            desc="Eval filtering non-empty target",
+            lambda row: int(row.get("num_target_tokens", 0)) > 0 and int(row.get("source_has_content", 0)) > 0,
+            desc="Eval filtering non-empty source/target",
         )
         eval_kept = len(eval_filtered)
         logger.info("Eval filtering kept=%s dropped=%s", eval_kept, len(eval_mapped) - eval_kept)

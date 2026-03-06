@@ -49,8 +49,9 @@ Set it in `configs/train_example.yaml`:
 - `data.train_file`
 
 Prompt formatting is configurable with `data.prompt_template`.
-Default template matches:
+Available placeholders:
 - `{source_lang}`, `{src_lang_code}`, `{target_lang}`, `{tgt_lang_code}`, `{text}`
+Only `{text}` is required; the others are optional.
 
 ### Optional: Split `final_dataset.jsonl` into Train/Eval (95:5)
 

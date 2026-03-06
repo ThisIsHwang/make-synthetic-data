@@ -34,6 +34,7 @@ class FixedAdafactorTrainer(Trainer):
             self.optimizer = Adafactor(
                 params,
                 lr=self.args.learning_rate,
+                weight_decay=self.args.weight_decay,
                 scale_parameter=False,
                 relative_step=False,
                 warmup_init=False,
@@ -303,7 +304,7 @@ def _load_tokenizer(cfg: SFTConfig):
         raise RuntimeError(
             "Tokenizer load failed in both fast and slow modes.\n"
             f"- tokenizer_name_or_path={tokenizer_name_or_path}\n"
-            "- For Qwen3, ensure the tokenizer repo/files are complete.\n"
+            "- Ensure the tokenizer repo/files are complete and compatible with transformers.\n"
             "- If loading from a fine-tuned checkpoint path, point tokenizer to the base model "
             "or copy tokenizer files into that checkpoint.\n"
             "- Try reinstalling/upgrading transformers/tokenizers and clearing broken HF cache."

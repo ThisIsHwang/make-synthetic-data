@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 import os
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -17,6 +18,13 @@ DEFAULT_TRANSLATION_PROMPT_TEMPLATE = (
     "translation, without any additional explanations or commentary. Please translate\n"
     "the following {source_lang} text into {target_lang}:\n\n\n{text}"
 )
+ALLOWED_PROMPT_TEMPLATE_KEYS = {
+    "source_lang",
+    "src_lang_code",
+    "target_lang",
+    "tgt_lang_code",
+    "text",
+}
 
 
 @dataclass
@@ -99,17 +107,37 @@ class SFTConfig:
     train: TrainConfig = field(default_factory=TrainConfig)
 
 
-def _coerce_dataclass(cls: type[Any], data: dict[str, Any]) -> Any:
+def _child_config_path(parent: str, name: str) -> str:
+    if not parent or parent == "config":
+        return name
+    return f"{parent}.{name}"
+
+
+def _coerce_dataclass(cls: type[Any], data: Any, path: str = "config") -> Any:
+    label = path or cls.__name__
+    if not isinstance(data, Mapping):
+        raise ValueError(f"Config section {label} must be a mapping/object.")
+
+    field_map = cls.__dataclass_fields__  # type: ignore[attr-defined]
+    known = set(field_map)
+    unknown = sorted(str(key) for key in data.keys() if key not in known)
+    if unknown:
+        raise ValueError(f"Unknown config keys in {label}: {', '.join(unknown)}")
+
     kwargs: dict[str, Any] = {}
     defaults = cls()
-    for field_info in cls.__dataclass_fields__.values():  # type: ignore[attr-defined]
+    for field_info in field_map.values():
         name = field_info.name
         if name not in data:
             continue
         value = data[name]
         default_value = getattr(defaults, name)
-        if hasattr(default_value, "__dataclass_fields__") and isinstance(value, dict):
-            kwargs[name] = _coerce_dataclass(type(default_value), value)
+        if hasattr(default_value, "__dataclass_fields__"):
+            kwargs[name] = _coerce_dataclass(
+                type(default_value),
+                value,
+                path=_child_config_path(path, name),
+            )
         else:
             kwargs[name] = value
     return cls(**kwargs)
@@ -158,8 +186,10 @@ def _template_fields(template: str) -> set[str]:
 
 def load_config(path: str | Path) -> SFTConfig:
     config_path = Path(path)
-    payload = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
-    cfg = _coerce_dataclass(SFTConfig, payload)
+    payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    if payload is None:
+        payload = {}
+    cfg = _coerce_dataclass(SFTConfig, payload, path="config")
     base_dir = config_path.parent.resolve()
 
     cfg.data.train_file = _resolve_optional_path(cfg.data.train_file, base_dir) or cfg.data.train_file
@@ -204,13 +234,18 @@ def load_config(path: str | Path) -> SFTConfig:
         raise ValueError("Set data.target_lang_code or data.target_lang_code_field.")
     if not cfg.data.prompt_template.strip():
         raise ValueError("data.prompt_template must not be empty.")
-    required_template_keys = {"source_lang", "src_lang_code", "target_lang", "tgt_lang_code", "text"}
     found_keys = _template_fields(cfg.data.prompt_template)
-    missing_keys = sorted(required_template_keys - found_keys)
-    if missing_keys:
+    unknown_keys = sorted(found_keys - ALLOWED_PROMPT_TEMPLATE_KEYS)
+    if unknown_keys:
         raise ValueError(
-            "data.prompt_template is missing required placeholders: "
-            + ", ".join(missing_keys)
+            "data.prompt_template has unknown placeholders: "
+            + ", ".join(unknown_keys)
+            + ". Allowed placeholders: "
+            + ", ".join(sorted(ALLOWED_PROMPT_TEMPLATE_KEYS))
+        )
+    if "text" not in found_keys:
+        raise ValueError(
+            "data.prompt_template must include {text}."
         )
 
     compute_gradient_accumulation_steps(cfg)

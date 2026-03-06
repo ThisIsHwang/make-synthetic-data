@@ -17,7 +17,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from gemma27b_sft.config import DataConfig, ModelConfig
+from gemma27b_sft.config import DataConfig, ModelConfig, SFTConfig, _coerce_dataclass
 from gemma27b_sft.data import _messages
 
 
@@ -65,19 +65,14 @@ def _resolve_path(path: str | Path | None, base_dir: Path) -> Path | None:
 
 
 def _load_partial_config(config_path: Path) -> tuple[DataConfig, ModelConfig, Path | None]:
-    payload = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    if payload is None:
+        payload = {}
+    cfg = _coerce_dataclass(SFTConfig, payload, path="config")
 
-    data_cfg = DataConfig()
-    for key, value in (payload.get("data") or {}).items():
-        if hasattr(data_cfg, key):
-            setattr(data_cfg, key, value)
-
-    model_cfg = ModelConfig()
-    for key, value in (payload.get("model") or {}).items():
-        if hasattr(model_cfg, key):
-            setattr(model_cfg, key, value)
-
-    train_output = (payload.get("train") or {}).get("output_dir")
+    data_cfg = cfg.data
+    model_cfg = cfg.model
+    train_output = cfg.train.output_dir
     base_dir = config_path.parent.resolve()
     data_cfg.train_file = str(_resolve_path(data_cfg.train_file, base_dir))
     data_cfg.eval_file = str(_resolve_path(data_cfg.eval_file, base_dir)) if data_cfg.eval_file else None
@@ -160,6 +155,22 @@ def _move_to_device(batch: Any, device: str) -> Any:
     return batch
 
 
+def _generation_stop_ids(tokenizer) -> list[int]:
+    eot_id = tokenizer.convert_tokens_to_ids("<end_of_turn>")
+    unk_id = getattr(tokenizer, "unk_token_id", None)
+    stop_ids: list[int] = []
+    if tokenizer.eos_token_id is not None:
+        stop_ids.append(int(tokenizer.eos_token_id))
+    if (
+        isinstance(eot_id, int)
+        and eot_id >= 0
+        and (unk_id is None or eot_id != unk_id)
+        and eot_id not in stop_ids
+    ):
+        stop_ids.append(int(eot_id))
+    return stop_ids
+
+
 def _generate_translations(
     model,
     tokenizer,
@@ -171,12 +182,7 @@ def _generate_translations(
     device: str,
 ) -> list[str]:
     hypotheses: list[str] = []
-    eot_id = tokenizer.convert_tokens_to_ids("<end_of_turn>")
-    stop_ids: list[int] = []
-    if tokenizer.eos_token_id is not None:
-        stop_ids.append(int(tokenizer.eos_token_id))
-    if isinstance(eot_id, int) and eot_id >= 0 and eot_id not in stop_ids:
-        stop_ids.append(int(eot_id))
+    stop_ids = _generation_stop_ids(tokenizer)
 
     for start in range(0, len(rows), generation_batch_size):
         batch_rows = rows[start : start + generation_batch_size]
@@ -205,9 +211,10 @@ def _generate_translations(
                 pad_token_id=tokenizer.pad_token_id,
             )
 
-        input_lens = encoded["attention_mask"].sum(dim=1).tolist()
-        for row_idx, input_len in enumerate(input_lens):
-            gen_ids = outputs[row_idx, int(input_len) :]
+        # With left padding, generation starts after the full padded prompt width.
+        prompt_width = int(encoded["input_ids"].shape[1])
+        for row_idx in range(outputs.shape[0]):
+            gen_ids = outputs[row_idx, prompt_width:]
             text = tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
             hypotheses.append(text)
 

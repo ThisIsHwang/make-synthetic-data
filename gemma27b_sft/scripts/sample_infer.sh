@@ -7,17 +7,61 @@ set -euo pipefail
 #   SRC_TEXT="..." ./scripts/sample_infer.sh
 #   CONFIG_PATH=configs/train_8xh100_deepspeed.yaml ./scripts/sample_infer.sh
 
+is_loadable_model_dir() {
+  local dir="$1"
+  [[ -d "${dir}" ]] || return 1
+  [[ -f "${dir}/config.json" ]] || return 1
+  compgen -G "${dir}/model.safetensors*" >/dev/null \
+    || compgen -G "${dir}/pytorch_model.bin*" >/dev/null \
+    || compgen -G "${dir}/adapter_model.safetensors*" >/dev/null \
+    || compgen -G "${dir}/adapter_model.bin*" >/dev/null
+}
+
+pick_latest_checkpoint() {
+  local base_dir="$1"
+  ls -dt "${base_dir}"/checkpoint-* 2>/dev/null | head -1 || true
+}
+
+pick_newer_path() {
+  local left="${1:-}"
+  local right="${2:-}"
+  if [[ -z "${left}" ]]; then
+    printf '%s' "${right}"
+    return
+  fi
+  if [[ -z "${right}" ]]; then
+    printf '%s' "${left}"
+    return
+  fi
+  if [[ "${left}" -nt "${right}" ]]; then
+    printf '%s' "${left}"
+  else
+    printf '%s' "${right}"
+  fi
+}
+
 MODEL_DIR="${MODEL_DIR:-}"
 if [[ -z "${MODEL_DIR}" ]]; then
-  MODEL_DIR="$(ls -dt ../outputs/gemma3-27b-it-sft-deepspeed/checkpoint-* 2>/dev/null | head -1 || true)"
+  DEFAULT_DS_DIR="../outputs/gemma3-27b-it-sft-deepspeed"
+  DEFAULT_FSDP_DIR="../outputs/gemma3-27b-it-sft-fsdp"
+  root_candidate=""
+  if is_loadable_model_dir "${DEFAULT_DS_DIR}"; then
+    root_candidate="${DEFAULT_DS_DIR}"
+  fi
+  if is_loadable_model_dir "${DEFAULT_FSDP_DIR}"; then
+    root_candidate="$(pick_newer_path "${root_candidate}" "${DEFAULT_FSDP_DIR}")"
+  fi
+  MODEL_DIR="${root_candidate}"
 fi
 if [[ -z "${MODEL_DIR}" ]]; then
-  MODEL_DIR="$(ls -dt ../outputs/gemma3-27b-it-sft-fsdp/checkpoint-* 2>/dev/null | head -1 || true)"
+  ds_checkpoint="$(pick_latest_checkpoint "../outputs/gemma3-27b-it-sft-deepspeed")"
+  fsdp_checkpoint="$(pick_latest_checkpoint "../outputs/gemma3-27b-it-sft-fsdp")"
+  MODEL_DIR="$(pick_newer_path "${ds_checkpoint}" "${fsdp_checkpoint}")"
 fi
 if [[ -z "${MODEL_DIR}" ]]; then
   if [[ -d "../outputs/gemma3-27b-it-sft-deepspeed" ]]; then
     MODEL_DIR="../outputs/gemma3-27b-it-sft-deepspeed"
-  else
+  elif [[ -d "../outputs/gemma3-27b-it-sft-fsdp" ]]; then
     MODEL_DIR="../outputs/gemma3-27b-it-sft-fsdp"
   fi
 fi
@@ -58,32 +102,43 @@ import os
 import torch
 import yaml
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from gemma27b_sft.config import SFTConfig, _coerce_dataclass
 
 model_dir = os.environ["MODEL_DIR"]
 config_path = os.environ["CONFIG_PATH"]
 src = os.environ["SRC_TEXT"]
 
-tokenizer = AutoTokenizer.from_pretrained(model_dir, use_fast=True)
+try:
+    tokenizer = AutoTokenizer.from_pretrained(model_dir, use_fast=True)
+except Exception:
+    tokenizer = AutoTokenizer.from_pretrained(model_dir, use_fast=False)
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 
+dtype = torch.float32
+if torch.cuda.is_available():
+    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+
 model = AutoModelForCausalLM.from_pretrained(
     model_dir,
-    torch_dtype=torch.bfloat16,
+    torch_dtype=dtype,
     device_map="auto",
     attn_implementation="sdpa",
 )
 model.eval()
 
 with open(config_path, "r", encoding="utf-8") as f:
-    cfg = yaml.safe_load(f) or {}
-data_cfg = cfg.get("data", {}) if isinstance(cfg, dict) else {}
+    payload = yaml.safe_load(f)
+if payload is None:
+    payload = {}
+cfg = _coerce_dataclass(SFTConfig, payload, path="config")
+data_cfg = cfg.data
 
-prompt_template = str(data_cfg.get("prompt_template", "{text}"))
-src_lang_code = str(os.environ.get("SRC_LANG_CODE") or data_cfg.get("source_lang_code", "en")).strip()
-tgt_lang_code = str(os.environ.get("TGT_LANG_CODE") or data_cfg.get("target_lang_code", "ko")).strip()
-src_lang_name_cfg = str(data_cfg.get("source_lang_name", "auto")).strip()
-tgt_lang_name_cfg = str(data_cfg.get("target_lang_name", "auto")).strip()
+prompt_template = str(data_cfg.prompt_template)
+src_lang_code = str(os.environ.get("SRC_LANG_CODE") or data_cfg.source_lang_code).strip()
+tgt_lang_code = str(os.environ.get("TGT_LANG_CODE") or data_cfg.target_lang_code).strip()
+src_lang_name_cfg = str(data_cfg.source_lang_name).strip()
+tgt_lang_name_cfg = str(data_cfg.target_lang_name).strip()
 src_lang_name = str(os.environ.get("SRC_LANG_NAME") or src_lang_name_cfg).strip()
 tgt_lang_name = str(os.environ.get("TGT_LANG_NAME") or tgt_lang_name_cfg).strip()
 
