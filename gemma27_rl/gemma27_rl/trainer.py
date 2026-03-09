@@ -1554,6 +1554,16 @@ def _validate_optional_bool_rows(*, scorer_name: str, requested: int, skipped_ro
     return rows
 
 
+def _mqm_esa_cache_key(sample: SampleForScoring, *, use_reference: bool) -> tuple[str, str, str, str, str]:
+    return (
+        sample.src,
+        sample.mt,
+        (sample.ref or "") if use_reference else "",
+        str(sample.source_lang or "").strip(),
+        str(sample.target_lang or "").strip(),
+    )
+
+
 def _apply_aux_worker_defaults(cfg: RLPostTrainConfig) -> None:
     aux_host = _normalize_optional_text(cfg.misc.aux_worker_host)
     aux_workdir = _normalize_optional_text(cfg.misc.aux_worker_remote_workdir)
@@ -2630,7 +2640,7 @@ def _score_with_cache_xcomet(
 def _score_with_cache_mqm(
     samples: list[SampleForScoring],
     scorer: OpenAICompatibleMQMScorer,
-    cache: dict[tuple[str, str, str], tuple[float, list[dict[str, Any]]]],
+    cache: dict[tuple[str, str, str, str, str], tuple[float, list[dict[str, Any]]]],
     use_cache: bool,
 ) -> tuple[list[float], list[list[dict[str, Any]]], list[bool]]:
     scores = [0.0 for _ in samples]
@@ -2640,7 +2650,7 @@ def _score_with_cache_mqm(
     uncached_idx: list[int] = []
 
     for idx, sample in enumerate(samples):
-        key = (sample.src, sample.mt, (sample.ref or "") if scorer.cfg.use_reference else "")
+        key = _mqm_esa_cache_key(sample, use_reference=scorer.cfg.use_reference)
         if use_cache and key in cache:
             scores[idx], spans[idx] = cache[key]
         else:
@@ -2677,7 +2687,7 @@ def _score_with_cache_mqm(
             spans[idx] = span_list
             skipped[idx] = bool(skipped_row)
             if use_cache and (not skipped_row):
-                cache[(sample.src, sample.mt, (sample.ref or "") if scorer.cfg.use_reference else "")] = (
+                cache[_mqm_esa_cache_key(sample, use_reference=scorer.cfg.use_reference)] = (
                     score_f,
                     span_list,
                 )
@@ -2688,7 +2698,7 @@ def _score_with_cache_mqm(
 def _score_with_cache_esa(
     samples: list[SampleForScoring],
     scorer: OpenAICompatibleESAScorer,
-    cache: dict[tuple[str, str, str], float],
+    cache: dict[tuple[str, str, str, str, str], float],
     use_cache: bool,
 ) -> tuple[list[float], list[bool]]:
     out = [0.0 for _ in samples]
@@ -2697,7 +2707,7 @@ def _score_with_cache_esa(
     uncached_idx: list[int] = []
 
     for idx, sample in enumerate(samples):
-        key = (sample.src, sample.mt, (sample.ref or "") if scorer.cfg.use_reference else "")
+        key = _mqm_esa_cache_key(sample, use_reference=scorer.cfg.use_reference)
         if use_cache and key in cache:
             out[idx] = float(cache[key])
         else:
@@ -2722,7 +2732,7 @@ def _score_with_cache_esa(
             out[idx] = float(score)
             skipped[idx] = bool(skipped_row)
             if use_cache and (not skipped_row):
-                cache[(sample.src, sample.mt, (sample.ref or "") if scorer.cfg.use_reference else "")] = float(score)
+                cache[_mqm_esa_cache_key(sample, use_reference=scorer.cfg.use_reference)] = float(score)
 
     return out, skipped
 
@@ -2736,8 +2746,8 @@ def _prepare_rewards_and_advantages(
     esa_scorer: OpenAICompatibleESAScorer | None,
     metricx_cache: dict[tuple[str, str, str], float],
     xcomet_cache: dict[tuple[str, str, str], tuple[float, list[dict[str, Any]]]],
-    mqm_cache: dict[tuple[str, str, str], tuple[float, list[dict[str, Any]]]],
-    esa_cache: dict[tuple[str, str, str], float],
+    mqm_cache: dict[tuple[str, str, str, str, str], tuple[float, list[dict[str, Any]]]],
+    esa_cache: dict[tuple[str, str, str, str, str], float],
     tokenizer: Any | None = None,
 ) -> tuple[list[Rollout], list[list[float]], dict[str, float], dict[str, float]]:
     global _ESA_ALL_ZERO_WARNED
@@ -2787,10 +2797,34 @@ def _prepare_rewards_and_advantages(
         if replacement_count > 0:
             sanitized_target_rows += 1
             sanitized_marker_total += int(replacement_count)
-        samples.append(SampleForScoring(src=rollout.src_text, mt=clean_mt, ref=rollout.ref_text))
+        samples.append(
+            SampleForScoring(
+                src=rollout.src_text,
+                mt=clean_mt,
+                ref=rollout.ref_text,
+                source_lang=rollout.src_lang,
+                target_lang=rollout.tgt_lang,
+            )
+        )
         span_reward_texts.append(clean_mt)
-        span_reward_samples.append(SampleForScoring(src=rollout.src_text, mt=clean_mt, ref=rollout.ref_text))
-        mqm_esa_samples.append(SampleForScoring(src=rollout.src_text, mt=clean_mt, ref=rollout.ref_text))
+        span_reward_samples.append(
+            SampleForScoring(
+                src=rollout.src_text,
+                mt=clean_mt,
+                ref=rollout.ref_text,
+                source_lang=rollout.src_lang,
+                target_lang=rollout.tgt_lang,
+            )
+        )
+        mqm_esa_samples.append(
+            SampleForScoring(
+                src=rollout.src_text,
+                mt=clean_mt,
+                ref=rollout.ref_text,
+                source_lang=rollout.src_lang,
+                target_lang=rollout.tgt_lang,
+            )
+        )
     debug_span_loss = _env_flag("GEMMA27_RL_DEBUG_SPAN_LOSS", default=False)
     debug_span_max_rollouts = _env_int("GEMMA27_RL_DEBUG_SPAN_MAX_ROLLOUTS", default=1, minimum=1)
     debug_span_max_tokens = _env_int("GEMMA27_RL_DEBUG_SPAN_MAX_TOKENS", default=256, minimum=1)
@@ -4276,8 +4310,8 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
 
     metricx_cache: dict[tuple[str, str, str], float] = {}
     xcomet_cache: dict[tuple[str, str, str], tuple[float, list[dict[str, Any]]]] = {}
-    mqm_cache: dict[tuple[str, str, str], tuple[float, list[dict[str, Any]]]] = {}
-    esa_cache: dict[tuple[str, str, str], float] = {}
+    mqm_cache: dict[tuple[str, str, str, str, str], tuple[float, list[dict[str, Any]]]] = {}
+    esa_cache: dict[tuple[str, str, str, str, str], float] = {}
     rng = random.Random(cfg.misc.seed)
     train_indices = list(range(len(train_examples)))
     rng.shuffle(train_indices)

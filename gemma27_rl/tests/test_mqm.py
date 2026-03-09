@@ -49,6 +49,23 @@ def test_openai_mqm_predict_fn_path() -> None:
     assert "안녕" in captured[0][-1]["content"]
 
 
+def test_openai_mqm_predict_fn_uses_sample_language_pair() -> None:
+    captured: list[list[dict[str, str]]] = []
+
+    def fake_predict(rows: list[list[dict[str, str]]]) -> list[float]:
+        captured.extend(rows)
+        return [-5.0 for _ in rows]
+
+    scorer = OpenAICompatibleMQMScorer(cfg=MQMConfig(enabled=True), predict_fn=fake_predict)
+    out = scorer.score_batch(
+        [SampleForScoring(src="안녕", mt="hello", ref=None, source_lang="Korean", target_lang="English")]
+    )
+
+    assert out.sequence_scores == [-5.0]
+    assert "Korean source:" in captured[0][-1]["content"]
+    assert "English translation:" in captured[0][-1]["content"]
+
+
 def test_gemba_mqm_extract_error_spans_maps_quoted_text() -> None:
     mt = "나는 학교에 갔다."
     raw = """Critical:

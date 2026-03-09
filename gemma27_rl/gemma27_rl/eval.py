@@ -411,7 +411,15 @@ def evaluate_on_dataset(
         if replacement_count > 0:
             sanitized_target_rows += 1
             sanitized_marker_total += int(replacement_count)
-        samples.append(SampleForScoring(src=rollout.src_text, mt=clean_mt, ref=rollout.ref_text))
+        samples.append(
+            SampleForScoring(
+                src=rollout.src_text,
+                mt=clean_mt,
+                ref=rollout.ref_text,
+                source_lang=rollout.src_lang,
+                target_lang=rollout.tgt_lang,
+            )
+        )
     if sanitized_target_rows > 0:
         logger.info(
             "evaluate_on_dataset: scorer target sanitize applied: rows=%s/%s marker_replacements=%s tokenizer_special_tokens=%s",

@@ -72,6 +72,35 @@ def test_openai_esa_predict_fn_path() -> None:
     assert captured[0].mt == "안녕"
 
 
+def test_openai_esa_uses_sample_language_pair(monkeypatch: pytest.MonkeyPatch) -> None:
+    scorer = OpenAICompatibleESAScorer(
+        cfg=ESAConfig(
+            enabled=True,
+            base_url="http://localhost:8000/v1",
+            max_retries=0,
+        )
+    )
+    captured: list[str] = []
+
+    def _fake_call(messages, max_tokens, chat_template_kwargs_override=None):
+        captured.append(messages[-1]["content"])
+        if len(captured) == 1:
+            return 'Major:\naccuracy/mistranslation - "hello"'
+        return "81"
+
+    monkeypatch.setattr(scorer, "_call_openai_compatible_api", _fake_call)
+
+    score, _, _ = scorer._score_one_sample(
+        SampleForScoring(src="안녕", mt="hello", ref=None, source_lang="Korean", target_lang="English")
+    )
+
+    assert score == 81.0
+    assert "Korean source:" in captured[0]
+    assert "English translation:" in captured[0]
+    assert "Korean source:" in captured[1]
+    assert "English translation:" in captured[1]
+
+
 def test_load_config_allows_esa_only_reward(tmp_path: Path) -> None:
     cfg_path = tmp_path / "esa_only.yaml"
     cfg_path.write_text(

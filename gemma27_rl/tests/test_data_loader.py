@@ -195,3 +195,47 @@ def test_skip_bad_source_parses_common_string_booleans(tmp_path) -> None:
 
     examples = load_examples(cfg, split="train", limit=None)
     assert [example.example_id for example in examples] == ["1", "2", "3", "4"]
+
+
+def test_load_examples_can_expand_bidirectional_from_reference(tmp_path) -> None:
+    data_path = tmp_path / "bidirectional.jsonl"
+    rows = [
+        {
+            "segment_id": 7,
+            "source": "hello",
+            "target": "안녕하세요",
+            "src_lang": "English",
+            "tgt_lang": "Korean",
+            "src_lang_code": "en",
+            "tgt_lang_code": "ko",
+        }
+    ]
+    with data_path.open("w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+    cfg = DataConfig(
+        train_file=str(data_path),
+        id_field="segment_id",
+        src_text_field="source",
+        src_lang_field="src_lang",
+        tgt_lang_field="tgt_lang",
+        src_lang_code_field="src_lang_code",
+        tgt_lang_code_field="tgt_lang_code",
+        ref_text_field="target",
+        bidirectional_with_ref=True,
+    )
+
+    examples = load_examples(cfg, split="train", limit=None)
+
+    assert [example.example_id for example in examples] == ["7", "7::reverse"]
+    assert examples[0].src_text == "hello"
+    assert examples[0].ref_text == "안녕하세요"
+    assert examples[0].src_lang == "English"
+    assert examples[0].tgt_lang == "Korean"
+    assert examples[1].src_text == "안녕하세요"
+    assert examples[1].ref_text == "hello"
+    assert examples[1].src_lang == "Korean"
+    assert examples[1].tgt_lang == "English"
+    assert examples[1].src_lang_code == "ko"
+    assert examples[1].tgt_lang_code == "en"

@@ -58,6 +58,7 @@ data:
   ref_text_field: target
   is_bad_source_field: is_bad_source
   skip_bad_source: true
+  bidirectional_with_ref: true
 
   default_src_lang: English
   default_tgt_lang: Korean

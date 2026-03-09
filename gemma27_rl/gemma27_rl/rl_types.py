@@ -26,6 +26,10 @@ class Rollout:
     ref_logprobs: list[float] | None
     token_char_offsets: list[tuple[int, int]]
     src_text: str
+    src_lang: str | None = None
+    tgt_lang: str | None = None
+    src_lang_code: str | None = None
+    tgt_lang_code: str | None = None
     ref_text: str | None = None
     raw_completion_token_ids: list[int] | None = None
     completion_raw_text: str | None = None
@@ -38,6 +42,8 @@ class SampleForScoring:
     src: str
     mt: str
     ref: str | None = None
+    source_lang: str | None = None
+    target_lang: str | None = None
 
 
 @dataclass

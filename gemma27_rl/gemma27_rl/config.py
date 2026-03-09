@@ -97,6 +97,7 @@ class DataConfig:
     ref_text_field: str = "ref_text"
     is_bad_source_field: str = "is_bad_source"
     skip_bad_source: bool = False
+    bidirectional_with_ref: bool = False
 
     default_src_lang: str = "English"
     default_tgt_lang: str = "Korean"

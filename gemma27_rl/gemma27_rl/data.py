@@ -128,6 +128,51 @@ def _parse_bad_source_flag(value: Any) -> bool:
     return True
 
 
+def _append_example_with_optional_reverse(
+    *,
+    examples: list[Example],
+    example_id: str,
+    src_text: str,
+    src_lang: str,
+    tgt_lang: str,
+    src_lang_code: str | None,
+    tgt_lang_code: str | None,
+    ref_text: str | None,
+    bidirectional_with_ref: bool,
+    limit: int | None,
+) -> bool:
+    examples.append(
+        Example(
+            example_id=example_id,
+            src_text=src_text,
+            src_lang=src_lang,
+            tgt_lang=tgt_lang,
+            src_lang_code=src_lang_code,
+            tgt_lang_code=tgt_lang_code,
+            ref_text=ref_text,
+        )
+    )
+    if limit is not None and len(examples) >= limit:
+        return True
+
+    reverse_src = str(ref_text or "").strip()
+    if (not bidirectional_with_ref) or (not reverse_src):
+        return False
+
+    examples.append(
+        Example(
+            example_id=f"{example_id}::reverse",
+            src_text=reverse_src,
+            src_lang=tgt_lang,
+            tgt_lang=src_lang,
+            src_lang_code=tgt_lang_code,
+            tgt_lang_code=src_lang_code,
+            ref_text=src_text,
+        )
+    )
+    return limit is not None and len(examples) >= limit
+
+
 def _resolve_split(records: list[dict[str, Any]], split_field: str | None, split_name: str | None) -> list[dict[str, Any]]:
     if not split_field or not split_name:
         return records
@@ -257,6 +302,7 @@ def load_examples(cfg: DataConfig, split: str, limit: int | None = None) -> list
     examples: list[Example] = []
     skipped_bad_source = 0
     skipped_empty_source = 0
+    reverse_examples_added = 0
     for idx, row in enumerate(records):
         if cfg.skip_bad_source and _parse_bad_source_flag(row.get(cfg.is_bad_source_field, False)):
             skipped_bad_source += 1
@@ -274,26 +320,30 @@ def load_examples(cfg: DataConfig, split: str, limit: int | None = None) -> list
         ref_text = _pick_text(row, cfg.ref_text_field, None)
         ex_id = _pick_text(row, cfg.id_field, str(idx)) or str(idx)
 
-        examples.append(
-            Example(
-                example_id=ex_id,
-                src_text=src,
-                src_lang=src_lang,
-                tgt_lang=tgt_lang,
-                src_lang_code=src_code,
-                tgt_lang_code=tgt_code,
-                ref_text=ref_text,
-            )
+        before_count = len(examples)
+        reached_limit = _append_example_with_optional_reverse(
+            examples=examples,
+            example_id=ex_id,
+            src_text=src,
+            src_lang=src_lang,
+            tgt_lang=tgt_lang,
+            src_lang_code=src_code,
+            tgt_lang_code=tgt_code,
+            ref_text=ref_text,
+            bidirectional_with_ref=bool(cfg.bidirectional_with_ref),
+            limit=limit,
         )
-        if limit is not None and len(examples) >= limit:
+        reverse_examples_added += max(0, len(examples) - before_count - 1)
+        if reached_limit:
             break
 
     logger.info(
-        "Loaded %s examples for split=%s (records=%s skipped_bad_source=%s skipped_empty_source=%s)",
+        "Loaded %s examples for split=%s (records=%s skipped_bad_source=%s skipped_empty_source=%s reverse_examples=%s)",
         len(examples),
         split,
         len(records),
         skipped_bad_source,
         skipped_empty_source,
+        reverse_examples_added,
     )
     return examples

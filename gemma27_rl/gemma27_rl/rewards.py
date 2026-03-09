@@ -415,6 +415,17 @@ def _override_enable_thinking(
     return out
 
 
+def _resolve_sample_lang_pair(
+    sample: SampleForScoring,
+    *,
+    default_source_lang: str,
+    default_target_lang: str,
+) -> tuple[str, str]:
+    source_lang = str(sample.source_lang or default_source_lang or "").strip() or str(default_source_lang)
+    target_lang = str(sample.target_lang or default_target_lang or "").strip() or str(default_target_lang)
+    return source_lang, target_lang
+
+
 def _normalize_gemba_response_line(raw_line: str) -> str:
     line = str(raw_line).strip()
     if not line:
@@ -1716,12 +1727,19 @@ class OpenAICompatibleMQMScorer:
 
         message_rows = [
             build_gemba_mqm_messages(
-                source_lang=self.cfg.source_lang,
-                target_lang=self.cfg.target_lang,
+                source_lang=source_lang,
+                target_lang=target_lang,
                 source_seg=sample.src,
                 target_seg=sample.mt,
             )
             for sample in samples
+            for source_lang, target_lang in [
+                _resolve_sample_lang_pair(
+                    sample,
+                    default_source_lang=self.cfg.source_lang,
+                    default_target_lang=self.cfg.target_lang,
+                )
+            ]
         ]
         if self.predict_fn is not None:
             scores = [float(v) for v in self.predict_fn(message_rows)]
@@ -2105,13 +2123,18 @@ class OpenAICompatibleESAScorer:
 
     def _score_one_sample(self, sample: SampleForScoring) -> tuple[float, str, str]:
         last_exc: Exception | None = None
+        source_lang, target_lang = _resolve_sample_lang_pair(
+            sample,
+            default_source_lang=self.cfg.source_lang,
+            default_target_lang=self.cfg.target_lang,
+        )
         for enable_thinking, attempts in _gemba_parse_phase_specs():
             for _ in range(attempts):
                 try:
                     raw_error_text = self._call_openai_compatible_api(
                         build_gemba_esa_error_messages(
-                            source_lang=self.cfg.source_lang,
-                            target_lang=self.cfg.target_lang,
+                            source_lang=source_lang,
+                            target_lang=target_lang,
                             source_seg=sample.src,
                             target_seg=sample.mt,
                             use_fewshot=bool(self.cfg.use_fewshot),
@@ -2130,8 +2153,8 @@ class OpenAICompatibleESAScorer:
                     normalized_error_spans = gemba_esa_format_error_spans(raw_error_text)
                     raw_score_text = self._call_openai_compatible_api(
                         build_gemba_esa_ranking_messages(
-                            source_lang=self.cfg.source_lang,
-                            target_lang=self.cfg.target_lang,
+                            source_lang=source_lang,
+                            target_lang=target_lang,
                             source_seg=sample.src,
                             target_seg=sample.mt,
                             error_spans=normalized_error_spans,
