@@ -222,7 +222,7 @@ def test_openai_esa_repairs_error_annotations_and_extracts_score(monkeypatch: py
     assert raw_score_text == "81"
 
 
-def test_openai_esa_enables_thinking_after_first_ten_failed_attempts(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_openai_esa_enables_thinking_after_first_two_failed_attempts(monkeypatch: pytest.MonkeyPatch) -> None:
     scorer = OpenAICompatibleESAScorer(
         cfg=ESAConfig(
             enabled=True,
@@ -236,9 +236,9 @@ def test_openai_esa_enables_thinking_after_first_ten_failed_attempts(monkeypatch
     def _fake_call(messages, max_tokens, chat_template_kwargs_override=None):
         call_count["n"] += 1
         seen_thinking.append(bool((chat_template_kwargs_override or {}).get("enable_thinking")))
-        if call_count["n"] <= 20:
+        if call_count["n"] <= 4:
             return "bad"
-        if call_count["n"] == 21:
+        if call_count["n"] == 5:
             return 'Major:\naccuracy/mistranslation - "안녕"'
         return "81"
 
@@ -247,7 +247,7 @@ def test_openai_esa_enables_thinking_after_first_ten_failed_attempts(monkeypatch
     score, _, _ = scorer._score_one_sample(SampleForScoring(src="hello", mt="안녕", ref=None))
 
     assert score == 81.0
-    assert seen_thinking[:20] == [False] * 20
+    assert seen_thinking[:4] == [False] * 4
     assert seen_thinking[-1] is True
 
 

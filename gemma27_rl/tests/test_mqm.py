@@ -157,7 +157,7 @@ def test_openai_mqm_repairs_unparseable_output_before_retrying(monkeypatch: pyte
     assert spans[0]["text"] == "안녕"
 
 
-def test_openai_mqm_enables_thinking_after_first_ten_failed_attempts(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_openai_mqm_enables_thinking_after_first_two_failed_attempts(monkeypatch: pytest.MonkeyPatch) -> None:
     scorer = OpenAICompatibleMQMScorer(
         cfg=MQMConfig(
             enabled=True,
@@ -172,7 +172,7 @@ def test_openai_mqm_enables_thinking_after_first_ten_failed_attempts(monkeypatch
     def _fake_call(messages, max_tokens=None, chat_template_kwargs_override=None):
         calls["n"] += 1
         seen_thinking.append(bool((chat_template_kwargs_override or {}).get("enable_thinking")))
-        if calls["n"] <= 20:
+        if calls["n"] <= 4:
             return "bad"
         return 'Major:\naccuracy/mistranslation - "안녕"'
 
@@ -181,7 +181,7 @@ def test_openai_mqm_enables_thinking_after_first_ten_failed_attempts(monkeypatch
     score, _, _ = scorer._score_one_sample(sample, [{"role": "user", "content": "test"}])
 
     assert score == -5.0
-    assert seen_thinking[:20] == [False] * 20
+    assert seen_thinking[:4] == [False] * 4
     assert seen_thinking[-1] is True
 
 

@@ -390,7 +390,8 @@ _GEMBA_ERROR_LINE_PATTERN = re.compile(
     r"(?:\s*/\s*[^:]+?)?\s*(?:-|:|–|—)\s*(.+)$",
     flags=re.IGNORECASE,
 )
-_GEMBA_PARSE_ATTEMPTS_PER_PHASE = 10
+_GEMBA_PARSE_ATTEMPTS_WITHOUT_THINKING = 2
+_GEMBA_PARSE_ATTEMPTS_WITH_THINKING = 10
 
 
 class GembaParseError(ValueError):
@@ -399,8 +400,8 @@ class GembaParseError(ValueError):
 
 def _gemba_parse_phase_specs() -> tuple[tuple[bool, int], ...]:
     return (
-        (False, _GEMBA_PARSE_ATTEMPTS_PER_PHASE),
-        (True, _GEMBA_PARSE_ATTEMPTS_PER_PHASE),
+        (False, _GEMBA_PARSE_ATTEMPTS_WITHOUT_THINKING),
+        (True, _GEMBA_PARSE_ATTEMPTS_WITH_THINKING),
     )
 
 
