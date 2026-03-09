@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -7,6 +8,7 @@ import pytest
 pytest.importorskip("torch")
 
 from gemma27_rl.config import ESAConfig, load_config
+import gemma27_rl.rewards as rewards_mod
 from gemma27_rl.rewards import (
     OpenAICompatibleESAScorer,
     build_gemba_esa_error_messages,
@@ -88,3 +90,39 @@ def test_load_config_allows_esa_only_reward(tmp_path: Path) -> None:
     cfg = load_config(cfg_path)
     assert cfg.reward.esa.enabled is True
     assert cfg.reward.esa.base_url == "http://localhost:8000"
+
+
+def test_openai_esa_request_includes_reasoning_parser(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+
+    class _FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return json.dumps({"choices": [{"message": {"content": "Score (0-100): 83"}}]}).encode("utf-8")
+
+    class _FakeOpener:
+        def open(self, req, timeout=None):
+            captured["timeout"] = timeout
+            captured["payload"] = json.loads(req.data.decode("utf-8"))
+            return _FakeResponse()
+
+    monkeypatch.setattr(rewards_mod, "_temporarily_unset_proxy_env", lambda: (lambda: None))
+    monkeypatch.setattr(rewards_mod.urllib_request, "build_opener", lambda *args, **kwargs: _FakeOpener())
+
+    scorer = OpenAICompatibleESAScorer(
+        cfg=ESAConfig(
+            enabled=True,
+            base_url="http://localhost:8000/v1",
+            reasoning_parser="qwen3",
+        )
+    )
+    raw = scorer._call_openai_compatible_api([{"role": "user", "content": "test"}], max_tokens=64)
+
+    assert raw == "Score (0-100): 83"
+    assert captured["timeout"] == 120.0
+    assert captured["payload"]["reasoning_parser"] == "qwen3"

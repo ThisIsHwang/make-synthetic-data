@@ -160,6 +160,7 @@ class MQMConfig:
     enabled: bool = False
     base_url: str | None = None
     model_name: str = "qwen3.5-397b-instruct"
+    reasoning_parser: str | None = None
     api_key: str | None = None
     api_key_env: str = "OPENAI_API_KEY"
     source_lang: str = "English"
@@ -188,6 +189,7 @@ class ESAConfig:
     enabled: bool = False
     base_url: str | None = None
     model_name: str = "qwen3.5-397b-instruct"
+    reasoning_parser: str | None = None
     api_key: str | None = None
     api_key_env: str = "OPENAI_API_KEY"
     source_lang: str = "English"
@@ -597,6 +599,8 @@ def _validate_config(cfg: RLPostTrainConfig) -> None:
             raise ValueError("reward.mqm.stop must be a list")
         if cfg.reward.mqm.chat_template_kwargs is not None and not isinstance(cfg.reward.mqm.chat_template_kwargs, dict):
             raise ValueError("reward.mqm.chat_template_kwargs must be a dict")
+        if cfg.reward.mqm.reasoning_parser is not None and not str(cfg.reward.mqm.reasoning_parser).strip():
+            raise ValueError("reward.mqm.reasoning_parser must not be empty when set")
         if cfg.reward.mqm.top_k is not None and int(cfg.reward.mqm.top_k) <= 0:
             raise ValueError("reward.mqm.top_k must be > 0 when set")
         if cfg.reward.mqm.repetition_penalty is not None and float(cfg.reward.mqm.repetition_penalty) <= 0:
@@ -620,6 +624,8 @@ def _validate_config(cfg: RLPostTrainConfig) -> None:
             raise ValueError("reward.esa.stop must be a list")
         if cfg.reward.esa.chat_template_kwargs is not None and not isinstance(cfg.reward.esa.chat_template_kwargs, dict):
             raise ValueError("reward.esa.chat_template_kwargs must be a dict")
+        if cfg.reward.esa.reasoning_parser is not None and not str(cfg.reward.esa.reasoning_parser).strip():
+            raise ValueError("reward.esa.reasoning_parser must not be empty when set")
         if cfg.reward.esa.top_k is not None and int(cfg.reward.esa.top_k) <= 0:
             raise ValueError("reward.esa.top_k must be > 0 when set")
         if cfg.reward.esa.repetition_penalty is not None and float(cfg.reward.esa.repetition_penalty) <= 0:

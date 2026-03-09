@@ -1573,6 +1573,8 @@ class OpenAICompatibleMQMScorer:
             "top_p": float(self.cfg.top_p),
             "max_tokens": int(self.cfg.max_tokens),
         }
+        if self.cfg.reasoning_parser:
+            payload["reasoning_parser"] = str(self.cfg.reasoning_parser)
         if self.cfg.top_k is not None:
             payload["top_k"] = int(self.cfg.top_k)
         if self.cfg.presence_penalty is not None:
@@ -1819,6 +1821,8 @@ class OpenAICompatibleESAScorer:
             "top_p": float(self.cfg.top_p),
             "max_tokens": int(max_tokens),
         }
+        if self.cfg.reasoning_parser:
+            payload["reasoning_parser"] = str(self.cfg.reasoning_parser)
         if self.cfg.top_k is not None:
             payload["top_k"] = int(self.cfg.top_k)
         if self.cfg.presence_penalty is not None:

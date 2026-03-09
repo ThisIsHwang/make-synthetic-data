@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
+
 from gemma27_rl.config import MQMConfig
+import gemma27_rl.rewards as rewards_mod
 from gemma27_rl.rewards import (
     OpenAICompatibleMQMScorer,
     gemba_mqm_extract_error_spans,
@@ -58,3 +61,39 @@ no-error
     assert spans[0]["text"] == "학교"
     assert spans[0]["start"] < spans[0]["end"]
     assert spans[1]["severity"] == "MAJOR"
+
+
+def test_openai_mqm_request_includes_reasoning_parser(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    class _FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return json.dumps({"choices": [{"message": {"content": "Minor:\nno-error"}}]}).encode("utf-8")
+
+    class _FakeOpener:
+        def open(self, req, timeout=None):
+            captured["timeout"] = timeout
+            captured["payload"] = json.loads(req.data.decode("utf-8"))
+            return _FakeResponse()
+
+    monkeypatch.setattr(rewards_mod, "_temporarily_unset_proxy_env", lambda: (lambda: None))
+    monkeypatch.setattr(rewards_mod.urllib_request, "build_opener", lambda *args, **kwargs: _FakeOpener())
+
+    scorer = OpenAICompatibleMQMScorer(
+        cfg=MQMConfig(
+            enabled=True,
+            base_url="http://localhost:8000/v1",
+            reasoning_parser="qwen3",
+        )
+    )
+    raw = scorer._call_openai_compatible_api([{"role": "user", "content": "test"}])
+
+    assert raw == "Minor:\nno-error"
+    assert captured["timeout"] == 120.0
+    assert captured["payload"]["reasoning_parser"] == "qwen3"

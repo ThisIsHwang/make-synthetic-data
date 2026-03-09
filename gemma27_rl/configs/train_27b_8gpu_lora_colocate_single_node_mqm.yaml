@@ -129,12 +129,13 @@ reward:
     enabled: true
     base_url: http://replace-with-openai-compatible-endpoint/v1
     model_name: qwen3.5-397b-instruct
+    reasoning_parser: qwen3
     api_key: null
     api_key_env: OPENAI_API_KEY
     source_lang: English
     target_lang: Korean
-    timeout_sec: 120.0
-    timeout_s: 120.0
+    timeout_sec: 1800.0
+    timeout_s: 1800.0
     max_retries: 3
     batch_size: 1
     use_reference: false
@@ -156,12 +157,13 @@ reward:
     enabled: false
     base_url: null
     model_name: qwen3.5-397b-instruct
+    reasoning_parser: qwen3
     api_key: null
     api_key_env: OPENAI_API_KEY
     source_lang: English
     target_lang: Korean
-    timeout_sec: 120.0
-    timeout_s: 120.0
+    timeout_sec: 1800.0
+    timeout_s: 1800.0
     max_retries: 3
     batch_size: 1
     use_reference: false
