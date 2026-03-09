@@ -1537,6 +1537,23 @@ def _mean_std(values: list[float]) -> tuple[float, float]:
     return float(m), float(var**0.5)
 
 
+def _validate_optional_bool_rows(*, scorer_name: str, requested: int, skipped_rows: Any | None) -> list[bool]:
+    if skipped_rows is None:
+        return [False for _ in range(int(requested))]
+    if not isinstance(skipped_rows, (list, tuple)):
+        raise RuntimeError(
+            f"{scorer_name} scorer returned non-list skipped_rows "
+            f"(type={type(skipped_rows).__name__}, requested={requested})."
+        )
+    rows = [bool(v) for v in list(skipped_rows)]
+    if len(rows) != int(requested):
+        raise RuntimeError(
+            f"{scorer_name} scorer returned mismatched skipped_rows length: "
+            f"requested={requested} returned={len(rows)}"
+        )
+    return rows
+
+
 def _apply_aux_worker_defaults(cfg: RLPostTrainConfig) -> None:
     aux_host = _normalize_optional_text(cfg.misc.aux_worker_host)
     aux_workdir = _normalize_optional_text(cfg.misc.aux_worker_remote_workdir)
@@ -2615,9 +2632,10 @@ def _score_with_cache_mqm(
     scorer: OpenAICompatibleMQMScorer,
     cache: dict[tuple[str, str, str], tuple[float, list[dict[str, Any]]]],
     use_cache: bool,
-) -> tuple[list[float], list[list[dict[str, Any]]]]:
+) -> tuple[list[float], list[list[dict[str, Any]]], list[bool]]:
     scores = [0.0 for _ in samples]
     spans = [[] for _ in samples]
+    skipped = [False for _ in samples]
     uncached: list[SampleForScoring] = []
     uncached_idx: list[int] = []
 
@@ -2632,26 +2650,39 @@ def _score_with_cache_mqm(
     if uncached:
         out = scorer.score_batch(uncached)
         raw_span_rows = (out.metadata or {}).get("error_spans", [[] for _ in uncached])
+        raw_skipped_rows = (out.metadata or {}).get("skipped_rows", [False for _ in uncached])
         sequence_scores, span_rows = _validate_scorer_batch_lengths(
             scorer_name="MQM",
             requested=len(uncached),
             sequence_scores=out.sequence_scores,
             error_spans=raw_span_rows,
         )
+        skipped_rows = _validate_optional_bool_rows(
+            scorer_name="MQM",
+            requested=len(uncached),
+            skipped_rows=raw_skipped_rows,
+        )
         assert span_rows is not None
-        for idx, score, span_row, sample in zip(uncached_idx, sequence_scores, span_rows, uncached):
+        for idx, score, span_row, sample, skipped_row in zip(
+            uncached_idx,
+            sequence_scores,
+            span_rows,
+            uncached,
+            skipped_rows,
+        ):
             score_f = float(score)
             span_iter = span_row if isinstance(span_row, (list, tuple)) else []
             span_list = [s for s in span_iter if isinstance(s, dict)]
             scores[idx] = score_f
             spans[idx] = span_list
-            if use_cache:
+            skipped[idx] = bool(skipped_row)
+            if use_cache and (not skipped_row):
                 cache[(sample.src, sample.mt, (sample.ref or "") if scorer.cfg.use_reference else "")] = (
                     score_f,
                     span_list,
                 )
 
-    return scores, spans
+    return scores, spans, skipped
 
 
 def _score_with_cache_esa(
@@ -2659,8 +2690,9 @@ def _score_with_cache_esa(
     scorer: OpenAICompatibleESAScorer,
     cache: dict[tuple[str, str, str], float],
     use_cache: bool,
-) -> list[float]:
+) -> tuple[list[float], list[bool]]:
     out = [0.0 for _ in samples]
+    skipped = [False for _ in samples]
     uncached: list[SampleForScoring] = []
     uncached_idx: list[int] = []
 
@@ -2673,18 +2705,26 @@ def _score_with_cache_esa(
             uncached_idx.append(idx)
 
     if uncached:
-        raw_scores = scorer.score_batch(uncached).sequence_scores
+        score_out = scorer.score_batch(uncached)
+        raw_scores = score_out.sequence_scores
+        raw_skipped_rows = (score_out.metadata or {}).get("skipped_rows", [False for _ in uncached])
         scores, _ = _validate_scorer_batch_lengths(
             scorer_name="ESA",
             requested=len(uncached),
             sequence_scores=raw_scores,
         )
-        for idx, score, sample in zip(uncached_idx, scores, uncached):
+        skipped_rows = _validate_optional_bool_rows(
+            scorer_name="ESA",
+            requested=len(uncached),
+            skipped_rows=raw_skipped_rows,
+        )
+        for idx, score, sample, skipped_row in zip(uncached_idx, scores, uncached, skipped_rows):
             out[idx] = float(score)
-            if use_cache:
+            skipped[idx] = bool(skipped_row)
+            if use_cache and (not skipped_row):
                 cache[(sample.src, sample.mt, (sample.ref or "") if scorer.cfg.use_reference else "")] = float(score)
 
-    return out
+    return out, skipped
 
 
 def _prepare_rewards_and_advantages(
@@ -2699,8 +2739,11 @@ def _prepare_rewards_and_advantages(
     mqm_cache: dict[tuple[str, str, str], tuple[float, list[dict[str, Any]]]],
     esa_cache: dict[tuple[str, str, str], float],
     tokenizer: Any | None = None,
-) -> tuple[list[list[float]], dict[str, float], dict[str, float]]:
+) -> tuple[list[Rollout], list[list[float]], dict[str, float], dict[str, float]]:
     global _ESA_ALL_ZERO_WARNED
+
+    def _filter_rows_by_indices(rows: list[Any], keep_indices: list[int]) -> list[Any]:
+        return [rows[idx] for idx in keep_indices]
 
     def _sanitize(values: list[float], fallback: float) -> tuple[list[float], int]:
         out: list[float] = []
@@ -2793,6 +2836,8 @@ def _prepare_rewards_and_advantages(
     esa_scores = [0.0 for _ in rollouts]
     span_rows = [[] for _ in rollouts]
     mqm_span_rows = [[] for _ in rollouts]
+    mqm_skipped = [False for _ in rollouts]
+    esa_skipped = [False for _ in rollouts]
 
     enabled_scorers = sum(int(flag) for flag in (metricx_enabled, xcomet_enabled, mqm_enabled, esa_enabled))
     if enabled_scorers > 1:
@@ -2843,9 +2888,9 @@ def _prepare_rewards_and_advantages(
             if "xcomet" in futures:
                 xcomet_scores, span_rows = futures["xcomet"].result()
             if "mqm" in futures:
-                mqm_scores, mqm_span_rows = futures["mqm"].result()
+                mqm_scores, mqm_span_rows, mqm_skipped = futures["mqm"].result()
             if "esa" in futures:
-                esa_scores = futures["esa"].result()
+                esa_scores, esa_skipped = futures["esa"].result()
     else:
         if metricx_enabled:
             metricx_scores = _score_with_cache_metricx(
@@ -2862,14 +2907,14 @@ def _prepare_rewards_and_advantages(
                 use_cache=cfg.reward.cache_enabled,
             )
         if mqm_enabled:
-            mqm_scores, mqm_span_rows = _score_with_cache_mqm(
+            mqm_scores, mqm_span_rows, mqm_skipped = _score_with_cache_mqm(
                 samples=mqm_esa_samples,
                 scorer=mqm_scorer,
                 cache=mqm_cache,
                 use_cache=cfg.reward.cache_enabled and cfg.reward.mqm.enabled,
             )
         if esa_enabled:
-            esa_scores = _score_with_cache_esa(
+            esa_scores, esa_skipped = _score_with_cache_esa(
                 samples=mqm_esa_samples,
                 scorer=esa_scorer,
                 cache=esa_cache,
@@ -2916,7 +2961,8 @@ def _prepare_rewards_and_advantages(
         esa_enabled
         and esa_scores
         and (not _ESA_ALL_ZERO_WARNED)
-        and all(abs(float(v)) <= 1e-12 for v in esa_scores)
+        and any(not skipped for skipped in esa_skipped)
+        and all(abs(float(v)) <= 1e-12 for v, skipped in zip(esa_scores, esa_skipped) if not skipped)
     ):
         _ESA_ALL_ZERO_WARNED = True
         logger.warning(
@@ -2926,6 +2972,12 @@ def _prepare_rewards_and_advantages(
             "(GEMMA27_RL_LOG_ESA_IO=1).",
             len(esa_scores),
         )
+    mqm_skipped_count = int(sum(mqm_skipped))
+    esa_skipped_count = int(sum(esa_skipped))
+    if mqm_skipped_count > 0:
+        logger.warning("MQM scorer skipped %s sample(s) after repeated parse/repair failures.", mqm_skipped_count)
+    if esa_skipped_count > 0:
+        logger.warning("ESA scorer skipped %s sample(s) after repeated parse/repair failures.", esa_skipped_count)
     span_rows = [
         [
             *(span_rows[idx] if idx < len(span_rows) else []),
@@ -2933,6 +2985,30 @@ def _prepare_rewards_and_advantages(
         ]
         for idx in range(len(rollouts))
     ]
+
+    drop_mask = [False for _ in rollouts]
+    if mqm_enabled:
+        drop_mask = [drop or skipped for drop, skipped in zip(drop_mask, mqm_skipped)]
+    if esa_enabled:
+        drop_mask = [drop or skipped for drop, skipped in zip(drop_mask, esa_skipped)]
+    dropped_rollouts_count = int(sum(drop_mask))
+    if dropped_rollouts_count > 0:
+        keep_indices = [idx for idx, drop in enumerate(drop_mask) if not drop]
+        logger.warning(
+            "Dropping %s rollout(s) from GRPO update because MQM/ESA scoring was skipped for those samples.",
+            dropped_rollouts_count,
+        )
+        rollouts = _filter_rows_by_indices(rollouts, keep_indices)
+        raw_completion_texts = _filter_rows_by_indices(raw_completion_texts, keep_indices)
+        clean_completion_texts = _filter_rows_by_indices(clean_completion_texts, keep_indices)
+        span_reward_texts = _filter_rows_by_indices(span_reward_texts, keep_indices)
+        metricx_scores = _filter_rows_by_indices(metricx_scores, keep_indices)
+        xcomet_scores = _filter_rows_by_indices(xcomet_scores, keep_indices)
+        mqm_scores = _filter_rows_by_indices(mqm_scores, keep_indices)
+        esa_scores = _filter_rows_by_indices(esa_scores, keep_indices)
+        span_rows = _filter_rows_by_indices(span_rows, keep_indices)
+        mqm_skipped = _filter_rows_by_indices(mqm_skipped, keep_indices)
+        esa_skipped = _filter_rows_by_indices(esa_skipped, keep_indices)
 
     seq_rewards = build_sequence_rewards(
         metricx_scores=metricx_scores,
@@ -3231,8 +3307,10 @@ def _prepare_rewards_and_advantages(
     metricx_m, metricx_s = _mean_std(metricx_scores)
     metricx_r_m, metricx_r_s = _mean_std(metricx_rewards)
     xcomet_m, xcomet_s = _mean_std(xcomet_scores)
-    mqm_m, mqm_s = _mean_std(mqm_scores)
-    esa_m, esa_s = _mean_std(esa_scores)
+    mqm_used_scores = [float(v) for v, skipped in zip(mqm_scores, mqm_skipped) if not skipped]
+    esa_used_scores = [float(v) for v, skipped in zip(esa_scores, esa_skipped) if not skipped]
+    mqm_m, mqm_s = _mean_std(mqm_used_scores)
+    esa_m, esa_s = _mean_std(esa_used_scores)
 
     reward_stats = {
         "metricx_score_mean": metricx_m,
@@ -3243,8 +3321,11 @@ def _prepare_rewards_and_advantages(
         "xcomet_score_std": xcomet_s,
         "mqm_score_mean": mqm_m,
         "mqm_score_std": mqm_s,
+        "mqm_skipped_count": float(mqm_skipped_count),
         "esa_score_mean": esa_m,
         "esa_score_std": esa_s,
+        "esa_skipped_count": float(esa_skipped_count),
+        "grpo_dropped_rollouts_count": float(dropped_rollouts_count),
         "token_rewards_mean": token_reward_m,
         "token_rewards_std": token_reward_s,
         "token_rewards_non_zero_ratio": float(non_zero_token_ratio),
@@ -3290,7 +3371,7 @@ def _prepare_rewards_and_advantages(
         "judge_sanitized_marker_total": float(sanitized_marker_total),
     }
 
-    return norm_adv_rows, reward_stats, norm_stats
+    return rollouts, norm_adv_rows, reward_stats, norm_stats
 
 
 def _fill_missing_reference_logprobs(
@@ -4328,10 +4409,10 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
                                 ref_device=ref_device,
                                 device=device,
                             )
-                            merged_advantages, reward_stats, adv_stats = reward_future.result()
+                            merged_rollouts, merged_advantages, reward_stats, adv_stats = reward_future.result()
                             ref_fill_future.result()
                     else:
-                        merged_advantages, reward_stats, adv_stats = _prepare_rewards_and_advantages(
+                        merged_rollouts, merged_advantages, reward_stats, adv_stats = _prepare_rewards_and_advantages(
                             rollouts=merged_rollouts,
                             cfg=cfg,
                             metricx_scorer=metricx_scorer,
@@ -4364,6 +4445,7 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
                     and min(shard_sizes) > 0
                     and len(set(shard_sizes)) == 1
                     and len(merged_advantages) == len(merged_rollouts)
+                    and float(reward_stats.get("grpo_dropped_rollouts_count", 0.0)) <= 0.0
                 )
                 if can_shard_update:
                     logger.info(
@@ -4383,7 +4465,13 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
                         for i in range(world_size)
                     ]
                 else:
-                    if merged_rollouts and len(set(shard_sizes)) > 1:
+                    if float(reward_stats.get("grpo_dropped_rollouts_count", 0.0)) > 0.0:
+                        logger.warning(
+                            "Skipped MQM/ESA rollouts forced replicated policy update at update=%s; dropped_rollouts=%s",
+                            update_idx,
+                            int(float(reward_stats.get("grpo_dropped_rollouts_count", 0.0))),
+                        )
+                    elif merged_rollouts and len(set(shard_sizes)) > 1:
                         logger.warning(
                             "Uneven rollout shard sizes at update=%s; falling back to replicated policy update this step. shard_sizes=%s",
                             update_idx,
@@ -4441,7 +4529,7 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
                 prompt_instance_ids=prompt_instance_ids,
             )
             if rollouts:
-                advantages, reward_stats, adv_stats = _prepare_rewards_and_advantages(
+                rollouts, advantages, reward_stats, adv_stats = _prepare_rewards_and_advantages(
                     rollouts=rollouts,
                     cfg=cfg,
                     metricx_scorer=metricx_scorer,

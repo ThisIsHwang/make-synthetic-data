@@ -95,6 +95,23 @@ def _mean_std(values: list[float]) -> tuple[float, float]:
     return float(m), float(var**0.5)
 
 
+def _validate_optional_bool_rows(*, scorer_name: str, requested: int, skipped_rows: Any | None) -> list[bool]:
+    if skipped_rows is None:
+        return [False for _ in range(int(requested))]
+    if not isinstance(skipped_rows, (list, tuple)):
+        raise RuntimeError(
+            f"{scorer_name} scorer returned non-list skipped_rows "
+            f"(type={type(skipped_rows).__name__}, requested={requested})."
+        )
+    rows = [bool(v) for v in list(skipped_rows)]
+    if len(rows) != int(requested):
+        raise RuntimeError(
+            f"{scorer_name} scorer returned mismatched skipped_rows length: "
+            f"requested={requested} returned={len(rows)}"
+        )
+    return rows
+
+
 def _validate_scorer_batch_lengths(
     *,
     scorer_name: str,
@@ -411,6 +428,8 @@ def evaluate_on_dataset(
     esa_scores = [0.0 for _ in rollouts]
     spans: list[list[dict[str, Any]]] = [[] for _ in rollouts]
     mqm_spans: list[list[dict[str, Any]]] = [[] for _ in rollouts]
+    mqm_skipped = [False for _ in rollouts]
+    esa_skipped = [False for _ in rollouts]
 
     metricx_enabled = metricx_scorer is not None and cfg.reward.metricx.enabled
     xcomet_enabled = xcomet_scorer is not None and cfg.reward.xcomet.enabled
@@ -477,6 +496,11 @@ def evaluate_on_dataset(
             sequence_scores=mqm_out.sequence_scores,
             error_spans=(mqm_out.metadata or {}).get("error_spans", [[] for _ in samples]),
         )
+        skipped_rows = _validate_optional_bool_rows(
+            scorer_name="MQM",
+            requested=len(samples),
+            skipped_rows=(mqm_out.metadata or {}).get("skipped_rows", [False for _ in samples]),
+        )
         non_finite_idx = [idx for idx, value in enumerate(mqm_local_scores) if not math.isfinite(float(value))]
         if non_finite_idx:
             logger.warning(
@@ -490,14 +514,19 @@ def evaluate_on_dataset(
             [item for item in span_row if isinstance(item, dict)] if isinstance(span_row, (list, tuple)) else []
             for span_row in span_rows
         ]
-        return mqm_local_scores, mqm_local_spans
+        return mqm_local_scores, mqm_local_spans, skipped_rows
 
-    def _score_esa_eval() -> list[float]:
+    def _score_esa_eval() -> tuple[list[float], list[bool]]:
         esa_out = esa_scorer.score_batch(samples)
         esa_local_scores, _ = _validate_scorer_batch_lengths(
             scorer_name="ESA",
             requested=len(samples),
             sequence_scores=esa_out.sequence_scores,
+        )
+        skipped_rows = _validate_optional_bool_rows(
+            scorer_name="ESA",
+            requested=len(samples),
+            skipped_rows=(esa_out.metadata or {}).get("skipped_rows", [False for _ in samples]),
         )
         non_finite_idx = [idx for idx, value in enumerate(esa_local_scores) if not math.isfinite(float(value))]
         if non_finite_idx:
@@ -507,7 +536,7 @@ def evaluate_on_dataset(
             )
             for idx in non_finite_idx:
                 esa_local_scores[idx] = 0.0
-        return esa_local_scores
+        return esa_local_scores, skipped_rows
 
     enabled_scorers = sum(int(flag) for flag in (metricx_enabled, xcomet_enabled, mqm_enabled, esa_enabled))
     if enabled_scorers > 1:
@@ -533,9 +562,9 @@ def evaluate_on_dataset(
             if "xcomet" in futures:
                 xcomet_scores, spans = futures["xcomet"].result()
             if "mqm" in futures:
-                mqm_scores, mqm_spans = futures["mqm"].result()
+                mqm_scores, mqm_spans, mqm_skipped = futures["mqm"].result()
             if "esa" in futures:
-                esa_scores = futures["esa"].result()
+                esa_scores, esa_skipped = futures["esa"].result()
     else:
         if metricx_enabled:
             logger.info("evaluate_on_dataset: scoring metricx...")
@@ -545,10 +574,10 @@ def evaluate_on_dataset(
             xcomet_scores, spans = _score_xcomet_eval()
         if mqm_enabled:
             logger.info("evaluate_on_dataset: scoring mqm...")
-            mqm_scores, mqm_spans = _score_mqm_eval()
+            mqm_scores, mqm_spans, mqm_skipped = _score_mqm_eval()
         if esa_enabled:
             logger.info("evaluate_on_dataset: scoring esa...")
-            esa_scores = _score_esa_eval()
+            esa_scores, esa_skipped = _score_esa_eval()
     spans = [
         [
             *(spans[idx] if idx < len(spans) else []),
@@ -567,8 +596,10 @@ def evaluate_on_dataset(
     metricx_m, metricx_s = _mean_std(metricx_scores)
     metricx_r_m, metricx_r_s = _mean_std(metricx_rewards)
     xcomet_m, xcomet_s = _mean_std(xcomet_scores)
-    mqm_m, mqm_s = _mean_std(mqm_scores)
-    esa_m, esa_s = _mean_std(esa_scores)
+    mqm_used_scores = [float(v) for v, skipped in zip(mqm_scores, mqm_skipped) if not skipped]
+    esa_used_scores = [float(v) for v, skipped in zip(esa_scores, esa_skipped) if not skipped]
+    mqm_m, mqm_s = _mean_std(mqm_used_scores)
+    esa_m, esa_s = _mean_std(esa_used_scores)
     avg_completion_len = mean([len(r.completion_token_ids) for r in rollouts]) if rollouts else 0.0
 
     report = {
@@ -580,8 +611,10 @@ def evaluate_on_dataset(
         "xcomet_score_std": xcomet_s,
         "mqm_score_mean": mqm_m,
         "mqm_score_std": mqm_s,
+        "mqm_skipped_count": float(sum(mqm_skipped)),
         "esa_score_mean": esa_m,
         "esa_score_std": esa_s,
+        "esa_skipped_count": float(sum(esa_skipped)),
         "avg_span_count": mean(span_counts) if span_counts else 0.0,
         "severity_counts": dict(severity),
         "avg_completion_len": float(avg_completion_len),
@@ -652,7 +685,9 @@ def evaluate_on_dataset(
                     "metricx_reward": float(metricx_rewards[idx]) if idx < len(metricx_rewards) else 0.0,
                     "xcomet_score": float(xcomet_scores[idx]) if idx < len(xcomet_scores) else 0.0,
                     "mqm_score": float(mqm_scores[idx]) if idx < len(mqm_scores) else 0.0,
+                    "mqm_skipped": bool(mqm_skipped[idx]) if idx < len(mqm_skipped) else False,
                     "esa_score": float(esa_scores[idx]) if idx < len(esa_scores) else 0.0,
+                    "esa_skipped": bool(esa_skipped[idx]) if idx < len(esa_skipped) else False,
                     "span_count": len(span_row),
                     "error_spans": span_row,
                 }

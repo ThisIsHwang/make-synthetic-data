@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from gemma27_rl.config import MQMConfig
 import gemma27_rl.rewards as rewards_mod
 from gemma27_rl.rewards import (
+    GembaParseError,
     OpenAICompatibleMQMScorer,
     gemba_mqm_extract_error_spans,
     gemba_mqm_parse_errors,
@@ -61,6 +64,146 @@ no-error
     assert spans[0]["text"] == "학교"
     assert spans[0]["start"] < spans[0]["end"]
     assert spans[1]["severity"] == "MAJOR"
+
+
+def test_gemba_mqm_parse_errors_rejects_unstructured_output() -> None:
+    with pytest.raises(ValueError, match="structured errors|unparseable"):
+        gemba_mqm_parse_errors("The translation looks mostly fine to me.")
+
+
+def test_openai_mqm_retries_until_output_is_parseable(monkeypatch: pytest.MonkeyPatch) -> None:
+    scorer = OpenAICompatibleMQMScorer(
+        cfg=MQMConfig(
+            enabled=True,
+            base_url="http://localhost:8000/v1",
+            max_retries=0,
+        )
+    )
+    sample = SampleForScoring(src="hello", mt="안녕", ref=None)
+    calls = iter(
+        (["Looks fine overall.", "still bad"] * 9)
+        + ['Major:\naccuracy/mistranslation - "안녕"']
+    )
+    call_count = {"n": 0}
+
+    def _fake_call(messages, max_tokens=None, chat_template_kwargs_override=None):
+        call_count["n"] += 1
+        return next(calls)
+
+    monkeypatch.setattr(scorer, "_call_openai_compatible_api", _fake_call)
+
+    score, raw_text, spans = scorer._score_one_sample(
+        sample,
+        [{"role": "user", "content": "test"}],
+    )
+
+    assert call_count["n"] == 19
+    assert score == -5.0
+    assert raw_text == 'Major:\naccuracy/mistranslation - "안녕"'
+    assert len(spans) == 1
+    assert spans[0]["text"] == "안녕"
+
+
+def test_openai_mqm_parse_failures_do_not_fallback_to_zero(monkeypatch: pytest.MonkeyPatch) -> None:
+    scorer = OpenAICompatibleMQMScorer(
+        cfg=MQMConfig(
+            enabled=True,
+            base_url="http://localhost:8000/v1",
+            max_retries=0,
+            error_policy="zero",
+        )
+    )
+    monkeypatch.setattr(
+        scorer,
+        "_call_openai_compatible_api",
+        lambda messages, max_tokens=None, chat_template_kwargs_override=None: "Looks fine overall.",
+    )
+
+    with pytest.raises(GembaParseError, match="unparseable"):
+        scorer._score_one_sample(
+            SampleForScoring(src="hello", mt="안녕", ref=None),
+            [{"role": "user", "content": "test"}],
+        )
+
+
+def test_openai_mqm_repairs_unparseable_output_before_retrying(monkeypatch: pytest.MonkeyPatch) -> None:
+    scorer = OpenAICompatibleMQMScorer(
+        cfg=MQMConfig(
+            enabled=True,
+            base_url="http://localhost:8000/v1",
+            max_retries=0,
+        )
+    )
+    sample = SampleForScoring(src="hello", mt="안녕", ref=None)
+    responses = iter(
+        [
+            "This translation has a major mistranslation around 안녕.",
+            'Major:\naccuracy/mistranslation - "안녕"\nMinor:\nno-error',
+        ]
+    )
+    captured: list[str] = []
+
+    def _fake_call(messages, max_tokens=None, chat_template_kwargs_override=None):
+        captured.append(messages[0]["content"])
+        return next(responses)
+
+    monkeypatch.setattr(scorer, "_call_openai_compatible_api", _fake_call)
+
+    score, raw_text, spans = scorer._score_one_sample(sample, [{"role": "user", "content": "test"}])
+
+    assert len(captured) == 2
+    assert score == -5.0
+    assert raw_text == 'Major:\naccuracy/mistranslation - "안녕"\nMinor:\nno-error'
+    assert spans[0]["text"] == "안녕"
+
+
+def test_openai_mqm_enables_thinking_after_first_ten_failed_attempts(monkeypatch: pytest.MonkeyPatch) -> None:
+    scorer = OpenAICompatibleMQMScorer(
+        cfg=MQMConfig(
+            enabled=True,
+            base_url="http://localhost:8000/v1",
+            max_retries=0,
+        )
+    )
+    sample = SampleForScoring(src="hello", mt="안녕", ref=None)
+    calls = {"n": 0}
+    seen_thinking: list[bool] = []
+
+    def _fake_call(messages, max_tokens=None, chat_template_kwargs_override=None):
+        calls["n"] += 1
+        seen_thinking.append(bool((chat_template_kwargs_override or {}).get("enable_thinking")))
+        if calls["n"] <= 20:
+            return "bad"
+        return 'Major:\naccuracy/mistranslation - "안녕"'
+
+    monkeypatch.setattr(scorer, "_call_openai_compatible_api", _fake_call)
+
+    score, _, _ = scorer._score_one_sample(sample, [{"role": "user", "content": "test"}])
+
+    assert score == -5.0
+    assert seen_thinking[:20] == [False] * 20
+    assert seen_thinking[-1] is True
+
+
+def test_openai_mqm_score_batch_skips_sample_after_all_attempts_fail(monkeypatch: pytest.MonkeyPatch) -> None:
+    scorer = OpenAICompatibleMQMScorer(
+        cfg=MQMConfig(
+            enabled=True,
+            base_url="http://localhost:8000/v1",
+            max_retries=0,
+        )
+    )
+    monkeypatch.setattr(
+        scorer,
+        "_call_openai_compatible_api",
+        lambda messages, max_tokens=None, chat_template_kwargs_override=None: "bad",
+    )
+
+    out = scorer.score_batch([SampleForScoring(src="hello", mt="안녕", ref=None)])
+
+    assert out.sequence_scores == [0.0]
+    assert out.metadata["skipped_rows"] == [True]
+    assert out.metadata["error_spans"] == [[]]
 
 
 def test_openai_mqm_request_includes_reasoning_parser(monkeypatch) -> None:

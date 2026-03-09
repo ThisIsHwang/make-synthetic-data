@@ -44,6 +44,13 @@ from .utils import (
 logger = logging.getLogger(__name__)
 
 
+def _capture_exception(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    try:
+        return fn(*args, **kwargs)
+    except Exception as exc:  # pragma: no cover - simple wrapper
+        return exc
+
+
 def _env_flag(name: str, default: bool = False) -> bool:
     raw = os.environ.get(name)
     if raw is None:
@@ -278,6 +285,33 @@ GEMBA_USER_TASK_PROMPT = (
     "but do not disrupt the flow or hinder comprehension."
 )
 
+GEMBA_MQM_REPAIR_SYSTEM_PROMPT = (
+    "You normalize machine translation MQM annotations into a strict canonical format."
+)
+
+GEMBA_MQM_REPAIR_PROMPT_TEMPLATE = (
+    "Rewrite the evaluator output below into the exact canonical MQM format.\n\n"
+    "Return only:\n"
+    "Critical:\n"
+    "<error lines or no-error>\n"
+    "Major:\n"
+    "<error lines or no-error>\n"
+    "Minor:\n"
+    "<error lines or no-error>\n\n"
+    "Rules:\n"
+    '- Each error line must look like category/subcategory - "exact target span"\n'
+    "- Copy quoted target spans exactly from the translation when possible.\n"
+    "- If a severity has no errors, output no-error under that severity.\n"
+    "- If there are no errors at all, output no-error under all three severities.\n"
+    "- Do not include explanations or any text outside the canonical format.\n\n"
+    "Source:\n"
+    "```{source_seg}```\n"
+    "Translation:\n"
+    "```{target_seg}```\n"
+    "Evaluator output:\n"
+    "```{raw_output}```"
+)
+
 GEMBA_FEWSHOT_USER_1 = dedent(
     """\
     English source:
@@ -351,32 +385,129 @@ GEMBA_FEWSHOT_ASSISTANT_3 = dedent(
 ).strip()
 
 
-def gemba_mqm_parse_errors(model_output: str) -> dict[str, list[str]]:
-    errors: dict[str, list[str]] = {"critical": [], "major": [], "minor": []}
-    level: str | None = None
+_GEMBA_ERROR_LINE_PATTERN = re.compile(
+    r"^(accuracy|fluency|style|terminology|non-translation|other)"
+    r"(?:\s*/\s*[^:]+?)?\s*(?:-|:|–|—)\s*(.+)$",
+    flags=re.IGNORECASE,
+)
+_GEMBA_PARSE_ATTEMPTS_PER_PHASE = 10
 
-    for raw_line in str(model_output).splitlines():
-        line = raw_line.strip()
+
+class GembaParseError(ValueError):
+    pass
+
+
+def _gemba_parse_phase_specs() -> tuple[tuple[bool, int], ...]:
+    return (
+        (False, _GEMBA_PARSE_ATTEMPTS_PER_PHASE),
+        (True, _GEMBA_PARSE_ATTEMPTS_PER_PHASE),
+    )
+
+
+def _override_enable_thinking(
+    chat_template_kwargs: dict[str, Any] | None,
+    *,
+    enable_thinking: bool,
+) -> dict[str, Any]:
+    out = dict(chat_template_kwargs or {})
+    out["enable_thinking"] = bool(enable_thinking)
+    return out
+
+
+def _normalize_gemba_response_line(raw_line: str) -> str:
+    line = str(raw_line).strip()
+    if not line:
+        return ""
+    line = re.sub(r"^\s*(?:[-*+]|(?:\d+[\.\)]))\s*", "", line)
+    line = line.replace("**", "").replace("__", "").replace("`", "").strip()
+    return line
+
+
+def _is_gemba_no_error_line(line: str) -> bool:
+    text = str(line).strip().lower()
+    return text in {"no-error", "no error"}
+
+
+def _is_structured_gemba_error_line(line: str) -> bool:
+    match = _GEMBA_ERROR_LINE_PATTERN.match(str(line).strip())
+    if match is None:
+        return False
+    detail = str(match.group(2)).strip()
+    if not detail:
+        return False
+    if _extract_mqm_quoted_text(line) is not None:
+        return True
+    return "non-translation" in str(line).lower()
+
+
+def _parse_gemba_error_output(
+    model_output: str | None,
+    *,
+    allowed_levels: tuple[str, ...],
+    scorer_name: str,
+) -> dict[str, list[str]]:
+    text = str(model_output or "")
+    if not text.strip():
+        raise GembaParseError(f"{scorer_name} response is empty.")
+
+    errors: dict[str, list[str]] = {level: [] for level in allowed_levels}
+    level: str | None = None
+    saw_structured_error = False
+    saw_explicit_no_error = False
+    invalid_lines: list[str] = []
+
+    for raw_line in text.splitlines():
+        line = _normalize_gemba_response_line(raw_line)
+        if not line:
+            continue
         line_l = line.lower()
-        if (not line) or ("no-error" in line_l) or ("no error" in line_l):
+
+        matched_header = False
+        for allowed in allowed_levels:
+            header = f"{allowed}:"
+            if line_l == header:
+                level = allowed
+                line = ""
+                line_l = ""
+                matched_header = True
+                break
+            if line_l.startswith(header):
+                level = allowed
+                line = line[len(header) :].strip()
+                line_l = line.lower()
+                matched_header = True
+                break
+        if matched_header and not line:
             continue
-        if line_l == "critical:":
-            level = "critical"
-            continue
-        if line_l == "major:":
-            level = "major"
-            continue
-        if line_l == "minor:":
-            level = "minor"
+
+        if _is_gemba_no_error_line(line):
+            saw_explicit_no_error = True
             continue
         if level is None:
+            invalid_lines.append(line)
             continue
-        if "non-translation" in line_l:
-            errors["critical"].append(line)
-        else:
-            errors[level].append(line)
+        if not _is_structured_gemba_error_line(line):
+            invalid_lines.append(line)
+            continue
 
+        normalized_level = "critical" if "non-translation" in line_l and "critical" in errors else level
+        errors[normalized_level].append(line)
+        saw_structured_error = True
+
+    if invalid_lines:
+        joined = "; ".join(invalid_lines[:3])
+        raise GembaParseError(f"{scorer_name} response has unparseable lines: {joined}")
+    if not saw_structured_error and not saw_explicit_no_error:
+        raise GembaParseError(f"{scorer_name} response contained neither structured errors nor explicit no-error.")
     return errors
+
+
+def gemba_mqm_parse_errors(model_output: str) -> dict[str, list[str]]:
+    return _parse_gemba_error_output(
+        model_output,
+        allowed_levels=("critical", "major", "minor"),
+        scorer_name="MQM",
+    )
 
 
 def gemba_mqm_score(model_output: str | None) -> int | None:
@@ -476,10 +607,10 @@ def gemba_mqm_extract_error_spans(model_output: str | None, mt_text: str) -> lis
                 return out
             quoted = _extract_mqm_quoted_text(line)
             if quoted is None:
-                continue
+                raise GembaParseError(f"MQM response error line is missing a quoted span: {line}")
             span = _find_text_span(mt_text, quoted, used_spans)
             if span is None:
-                continue
+                raise GembaParseError(f"MQM response quoted span was not found in translation: {quoted}")
             start, end = span
             used_spans.append(span)
             out.append(
@@ -540,6 +671,25 @@ def build_gemba_mqm_messages(
     ]
 
 
+def build_gemba_mqm_repair_messages(
+    *,
+    source_seg: str,
+    target_seg: str,
+    raw_output: str,
+) -> list[dict[str, str]]:
+    return [
+        {"role": "system", "content": GEMBA_MQM_REPAIR_SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": GEMBA_MQM_REPAIR_PROMPT_TEMPLATE.format(
+                source_seg=source_seg,
+                target_seg=target_seg,
+                raw_output=raw_output,
+            ),
+        },
+    ]
+
+
 GEMBA_ESA_SYSTEM_PROMPT = (
     "Your task is to identify machine translation errors and assess the quality of the translation."
 )
@@ -553,6 +703,31 @@ GEMBA_ESA_USER_TASK_PROMPT = (
     "Each error is classified as one of two categories: major or minor. Major errors disrupt the flow "
     "and make the understandability of text difficult or impossible. Minor errors are errors that do "
     "not disrupt the flow significantly and what the text is trying to say is still understandable."
+)
+
+GEMBA_ESA_REPAIR_SYSTEM_PROMPT = (
+    "You normalize machine translation ESA annotations into a strict canonical format."
+)
+
+GEMBA_ESA_REPAIR_PROMPT_TEMPLATE = (
+    "Rewrite the evaluator output below into the exact canonical ESA error format.\n\n"
+    "Return only:\n"
+    "Major:\n"
+    "<error lines or no-error>\n"
+    "Minor:\n"
+    "<error lines or no-error>\n\n"
+    "Rules:\n"
+    '- Each error line must look like category/subcategory - "exact target span"\n'
+    "- Copy quoted target spans exactly from the translation when possible.\n"
+    "- If a severity has no errors, output no-error under that severity.\n"
+    "- If there are no errors at all, output no-error under both severities.\n"
+    "- Do not include explanations or any text outside the canonical format.\n\n"
+    "Source:\n"
+    "```{source_seg}```\n"
+    "Translation:\n"
+    "```{target_seg}```\n"
+    "Evaluator output:\n"
+    "```{raw_output}```"
 )
 
 GEMBA_ESA_FEWSHOT_ASSISTANT_1 = dedent(
@@ -598,13 +773,29 @@ GEMBA_ESA_RANKING_PROMPT_TEMPLATE = (
     "```{target_seg}```\n"
     "Annotated error spans:\n"
     "```{error_spans}```\n"
+    "Respond with only one integer from 0 to 100. Do not include any explanation or extra text.\n"
     "Score (0-100):"
 )
 
+GEMBA_ESA_SCORE_EXTRACTION_SYSTEM_PROMPT = (
+    "You extract the final evaluation score and return only one number."
+)
+
+GEMBA_ESA_SCORE_EXTRACTION_PROMPT_TEMPLATE = (
+    "Extract the final score from the evaluator output below.\n"
+    "Return only one integer or decimal number from 0 to 100, with no explanation.\n\n"
+    "Evaluator output:\n"
+    "```{ranking_output}```"
+)
+
 _ESA_SCORE_PATTERNS: tuple[str, ...] = (
-    r"score\s*(?:\(\s*0\s*-\s*100\s*\))?\s*[:=]\s*(-?\d+(?:\.\d+)?)",
-    r"(-?\d+(?:\.\d+)?)\s*/\s*100",
-    r"(-?\d+(?:\.\d+)?)",
+    r"(?i)\bscore\b[^0-9]{0,30}(-?\d+(?:\.\d+)?)\s*/\s*100\b",
+    r"(?i)\bscore\b[^0-9]{0,30}(-?\d+(?:\.\d+)?)\s+out\s+of\s+100\b",
+    r"(?i)\bscore\b[^0-9]{0,30}(-?\d+(?:\.\d+)?)\b",
+    r"(?i)\b(-?\d+(?:\.\d+)?)\s*/\s*100\b",
+    r"(?i)\b(-?\d+(?:\.\d+)?)\s+out\s+of\s+100\b",
+    r":\s*(-?\d+(?:\.\d+)?)\s*$",
+    r"^\s*(-?\d+(?:\.\d+)?)\s*$",
 )
 
 
@@ -695,27 +886,11 @@ def build_gemba_esa_error_messages(
 
 
 def gemba_esa_parse_errors(model_output: str) -> dict[str, list[str]]:
-    errors: dict[str, list[str]] = {"major": [], "minor": []}
-    level: str | None = None
-
-    for raw_line in str(model_output).splitlines():
-        line = raw_line.strip()
-        line_l = line.lower()
-        if (not line) or ("no-error" in line_l) or ("no error" in line_l):
-            continue
-        if line_l == "major:":
-            level = "major"
-            continue
-        if line_l == "minor:":
-            level = "minor"
-            continue
-        if level is None:
-            continue
-        if "non-translation" in line_l:
-            errors["major"].append(line)
-        else:
-            errors[level].append(line)
-    return errors
+    return _parse_gemba_error_output(
+        model_output,
+        allowed_levels=("major", "minor"),
+        scorer_name="ESA",
+    )
 
 
 def gemba_esa_format_error_spans(model_output: str | None) -> str:
@@ -737,23 +912,40 @@ def gemba_esa_format_error_spans(model_output: str | None) -> str:
 def gemba_esa_parse_score(model_output: str | None) -> float | None:
     if model_output is None:
         return None
-    text = str(model_output)
-    for pattern in _ESA_SCORE_PATTERNS[:2]:
-        found = re.search(pattern, text, flags=re.IGNORECASE)
-        if found:
-            try:
-                value = float(found.group(1))
-            except Exception:
-                value = math.nan
-            if math.isfinite(value):
-                return value
-    all_numbers = re.findall(_ESA_SCORE_PATTERNS[2], text, flags=re.IGNORECASE)
+    text = str(model_output).strip()
+    if not text:
+        return None
+
+    if re.match(r"^\[['\"]?-?\d+(?:\.\d+)?['\"]?\]$", text):
+        inner = re.sub(r"[^\d\.\-]", "", text)
+        try:
+            value = float(inner)
+        except Exception:
+            value = math.nan
+        return value if math.isfinite(value) and 0.0 <= value <= 100.0 else None
+
+    normalized = text.replace("**", "").replace("__", "").replace("`", "")
+    normalized = re.sub(r"\b0\s*[-–]\s*100\b", " ", normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+
+    for pattern in _ESA_SCORE_PATTERNS:
+        matches = list(re.finditer(pattern, normalized))
+        if not matches:
+            continue
+        try:
+            value = float(matches[-1].group(1))
+        except Exception:
+            value = math.nan
+        if math.isfinite(value) and 0.0 <= value <= 100.0:
+            return value
+
+    all_numbers = re.findall(r"(?<!\d)(\d{1,3}(?:\.\d+)?)(?!\d)", normalized)
     for raw in reversed(all_numbers):
         try:
             value = float(raw)
         except Exception:
             continue
-        if math.isfinite(value):
+        if math.isfinite(value) and 0.0 <= value <= 100.0:
             return value
     return None
 
@@ -774,6 +966,35 @@ def build_gemba_esa_ranking_messages(
         error_spans=error_spans or "no-error",
     )
     return [{"role": "user", "content": prompt}]
+
+
+def build_gemba_esa_repair_messages(
+    *,
+    source_seg: str,
+    target_seg: str,
+    raw_output: str,
+) -> list[dict[str, str]]:
+    return [
+        {"role": "system", "content": GEMBA_ESA_REPAIR_SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": GEMBA_ESA_REPAIR_PROMPT_TEMPLATE.format(
+                source_seg=source_seg,
+                target_seg=target_seg,
+                raw_output=raw_output,
+            ),
+        },
+    ]
+
+
+def build_gemba_esa_score_extraction_messages(*, ranking_output: str) -> list[dict[str, str]]:
+    return [
+        {"role": "system", "content": GEMBA_ESA_SCORE_EXTRACTION_SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": GEMBA_ESA_SCORE_EXTRACTION_PROMPT_TEMPLATE.format(ranking_output=ranking_output),
+        },
+    ]
 
 
 def metricx_qe_input(src: str, mt: str) -> str:
@@ -1487,7 +1708,10 @@ class OpenAICompatibleMQMScorer:
 
     def score_batch(self, samples: list[SampleForScoring]) -> RewardOutput:
         if not samples:
-            return RewardOutput(sequence_scores=[], metadata={"raw_outputs": [], "error_spans": []})
+            return RewardOutput(
+                sequence_scores=[],
+                metadata={"raw_outputs": [], "error_spans": [], "skipped_rows": [], "skip_reasons": []},
+            )
 
         message_rows = [
             build_gemba_mqm_messages(
@@ -1502,7 +1726,12 @@ class OpenAICompatibleMQMScorer:
             scores = [float(v) for v in self.predict_fn(message_rows)]
             return RewardOutput(
                 sequence_scores=scores,
-                metadata={"raw_outputs": [], "error_spans": [[] for _ in samples]},
+                metadata={
+                    "raw_outputs": [],
+                    "error_spans": [[] for _ in samples],
+                    "skipped_rows": [False for _ in samples],
+                    "skip_reasons": [None for _ in samples],
+                },
             )
 
         if self._chat_url is None:
@@ -1511,56 +1740,125 @@ class OpenAICompatibleMQMScorer:
         sequence_scores: list[float] = []
         raw_outputs: list[str] = []
         error_spans: list[list[dict[str, Any]]] = []
+        skipped_rows: list[bool] = []
+        skip_reasons: list[str | None] = []
         max_workers = max(1, int(self.cfg.batch_size))
         if max_workers == 1:
             for sample, messages in zip(samples, message_rows):
-                score, raw_text = self._score_one_messages(messages)
-                sequence_scores.append(score)
-                raw_outputs.append(raw_text)
-                error_spans.append(gemba_mqm_extract_error_spans(raw_text, sample.mt))
+                try:
+                    score, raw_text, spans = self._score_one_sample(sample, messages)
+                    sequence_scores.append(score)
+                    raw_outputs.append(raw_text)
+                    error_spans.append(spans)
+                    skipped_rows.append(False)
+                    skip_reasons.append(None)
+                except Exception as exc:
+                    logger.warning("Skipping MQM-scoring sample after repeated failures: error=%s", exc)
+                    sequence_scores.append(0.0)
+                    raw_outputs.append("")
+                    error_spans.append([])
+                    skipped_rows.append(True)
+                    skip_reasons.append(str(exc))
         else:
             with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="mqm-scorer") as executor:
                 for i in range(0, len(message_rows), max_workers):
                     batch_messages = message_rows[i : i + max_workers]
                     batch_samples = samples[i : i + max_workers]
-                    futures = [executor.submit(self._score_one_messages, messages) for messages in batch_messages]
+                    futures = [
+                        executor.submit(_capture_exception, self._score_one_sample, sample, messages)
+                        for sample, messages in zip(batch_samples, batch_messages)
+                    ]
                     batch_results = [future.result() for future in futures]
-                    for sample, (score, raw_text) in zip(batch_samples, batch_results):
+                    for result in batch_results:
+                        if isinstance(result, Exception):
+                            logger.warning("Skipping MQM-scoring sample after repeated failures: error=%s", result)
+                            sequence_scores.append(0.0)
+                            raw_outputs.append("")
+                            error_spans.append([])
+                            skipped_rows.append(True)
+                            skip_reasons.append(str(result))
+                            continue
+                        score, raw_text, spans = result
                         sequence_scores.append(score)
                         raw_outputs.append(raw_text)
-                        error_spans.append(gemba_mqm_extract_error_spans(raw_text, sample.mt))
+                        error_spans.append(spans)
+                        skipped_rows.append(False)
+                        skip_reasons.append(None)
 
         return RewardOutput(
             sequence_scores=sequence_scores,
-            metadata={"raw_outputs": raw_outputs, "error_spans": error_spans},
+            metadata={
+                "raw_outputs": raw_outputs,
+                "error_spans": error_spans,
+                "skipped_rows": skipped_rows,
+                "skip_reasons": skip_reasons,
+            },
         )
 
-    def _score_one_messages(self, messages: list[dict[str, str]]) -> tuple[float, str]:
-        retries = max(0, int(self.cfg.max_retries))
+    def _score_one_sample(
+        self,
+        sample: SampleForScoring,
+        messages: list[dict[str, str]],
+    ) -> tuple[float, str, list[dict[str, Any]]]:
         last_exc: Exception | None = None
-        for attempt in range(retries + 1):
-            try:
-                raw_text = self._call_openai_compatible_api(messages)
-                raw_score = gemba_mqm_score(raw_text)
-                if raw_score is None:
-                    raise RuntimeError("GEMBA-MQM score parse returned None.")
-                scaled = self._scale_score(float(raw_score))
-                return float(scaled), raw_text
-            except Exception as exc:
-                last_exc = exc
-                if attempt < retries:
+        for enable_thinking, attempts in _gemba_parse_phase_specs():
+            for _ in range(attempts):
+                try:
+                    raw_text = self._call_openai_compatible_api(
+                        messages,
+                        chat_template_kwargs_override=_override_enable_thinking(
+                            self.cfg.chat_template_kwargs,
+                            enable_thinking=enable_thinking,
+                        ),
+                    )
+                    parsed_text = self._repair_mqm_output_if_needed(
+                        sample=sample,
+                        raw_text=raw_text,
+                        enable_thinking=enable_thinking,
+                    )
+                    raw_score = gemba_mqm_score(parsed_text)
+                    if raw_score is None:
+                        raise GembaParseError("GEMBA-MQM score parse returned None.")
+                    spans = gemba_mqm_extract_error_spans(parsed_text, sample.mt)
+                    scaled = self._scale_score(float(raw_score))
+                    return float(scaled), parsed_text, spans
+                except Exception as exc:
+                    last_exc = exc
                     continue
-                break
 
+        if last_exc is None:
+            raise RuntimeError("MQM API scoring failed without an exception.")
+        raise last_exc
+
+    def _repair_mqm_output_if_needed(self, *, sample: SampleForScoring, raw_text: str, enable_thinking: bool) -> str:
         try:
-            raise RuntimeError("MQM API scoring failed.") from last_exc
-        except Exception as exc:
-            if self.cfg.error_policy == "zero":
-                logger.warning("MQM API scoring failed; fallback score=0.0 due to error_policy=zero: %s", exc)
-                return 0.0, ""
-            raise
+            _ = gemba_mqm_score(raw_text)
+            _ = gemba_mqm_extract_error_spans(raw_text, sample.mt)
+            return raw_text
+        except GembaParseError:
+            repaired = self._call_openai_compatible_api(
+                build_gemba_mqm_repair_messages(
+                    source_seg=sample.src,
+                    target_seg=sample.mt,
+                    raw_output=raw_text,
+                ),
+                max_tokens=min(1024, max(256, int(self.cfg.max_tokens))),
+                chat_template_kwargs_override=_override_enable_thinking(
+                    self.cfg.chat_template_kwargs,
+                    enable_thinking=enable_thinking,
+                ),
+            )
+            _ = gemba_mqm_score(repaired)
+            _ = gemba_mqm_extract_error_spans(repaired, sample.mt)
+            return repaired
 
-    def _call_openai_compatible_api(self, messages: list[dict[str, str]]) -> str:
+    def _call_openai_compatible_api(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        max_tokens: int | None = None,
+        chat_template_kwargs_override: dict[str, Any] | None = None,
+    ) -> str:
         if self._chat_url is None:
             raise RuntimeError("MQM scorer chat URL is not set.")
 
@@ -1571,7 +1869,7 @@ class OpenAICompatibleMQMScorer:
             "messages": messages,
             "temperature": float(self.cfg.temperature),
             "top_p": float(self.cfg.top_p),
-            "max_tokens": int(self.cfg.max_tokens),
+            "max_tokens": int(self.cfg.max_tokens if max_tokens is None else max_tokens),
         }
         if self.cfg.reasoning_parser:
             payload["reasoning_parser"] = str(self.cfg.reasoning_parser)
@@ -1583,8 +1881,13 @@ class OpenAICompatibleMQMScorer:
             payload["repetition_penalty"] = float(self.cfg.repetition_penalty)
         if self.cfg.stop:
             payload["stop"] = list(self.cfg.stop)
-        if self.cfg.chat_template_kwargs:
-            payload["chat_template_kwargs"] = dict(self.cfg.chat_template_kwargs)
+        chat_template_kwargs = (
+            chat_template_kwargs_override
+            if chat_template_kwargs_override is not None
+            else self.cfg.chat_template_kwargs
+        )
+        if chat_template_kwargs:
+            payload["chat_template_kwargs"] = dict(chat_template_kwargs)
         if log_io:
             try:
                 payload_text = json.dumps(payload, ensure_ascii=False)
@@ -1725,13 +2028,21 @@ class OpenAICompatibleESAScorer:
 
     def score_batch(self, samples: list[SampleForScoring]) -> RewardOutput:
         if not samples:
-            return RewardOutput(sequence_scores=[], metadata={"raw_error_outputs": [], "raw_score_outputs": []})
+            return RewardOutput(
+                sequence_scores=[],
+                metadata={"raw_error_outputs": [], "raw_score_outputs": [], "skipped_rows": [], "skip_reasons": []},
+            )
 
         if self.predict_fn is not None:
             scores = [float(v) for v in self.predict_fn(samples)]
             return RewardOutput(
                 sequence_scores=scores,
-                metadata={"raw_error_outputs": ["" for _ in samples], "raw_score_outputs": ["" for _ in samples]},
+                metadata={
+                    "raw_error_outputs": ["" for _ in samples],
+                    "raw_score_outputs": ["" for _ in samples],
+                    "skipped_rows": [False for _ in samples],
+                    "skip_reasons": [None for _ in samples],
+                },
             )
 
         if self._chat_url is None:
@@ -1740,73 +2051,153 @@ class OpenAICompatibleESAScorer:
         sequence_scores: list[float] = []
         raw_error_outputs: list[str] = []
         raw_score_outputs: list[str] = []
+        skipped_rows: list[bool] = []
+        skip_reasons: list[str | None] = []
         max_workers = max(1, int(self.cfg.batch_size))
         if max_workers == 1:
             for sample in samples:
-                score, raw_error_text, raw_score_text = self._score_one_sample(sample)
-                sequence_scores.append(score)
-                raw_error_outputs.append(raw_error_text)
-                raw_score_outputs.append(raw_score_text)
+                try:
+                    score, raw_error_text, raw_score_text = self._score_one_sample(sample)
+                    sequence_scores.append(score)
+                    raw_error_outputs.append(raw_error_text)
+                    raw_score_outputs.append(raw_score_text)
+                    skipped_rows.append(False)
+                    skip_reasons.append(None)
+                except Exception as exc:
+                    logger.warning("Skipping ESA-scoring sample after repeated failures: error=%s", exc)
+                    sequence_scores.append(0.0)
+                    raw_error_outputs.append("")
+                    raw_score_outputs.append("")
+                    skipped_rows.append(True)
+                    skip_reasons.append(str(exc))
         else:
             with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="esa-scorer") as executor:
                 for i in range(0, len(samples), max_workers):
                     batch_samples = samples[i : i + max_workers]
-                    futures = [executor.submit(self._score_one_sample, sample) for sample in batch_samples]
+                    futures = [executor.submit(_capture_exception, self._score_one_sample, sample) for sample in batch_samples]
                     batch_results = [future.result() for future in futures]
-                    for score, raw_error_text, raw_score_text in batch_results:
+                    for result in batch_results:
+                        if isinstance(result, Exception):
+                            logger.warning("Skipping ESA-scoring sample after repeated failures: error=%s", result)
+                            sequence_scores.append(0.0)
+                            raw_error_outputs.append("")
+                            raw_score_outputs.append("")
+                            skipped_rows.append(True)
+                            skip_reasons.append(str(result))
+                            continue
+                        score, raw_error_text, raw_score_text = result
                         sequence_scores.append(score)
                         raw_error_outputs.append(raw_error_text)
                         raw_score_outputs.append(raw_score_text)
+                        skipped_rows.append(False)
+                        skip_reasons.append(None)
 
         return RewardOutput(
             sequence_scores=sequence_scores,
-            metadata={"raw_error_outputs": raw_error_outputs, "raw_score_outputs": raw_score_outputs},
+            metadata={
+                "raw_error_outputs": raw_error_outputs,
+                "raw_score_outputs": raw_score_outputs,
+                "skipped_rows": skipped_rows,
+                "skip_reasons": skip_reasons,
+            },
         )
 
     def _score_one_sample(self, sample: SampleForScoring) -> tuple[float, str, str]:
-        retries = max(0, int(self.cfg.max_retries))
         last_exc: Exception | None = None
-        for attempt in range(retries + 1):
-            try:
-                raw_error_text = self._call_openai_compatible_api(
-                    build_gemba_esa_error_messages(
-                        source_lang=self.cfg.source_lang,
-                        target_lang=self.cfg.target_lang,
-                        source_seg=sample.src,
-                        target_seg=sample.mt,
-                        use_fewshot=bool(self.cfg.use_fewshot),
-                    ),
-                    max_tokens=int(self.cfg.max_tokens_error_spans),
-                )
-                normalized_error_spans = gemba_esa_format_error_spans(raw_error_text)
-                raw_score_text = self._call_openai_compatible_api(
-                    build_gemba_esa_ranking_messages(
-                        source_lang=self.cfg.source_lang,
-                        target_lang=self.cfg.target_lang,
-                        source_seg=sample.src,
-                        target_seg=sample.mt,
-                        error_spans=normalized_error_spans,
-                    ),
-                    max_tokens=int(self.cfg.max_tokens_score),
-                )
-                raw_score = gemba_esa_parse_score(raw_score_text)
-                if raw_score is None:
-                    raise RuntimeError("GEMBA-ESA score parse returned None.")
-                scaled = self._scale_score(float(raw_score))
-                return float(scaled), raw_error_text, raw_score_text
-            except Exception as exc:
-                last_exc = exc
-                if attempt < retries:
+        for enable_thinking, attempts in _gemba_parse_phase_specs():
+            for _ in range(attempts):
+                try:
+                    raw_error_text = self._call_openai_compatible_api(
+                        build_gemba_esa_error_messages(
+                            source_lang=self.cfg.source_lang,
+                            target_lang=self.cfg.target_lang,
+                            source_seg=sample.src,
+                            target_seg=sample.mt,
+                            use_fewshot=bool(self.cfg.use_fewshot),
+                        ),
+                        max_tokens=int(self.cfg.max_tokens_error_spans),
+                        chat_template_kwargs_override=_override_enable_thinking(
+                            self.cfg.chat_template_kwargs,
+                            enable_thinking=enable_thinking,
+                        ),
+                    )
+                    raw_error_text = self._repair_esa_error_output_if_needed(
+                        sample=sample,
+                        raw_text=raw_error_text,
+                        enable_thinking=enable_thinking,
+                    )
+                    normalized_error_spans = gemba_esa_format_error_spans(raw_error_text)
+                    raw_score_text = self._call_openai_compatible_api(
+                        build_gemba_esa_ranking_messages(
+                            source_lang=self.cfg.source_lang,
+                            target_lang=self.cfg.target_lang,
+                            source_seg=sample.src,
+                            target_seg=sample.mt,
+                            error_spans=normalized_error_spans,
+                        ),
+                        max_tokens=int(self.cfg.max_tokens_score),
+                        chat_template_kwargs_override=_override_enable_thinking(
+                            self.cfg.chat_template_kwargs,
+                            enable_thinking=enable_thinking,
+                        ),
+                    )
+                    raw_score_text = self._repair_esa_score_output_if_needed(
+                        raw_score_text,
+                        enable_thinking=enable_thinking,
+                    )
+                    raw_score = gemba_esa_parse_score(raw_score_text)
+                    if raw_score is None:
+                        raise GembaParseError("GEMBA-ESA score parse returned None.")
+                    scaled = self._scale_score(float(raw_score))
+                    return float(scaled), raw_error_text, raw_score_text
+                except Exception as exc:
+                    last_exc = exc
                     continue
-                break
 
+        if last_exc is None:
+            raise RuntimeError("ESA API scoring failed without an exception.")
+        raise last_exc
+
+    def _repair_esa_error_output_if_needed(
+        self,
+        *,
+        sample: SampleForScoring,
+        raw_text: str,
+        enable_thinking: bool,
+    ) -> str:
         try:
-            raise RuntimeError("ESA API scoring failed.") from last_exc
-        except Exception as exc:
-            if self.cfg.error_policy == "zero":
-                logger.warning("ESA API scoring failed; fallback score=0.0 due to error_policy=zero: %s", exc)
-                return 0.0, "", ""
-            raise
+            _ = gemba_esa_format_error_spans(raw_text)
+            return raw_text
+        except GembaParseError:
+            repaired = self._call_openai_compatible_api(
+                build_gemba_esa_repair_messages(
+                    source_seg=sample.src,
+                    target_seg=sample.mt,
+                    raw_output=raw_text,
+                ),
+                max_tokens=min(1024, max(256, int(self.cfg.max_tokens_error_spans))),
+                chat_template_kwargs_override=_override_enable_thinking(
+                    self.cfg.chat_template_kwargs,
+                    enable_thinking=enable_thinking,
+                ),
+            )
+            _ = gemba_esa_format_error_spans(repaired)
+            return repaired
+
+    def _repair_esa_score_output_if_needed(self, raw_text: str, *, enable_thinking: bool) -> str:
+        if gemba_esa_parse_score(raw_text) is not None:
+            return raw_text
+        repaired = self._call_openai_compatible_api(
+            build_gemba_esa_score_extraction_messages(ranking_output=raw_text),
+            max_tokens=64,
+            chat_template_kwargs_override=_override_enable_thinking(
+                self.cfg.chat_template_kwargs,
+                enable_thinking=enable_thinking,
+            ),
+        )
+        if gemba_esa_parse_score(repaired) is None:
+            raise GembaParseError("GEMBA-ESA score parse returned None.")
+        return repaired
 
     def _call_openai_compatible_api(self, messages: list[dict[str, str]], *, max_tokens: int) -> str:
         if self._chat_url is None:
