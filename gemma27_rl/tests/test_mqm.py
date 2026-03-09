@@ -196,7 +196,9 @@ def test_openai_mqm_allows_empty_spans_when_score_parses(monkeypatch: pytest.Mon
     assert spans == []
 
 
-def test_openai_mqm_score_batch_skips_sample_when_score_parse_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_openai_mqm_score_batch_falls_back_without_skip_when_score_parse_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     scorer = OpenAICompatibleMQMScorer(
         cfg=MQMConfig(
             enabled=True,
@@ -213,7 +215,7 @@ def test_openai_mqm_score_batch_skips_sample_when_score_parse_fails(monkeypatch:
     out = scorer.score_batch([SampleForScoring(src="hello", mt="안녕", ref=None)])
 
     assert out.sequence_scores == [0.0]
-    assert out.metadata["skipped_rows"] == [True]
+    assert out.metadata["skipped_rows"] == [False]
     assert out.metadata["error_spans"] == [[]]
 
 

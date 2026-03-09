@@ -1758,12 +1758,15 @@ class OpenAICompatibleMQMScorer:
                     skipped_rows.append(False)
                     skip_reasons.append(None)
                 except Exception as exc:
-                    logger.warning("Skipping MQM-scoring sample after repeated failures: error=%s", exc)
+                    logger.warning(
+                        "MQM scoring failed after repeated failures; using fallback score=0.0 and empty spans: error=%s",
+                        exc,
+                    )
                     sequence_scores.append(0.0)
                     raw_outputs.append("")
                     error_spans.append([])
-                    skipped_rows.append(True)
-                    skip_reasons.append(str(exc))
+                    skipped_rows.append(False)
+                    skip_reasons.append(None)
         else:
             with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="mqm-scorer") as executor:
                 for i in range(0, len(message_rows), max_workers):
@@ -1776,12 +1779,15 @@ class OpenAICompatibleMQMScorer:
                     batch_results = [future.result() for future in futures]
                     for result in batch_results:
                         if isinstance(result, Exception):
-                            logger.warning("Skipping MQM-scoring sample after repeated failures: error=%s", result)
+                            logger.warning(
+                                "MQM scoring failed after repeated failures; using fallback score=0.0 and empty spans: error=%s",
+                                result,
+                            )
                             sequence_scores.append(0.0)
                             raw_outputs.append("")
                             error_spans.append([])
-                            skipped_rows.append(True)
-                            skip_reasons.append(str(result))
+                            skipped_rows.append(False)
+                            skip_reasons.append(None)
                             continue
                         score, raw_text, spans = result
                         sequence_scores.append(score)

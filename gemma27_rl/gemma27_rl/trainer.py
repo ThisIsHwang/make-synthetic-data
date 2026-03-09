@@ -3009,7 +3009,10 @@ def _prepare_rewards_and_advantages(
     mqm_skipped_count = int(sum(mqm_skipped))
     esa_skipped_count = int(sum(esa_skipped))
     if mqm_skipped_count > 0:
-        logger.warning("MQM scorer skipped %s sample(s) after repeated parse/repair failures.", mqm_skipped_count)
+        logger.warning(
+            "MQM scorer reported skipped_rows for %s sample(s), but MQM failures do not drop GRPO rollouts.",
+            mqm_skipped_count,
+        )
     if esa_skipped_count > 0:
         logger.warning("ESA scorer skipped %s sample(s) after repeated parse/repair failures.", esa_skipped_count)
     span_rows = [
@@ -3021,15 +3024,13 @@ def _prepare_rewards_and_advantages(
     ]
 
     drop_mask = [False for _ in rollouts]
-    if mqm_enabled:
-        drop_mask = [drop or skipped for drop, skipped in zip(drop_mask, mqm_skipped)]
     if esa_enabled:
         drop_mask = [drop or skipped for drop, skipped in zip(drop_mask, esa_skipped)]
     dropped_rollouts_count = int(sum(drop_mask))
     if dropped_rollouts_count > 0:
         keep_indices = [idx for idx, drop in enumerate(drop_mask) if not drop]
         logger.warning(
-            "Dropping %s rollout(s) from GRPO update because MQM/ESA scoring was skipped for those samples.",
+            "Dropping %s rollout(s) from GRPO update because ESA scoring was skipped for those samples.",
             dropped_rollouts_count,
         )
         rollouts = _filter_rows_by_indices(rollouts, keep_indices)

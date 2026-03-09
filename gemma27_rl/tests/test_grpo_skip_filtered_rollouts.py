@@ -68,6 +68,28 @@ class _MQMSkipAllScorer:
         )
 
 
+class _ESASkipSecondScorer:
+    cfg = SimpleNamespace(use_reference=False)
+
+    def score_batch(self, samples):  # type: ignore[no-untyped-def]
+        assert len(samples) == 2
+        return RewardOutput(
+            sequence_scores=[80.0, 0.0],
+            metadata={"skipped_rows": [False, True]},
+        )
+
+
+class _ESASkipAllScorer:
+    cfg = SimpleNamespace(use_reference=False)
+
+    def score_batch(self, samples):  # type: ignore[no-untyped-def]
+        assert len(samples) == 2
+        return RewardOutput(
+            sequence_scores=[0.0, 0.0],
+            metadata={"skipped_rows": [True, True]},
+        )
+
+
 def _base_cfg() -> RLPostTrainConfig:
     cfg = RLPostTrainConfig()
     cfg.reward.metricx.enabled = False
@@ -82,7 +104,7 @@ def _base_cfg() -> RLPostTrainConfig:
     return cfg
 
 
-def test_prepare_rewards_and_advantages_drops_skipped_mqm_rollouts() -> None:
+def test_prepare_rewards_and_advantages_keeps_rollouts_when_only_mqm_reports_skips() -> None:
     filtered_rollouts, advantages, reward_stats, adv_stats = _prepare_rewards_and_advantages(
         rollouts=_make_rollouts(),
         cfg=_base_cfg(),
@@ -97,14 +119,14 @@ def test_prepare_rewards_and_advantages_drops_skipped_mqm_rollouts() -> None:
         tokenizer=None,
     )
 
-    assert [rollout.example_id for rollout in filtered_rollouts] == ["ex-0"]
-    assert len(advantages) == 1
+    assert [rollout.example_id for rollout in filtered_rollouts] == ["ex-0", "ex-1"]
+    assert len(advantages) == 2
     assert reward_stats["mqm_skipped_count"] == 1.0
-    assert reward_stats["grpo_dropped_rollouts_count"] == 1.0
-    assert adv_stats["raw_std"] == pytest.approx(0.0)
+    assert reward_stats["grpo_dropped_rollouts_count"] == 0.0
+    assert adv_stats["raw_std"] > 0.0
 
 
-def test_prepare_rewards_and_advantages_handles_all_skipped_mqm_rollouts() -> None:
+def test_prepare_rewards_and_advantages_keeps_rollouts_when_all_mqm_rows_report_skips() -> None:
     filtered_rollouts, advantages, reward_stats, adv_stats = _prepare_rewards_and_advantages(
         rollouts=_make_rollouts(),
         cfg=_base_cfg(),
@@ -119,8 +141,64 @@ def test_prepare_rewards_and_advantages_handles_all_skipped_mqm_rollouts() -> No
         tokenizer=None,
     )
 
+    assert [rollout.example_id for rollout in filtered_rollouts] == ["ex-0", "ex-1"]
+    assert len(advantages) == 2
+    assert reward_stats["mqm_skipped_count"] == 2.0
+    assert reward_stats["grpo_dropped_rollouts_count"] == 0.0
+    assert adv_stats["raw_mean"] == pytest.approx(0.0)
+
+
+def test_prepare_rewards_and_advantages_drops_skipped_esa_rollouts() -> None:
+    cfg = _base_cfg()
+    cfg.reward.mqm.enabled = False
+    cfg.reward.esa.enabled = True
+    cfg.reward.w_mqm_seq = 0.0
+    cfg.reward.w_esa_seq = 0.2
+
+    filtered_rollouts, advantages, reward_stats, adv_stats = _prepare_rewards_and_advantages(
+        rollouts=_make_rollouts(),
+        cfg=cfg,
+        metricx_scorer=None,
+        xcomet_scorer=None,
+        mqm_scorer=None,
+        esa_scorer=_ESASkipSecondScorer(),  # type: ignore[arg-type]
+        metricx_cache={},
+        xcomet_cache={},
+        mqm_cache={},
+        esa_cache={},
+        tokenizer=None,
+    )
+
+    assert [rollout.example_id for rollout in filtered_rollouts] == ["ex-0"]
+    assert len(advantages) == 1
+    assert reward_stats["esa_skipped_count"] == 1.0
+    assert reward_stats["grpo_dropped_rollouts_count"] == 1.0
+    assert adv_stats["raw_std"] == pytest.approx(0.0)
+
+
+def test_prepare_rewards_and_advantages_handles_all_skipped_esa_rollouts() -> None:
+    cfg = _base_cfg()
+    cfg.reward.mqm.enabled = False
+    cfg.reward.esa.enabled = True
+    cfg.reward.w_mqm_seq = 0.0
+    cfg.reward.w_esa_seq = 0.2
+
+    filtered_rollouts, advantages, reward_stats, adv_stats = _prepare_rewards_and_advantages(
+        rollouts=_make_rollouts(),
+        cfg=cfg,
+        metricx_scorer=None,
+        xcomet_scorer=None,
+        mqm_scorer=None,
+        esa_scorer=_ESASkipAllScorer(),  # type: ignore[arg-type]
+        metricx_cache={},
+        xcomet_cache={},
+        mqm_cache={},
+        esa_cache={},
+        tokenizer=None,
+    )
+
     assert filtered_rollouts == []
     assert advantages == []
-    assert reward_stats["mqm_skipped_count"] == 2.0
+    assert reward_stats["esa_skipped_count"] == 2.0
     assert reward_stats["grpo_dropped_rollouts_count"] == 2.0
     assert adv_stats["raw_mean"] == pytest.approx(0.0)
