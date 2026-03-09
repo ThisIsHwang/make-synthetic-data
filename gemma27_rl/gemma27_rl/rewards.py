@@ -798,17 +798,6 @@ GEMBA_ESA_RANKING_PROMPT_TEMPLATE = (
     "Score (0-100):"
 )
 
-GEMBA_ESA_SCORE_EXTRACTION_SYSTEM_PROMPT = (
-    "You extract the final evaluation score and return only one number."
-)
-
-GEMBA_ESA_SCORE_EXTRACTION_PROMPT_TEMPLATE = (
-    "Extract the final score from the evaluator output below.\n"
-    "Return only one integer or decimal number from 0 to 100, with no explanation.\n\n"
-    "Evaluator output:\n"
-    "```{ranking_output}```"
-)
-
 _ESA_SCORE_PATTERNS: tuple[str, ...] = (
     r"(?i)\bscore\b[^0-9]{0,30}(-?\d+(?:\.\d+)?)\s*/\s*100\b",
     r"(?i)\bscore\b[^0-9]{0,30}(-?\d+(?:\.\d+)?)\s+out\s+of\s+100\b",
@@ -1006,18 +995,6 @@ def build_gemba_esa_repair_messages(
             ),
         },
     ]
-
-
-def build_gemba_esa_score_extraction_messages(*, ranking_output: str) -> list[dict[str, str]]:
-    return [
-        {"role": "system", "content": GEMBA_ESA_SCORE_EXTRACTION_SYSTEM_PROMPT},
-        {
-            "role": "user",
-            "content": GEMBA_ESA_SCORE_EXTRACTION_PROMPT_TEMPLATE.format(ranking_output=ranking_output),
-        },
-    ]
-
-
 def metricx_qe_input(src: str, mt: str) -> str:
     return f"source: {src} candidate: {mt}"
 
@@ -2165,10 +2142,6 @@ class OpenAICompatibleESAScorer:
                             enable_thinking=enable_thinking,
                         ),
                     )
-                    raw_score_text = self._repair_esa_score_output_if_needed(
-                        raw_score_text,
-                        enable_thinking=enable_thinking,
-                    )
                     raw_score = gemba_esa_parse_score(raw_score_text)
                     if raw_score is None:
                         raise GembaParseError("GEMBA-ESA score parse returned None.")
@@ -2181,21 +2154,6 @@ class OpenAICompatibleESAScorer:
         if last_exc is None:
             raise RuntimeError("ESA API scoring failed without an exception.")
         raise last_exc
-
-    def _repair_esa_score_output_if_needed(self, raw_text: str, *, enable_thinking: bool) -> str:
-        if gemba_esa_parse_score(raw_text) is not None:
-            return raw_text
-        repaired = self._call_openai_compatible_api(
-            build_gemba_esa_score_extraction_messages(ranking_output=raw_text),
-            max_tokens=64,
-            chat_template_kwargs_override=_override_enable_thinking(
-                self.cfg.chat_template_kwargs,
-                enable_thinking=enable_thinking,
-            ),
-        )
-        if gemba_esa_parse_score(repaired) is None:
-            raise GembaParseError("GEMBA-ESA score parse returned None.")
-        return repaired
 
     def _call_openai_compatible_api(
         self,

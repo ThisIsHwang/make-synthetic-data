@@ -215,7 +215,7 @@ def test_openai_esa_parse_failures_do_not_fallback_to_zero(monkeypatch: pytest.M
         scorer._score_one_sample(SampleForScoring(src="hello", mt="안녕", ref=None))
 
 
-def test_openai_esa_ignores_unparseable_error_annotations_and_extracts_score(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_openai_esa_ignores_unparseable_error_annotations_and_retries_score(monkeypatch: pytest.MonkeyPatch) -> None:
     scorer = OpenAICompatibleESAScorer(
         cfg=ESAConfig(
             enabled=True,
@@ -228,6 +228,7 @@ def test_openai_esa_ignores_unparseable_error_annotations_and_extracts_score(mon
         [
             "There seems to be one major issue around 안녕.",
             "I would give this translation a fairly strong result overall.",
+            "There seems to be one major issue around 안녕.",
             "81",
         ]
     )
@@ -241,7 +242,7 @@ def test_openai_esa_ignores_unparseable_error_annotations_and_extracts_score(mon
 
     score, raw_error_text, raw_score_text = scorer._score_one_sample(sample)
 
-    assert len(captured) == 3
+    assert len(captured) == 4
     assert score == 81.0
     assert raw_error_text == "There seems to be one major issue around 안녕."
     assert raw_score_text == "81"
