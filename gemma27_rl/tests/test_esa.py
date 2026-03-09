@@ -170,7 +170,7 @@ def test_openai_esa_request_includes_reasoning_parser(monkeypatch: pytest.Monkey
     assert captured["payload"]["chat_template_kwargs"] == {"enable_thinking": True}
 
 
-def test_openai_esa_retries_until_error_annotations_are_parseable(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_openai_esa_retries_until_score_is_parseable(monkeypatch: pytest.MonkeyPatch) -> None:
     scorer = OpenAICompatibleESAScorer(
         cfg=ESAConfig(
             enabled=True,
@@ -179,10 +179,7 @@ def test_openai_esa_retries_until_error_annotations_are_parseable(monkeypatch: p
         )
     )
     sample = SampleForScoring(src="hello", mt="안녕", ref=None)
-    calls = iter(
-        (["Looks okay overall.", "still bad"] * 9)
-        + ['Major:\naccuracy/mistranslation - "안녕"', "Score (0-100): 83"]
-    )
+    calls = iter(["Looks okay overall.", "still bad", "Looks okay overall.", "Score (0-100): 83"])
     call_count = {"n": 0}
 
     def _fake_call(messages, max_tokens, chat_template_kwargs_override=None):
@@ -193,9 +190,9 @@ def test_openai_esa_retries_until_error_annotations_are_parseable(monkeypatch: p
 
     score, raw_error_text, raw_score_text = scorer._score_one_sample(sample)
 
-    assert call_count["n"] == 20
+    assert call_count["n"] == 4
     assert score == 83.0
-    assert raw_error_text == 'Major:\naccuracy/mistranslation - "안녕"'
+    assert raw_error_text == "Looks okay overall."
     assert raw_score_text == "Score (0-100): 83"
 
 
@@ -214,11 +211,11 @@ def test_openai_esa_parse_failures_do_not_fallback_to_zero(monkeypatch: pytest.M
         lambda messages, max_tokens, chat_template_kwargs_override=None: "Looks okay overall.",
     )
 
-    with pytest.raises(GembaParseError, match="unparseable"):
+    with pytest.raises(GembaParseError, match="score parse returned None"):
         scorer._score_one_sample(SampleForScoring(src="hello", mt="안녕", ref=None))
 
 
-def test_openai_esa_repairs_error_annotations_and_extracts_score(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_openai_esa_ignores_unparseable_error_annotations_and_extracts_score(monkeypatch: pytest.MonkeyPatch) -> None:
     scorer = OpenAICompatibleESAScorer(
         cfg=ESAConfig(
             enabled=True,
@@ -230,7 +227,6 @@ def test_openai_esa_repairs_error_annotations_and_extracts_score(monkeypatch: py
     responses = iter(
         [
             "There seems to be one major issue around 안녕.",
-            'Major:\naccuracy/mistranslation - "안녕"\nMinor:\nno-error',
             "I would give this translation a fairly strong result overall.",
             "81",
         ]
@@ -245,9 +241,9 @@ def test_openai_esa_repairs_error_annotations_and_extracts_score(monkeypatch: py
 
     score, raw_error_text, raw_score_text = scorer._score_one_sample(sample)
 
-    assert len(captured) == 4
+    assert len(captured) == 3
     assert score == 81.0
-    assert raw_error_text == 'Major:\naccuracy/mistranslation - "안녕"\nMinor:\nno-error'
+    assert raw_error_text == "There seems to be one major issue around 안녕."
     assert raw_score_text == "81"
 
 
@@ -265,10 +261,12 @@ def test_openai_esa_enables_thinking_after_first_two_failed_attempts(monkeypatch
     def _fake_call(messages, max_tokens, chat_template_kwargs_override=None):
         call_count["n"] += 1
         seen_thinking.append(bool((chat_template_kwargs_override or {}).get("enable_thinking")))
-        if call_count["n"] <= 4:
+        if call_count["n"] in {1, 2, 4, 5, 7, 8}:
             return "bad"
-        if call_count["n"] == 5:
-            return 'Major:\naccuracy/mistranslation - "안녕"'
+        if call_count["n"] == 3:
+            return "annotation"
+        if call_count["n"] == 6:
+            return "annotation"
         return "81"
 
     monkeypatch.setattr(scorer, "_call_openai_compatible_api", _fake_call)
@@ -276,7 +274,7 @@ def test_openai_esa_enables_thinking_after_first_two_failed_attempts(monkeypatch
     score, _, _ = scorer._score_one_sample(SampleForScoring(src="hello", mt="안녕", ref=None))
 
     assert score == 81.0
-    assert seen_thinking[:4] == [False] * 4
+    assert seen_thinking[:6] == [False] * 6
     assert seen_thinking[-1] is True
 
 

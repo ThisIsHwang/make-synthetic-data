@@ -390,18 +390,27 @@ _GEMBA_ERROR_LINE_PATTERN = re.compile(
     r"(?:\s*/\s*[^:]+?)?\s*(?:-|:|–|—)\s*(.+)$",
     flags=re.IGNORECASE,
 )
-_GEMBA_PARSE_ATTEMPTS_WITHOUT_THINKING = 2
-_GEMBA_PARSE_ATTEMPTS_WITH_THINKING = 10
+_MQM_PARSE_ATTEMPTS_WITHOUT_THINKING = 1
+_MQM_PARSE_ATTEMPTS_WITH_THINKING = 1
+_ESA_SCORE_ATTEMPTS_WITHOUT_THINKING = 2
+_ESA_SCORE_ATTEMPTS_WITH_THINKING = 10
 
 
 class GembaParseError(ValueError):
     pass
 
 
-def _gemba_parse_phase_specs() -> tuple[tuple[bool, int], ...]:
+def _mqm_parse_phase_specs() -> tuple[tuple[bool, int], ...]:
     return (
-        (False, _GEMBA_PARSE_ATTEMPTS_WITHOUT_THINKING),
-        (True, _GEMBA_PARSE_ATTEMPTS_WITH_THINKING),
+        (False, _MQM_PARSE_ATTEMPTS_WITHOUT_THINKING),
+        (True, _MQM_PARSE_ATTEMPTS_WITH_THINKING),
+    )
+
+
+def _esa_score_phase_specs() -> tuple[tuple[bool, int], ...]:
+    return (
+        (False, _ESA_SCORE_ATTEMPTS_WITHOUT_THINKING),
+        (True, _ESA_SCORE_ATTEMPTS_WITH_THINKING),
     )
 
 
@@ -1820,7 +1829,7 @@ class OpenAICompatibleMQMScorer:
         messages: list[dict[str, str]],
     ) -> tuple[float, str, list[dict[str, Any]]]:
         last_exc: Exception | None = None
-        for enable_thinking, attempts in _gemba_parse_phase_specs():
+        for enable_thinking, attempts in _mqm_parse_phase_specs():
             for _ in range(attempts):
                 try:
                     raw_text = self._call_openai_compatible_api(
@@ -1838,7 +1847,10 @@ class OpenAICompatibleMQMScorer:
                     raw_score = gemba_mqm_score(parsed_text)
                     if raw_score is None:
                         raise GembaParseError("GEMBA-MQM score parse returned None.")
-                    spans = gemba_mqm_extract_error_spans(parsed_text, sample.mt)
+                    try:
+                        spans = gemba_mqm_extract_error_spans(parsed_text, sample.mt)
+                    except Exception:
+                        spans = []
                     scaled = self._scale_score(float(raw_score))
                     return float(scaled), parsed_text, spans
                 except Exception as exc:
@@ -1850,26 +1862,20 @@ class OpenAICompatibleMQMScorer:
         raise last_exc
 
     def _repair_mqm_output_if_needed(self, *, sample: SampleForScoring, raw_text: str, enable_thinking: bool) -> str:
-        try:
-            _ = gemba_mqm_score(raw_text)
-            _ = gemba_mqm_extract_error_spans(raw_text, sample.mt)
+        if gemba_mqm_score(raw_text) is not None:
             return raw_text
-        except GembaParseError:
-            repaired = self._call_openai_compatible_api(
-                build_gemba_mqm_repair_messages(
-                    source_seg=sample.src,
-                    target_seg=sample.mt,
-                    raw_output=raw_text,
-                ),
-                max_tokens=min(1024, max(256, int(self.cfg.max_tokens))),
-                chat_template_kwargs_override=_override_enable_thinking(
-                    self.cfg.chat_template_kwargs,
-                    enable_thinking=enable_thinking,
-                ),
-            )
-            _ = gemba_mqm_score(repaired)
-            _ = gemba_mqm_extract_error_spans(repaired, sample.mt)
-            return repaired
+        return self._call_openai_compatible_api(
+            build_gemba_mqm_repair_messages(
+                source_seg=sample.src,
+                target_seg=sample.mt,
+                raw_output=raw_text,
+            ),
+            max_tokens=min(1024, max(256, int(self.cfg.max_tokens))),
+            chat_template_kwargs_override=_override_enable_thinking(
+                self.cfg.chat_template_kwargs,
+                enable_thinking=enable_thinking,
+            ),
+        )
 
     def _call_openai_compatible_api(
         self,
@@ -2128,7 +2134,7 @@ class OpenAICompatibleESAScorer:
             default_source_lang=self.cfg.source_lang,
             default_target_lang=self.cfg.target_lang,
         )
-        for enable_thinking, attempts in _gemba_parse_phase_specs():
+        for enable_thinking, attempts in _esa_score_phase_specs():
             for _ in range(attempts):
                 try:
                     raw_error_text = self._call_openai_compatible_api(
@@ -2145,19 +2151,13 @@ class OpenAICompatibleESAScorer:
                             enable_thinking=enable_thinking,
                         ),
                     )
-                    raw_error_text = self._repair_esa_error_output_if_needed(
-                        sample=sample,
-                        raw_text=raw_error_text,
-                        enable_thinking=enable_thinking,
-                    )
-                    normalized_error_spans = gemba_esa_format_error_spans(raw_error_text)
                     raw_score_text = self._call_openai_compatible_api(
                         build_gemba_esa_ranking_messages(
                             source_lang=source_lang,
                             target_lang=target_lang,
                             source_seg=sample.src,
                             target_seg=sample.mt,
-                            error_spans=normalized_error_spans,
+                            error_spans=raw_error_text,
                         ),
                         max_tokens=int(self.cfg.max_tokens_score),
                         chat_template_kwargs_override=_override_enable_thinking(
@@ -2181,32 +2181,6 @@ class OpenAICompatibleESAScorer:
         if last_exc is None:
             raise RuntimeError("ESA API scoring failed without an exception.")
         raise last_exc
-
-    def _repair_esa_error_output_if_needed(
-        self,
-        *,
-        sample: SampleForScoring,
-        raw_text: str,
-        enable_thinking: bool,
-    ) -> str:
-        try:
-            _ = gemba_esa_format_error_spans(raw_text)
-            return raw_text
-        except GembaParseError:
-            repaired = self._call_openai_compatible_api(
-                build_gemba_esa_repair_messages(
-                    source_seg=sample.src,
-                    target_seg=sample.mt,
-                    raw_output=raw_text,
-                ),
-                max_tokens=min(1024, max(256, int(self.cfg.max_tokens_error_spans))),
-                chat_template_kwargs_override=_override_enable_thinking(
-                    self.cfg.chat_template_kwargs,
-                    enable_thinking=enable_thinking,
-                ),
-            )
-            _ = gemba_esa_format_error_spans(repaired)
-            return repaired
 
     def _repair_esa_score_output_if_needed(self, raw_text: str, *, enable_thinking: bool) -> str:
         if gemba_esa_parse_score(raw_text) is not None:
