@@ -250,6 +250,9 @@ def _apply_eval_sampling_split(
 
 def load_examples(cfg: DataConfig, split: str, limit: int | None = None) -> list[Example]:
     use_hf_dataset = bool(cfg.hf_dataset_name and str(cfg.hf_dataset_name).strip())
+    bidirectional_with_ref = bool(cfg.bidirectional_with_ref)
+    if split == "eval" and cfg.eval_bidirectional_with_ref is not None:
+        bidirectional_with_ref = bool(cfg.eval_bidirectional_with_ref)
 
     # Allow file-based eval override even when train uses HF datasets.
     file_override: str | None = None
@@ -330,7 +333,7 @@ def load_examples(cfg: DataConfig, split: str, limit: int | None = None) -> list
             src_lang_code=src_code,
             tgt_lang_code=tgt_code,
             ref_text=ref_text,
-            bidirectional_with_ref=bool(cfg.bidirectional_with_ref),
+            bidirectional_with_ref=bidirectional_with_ref,
             limit=limit,
         )
         reverse_examples_added += max(0, len(examples) - before_count - 1)

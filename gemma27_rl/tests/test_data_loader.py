@@ -239,3 +239,41 @@ def test_load_examples_can_expand_bidirectional_from_reference(tmp_path) -> None
     assert examples[1].tgt_lang == "English"
     assert examples[1].src_lang_code == "ko"
     assert examples[1].tgt_lang_code == "en"
+
+
+def test_eval_can_enable_bidirectional_from_reference_independently(tmp_path) -> None:
+    data_path = tmp_path / "bidirectional_eval.jsonl"
+    rows = [
+        {
+            "segment_id": 9,
+            "source": "hello",
+            "target": "안녕하세요",
+            "src_lang": "English",
+            "tgt_lang": "Korean",
+            "src_lang_code": "en",
+            "tgt_lang_code": "ko",
+        }
+    ]
+    with data_path.open("w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+    cfg = DataConfig(
+        train_file=str(data_path),
+        eval_file=str(data_path),
+        id_field="segment_id",
+        src_text_field="source",
+        src_lang_field="src_lang",
+        tgt_lang_field="tgt_lang",
+        src_lang_code_field="src_lang_code",
+        tgt_lang_code_field="tgt_lang_code",
+        ref_text_field="target",
+        bidirectional_with_ref=False,
+        eval_bidirectional_with_ref=True,
+    )
+
+    train_examples = load_examples(cfg, split="train", limit=None)
+    eval_examples = load_examples(cfg, split="eval", limit=None)
+
+    assert [example.example_id for example in train_examples] == ["9"]
+    assert [example.example_id for example in eval_examples] == ["9", "9::reverse"]

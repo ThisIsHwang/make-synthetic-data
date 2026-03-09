@@ -3690,23 +3690,35 @@ def _is_deepspeed_checkpoint_dir(path: Path) -> bool:
 
 
 def _compute_eval_selection_score(report: dict[str, Any], cfg: RLPostTrainConfig) -> float:
-    metricx_term = float(report.get("metricx_reward_mean", 0.0)) * float(cfg.reward.w_metricx)
-    xcomet_term = (
-        float(report.get("xcomet_score_mean", 0.0))
-        * float(cfg.reward.w_xcomet_seq)
-        * float(cfg.reward.xcomet_seq_scale)
-    )
-    mqm_term = (
-        float(report.get("mqm_score_mean", 0.0))
-        * float(cfg.reward.w_mqm_seq)
-        * float(cfg.reward.mqm_seq_scale)
-    )
-    esa_term = (
-        float(report.get("esa_score_mean", 0.0))
-        * float(cfg.reward.w_esa_seq)
-        * float(cfg.reward.esa_seq_scale)
-    )
-    return float(metricx_term + xcomet_term + mqm_term + esa_term)
+    def _score_one(summary: dict[str, Any]) -> float:
+        metricx_term = float(summary.get("metricx_reward_mean", 0.0)) * float(cfg.reward.w_metricx)
+        xcomet_term = (
+            float(summary.get("xcomet_score_mean", 0.0))
+            * float(cfg.reward.w_xcomet_seq)
+            * float(cfg.reward.xcomet_seq_scale)
+        )
+        mqm_term = (
+            float(summary.get("mqm_score_mean", 0.0))
+            * float(cfg.reward.w_mqm_seq)
+            * float(cfg.reward.mqm_seq_scale)
+        )
+        esa_term = (
+            float(summary.get("esa_score_mean", 0.0))
+            * float(cfg.reward.w_esa_seq)
+            * float(cfg.reward.esa_seq_scale)
+        )
+        return float(metricx_term + xcomet_term + mqm_term + esa_term)
+
+    direction_metrics = report.get("direction_metrics")
+    if isinstance(direction_metrics, dict) and direction_metrics:
+        directional_scores = [
+            _score_one(summary)
+            for summary in direction_metrics.values()
+            if isinstance(summary, dict)
+        ]
+        if directional_scores:
+            return float(sum(directional_scores) / len(directional_scores))
+    return _score_one(report)
 
 
 def _should_enable_xcomet_runtime(cfg: RLPostTrainConfig) -> bool:

@@ -98,6 +98,7 @@ class DataConfig:
     is_bad_source_field: str = "is_bad_source"
     skip_bad_source: bool = False
     bidirectional_with_ref: bool = False
+    eval_bidirectional_with_ref: bool | None = None
 
     default_src_lang: str = "English"
     default_tgt_lang: str = "Korean"

@@ -95,6 +95,69 @@ def _mean_std(values: list[float]) -> tuple[float, float]:
     return float(m), float(var**0.5)
 
 
+def _rollout_direction_label(rollout: Rollout) -> str:
+    src_code = str(rollout.src_lang_code or "").strip().lower()
+    tgt_code = str(rollout.tgt_lang_code or "").strip().lower()
+    if src_code and tgt_code:
+        return f"{src_code}->{tgt_code}"
+    src_lang = str(rollout.src_lang or "").strip() or "unknown"
+    tgt_lang = str(rollout.tgt_lang or "").strip() or "unknown"
+    return f"{src_lang}->{tgt_lang}"
+
+
+def _build_direction_metrics(
+    *,
+    rollouts: list[Rollout],
+    metricx_scores: list[float],
+    metricx_rewards: list[float],
+    xcomet_scores: list[float],
+    mqm_scores: list[float],
+    mqm_skipped: list[bool],
+    esa_scores: list[float],
+    esa_skipped: list[bool],
+) -> dict[str, dict[str, float]]:
+    grouped: dict[str, list[int]] = {}
+    for idx, rollout in enumerate(rollouts):
+        grouped.setdefault(_rollout_direction_label(rollout), []).append(idx)
+
+    direction_metrics: dict[str, dict[str, float]] = {}
+    for direction, indices in grouped.items():
+        metricx_dir = [float(metricx_scores[idx]) for idx in indices if idx < len(metricx_scores)]
+        metricx_reward_dir = [float(metricx_rewards[idx]) for idx in indices if idx < len(metricx_rewards)]
+        xcomet_dir = [float(xcomet_scores[idx]) for idx in indices if idx < len(xcomet_scores)]
+        mqm_dir = [
+            float(mqm_scores[idx])
+            for idx in indices
+            if idx < len(mqm_scores) and idx < len(mqm_skipped) and (not mqm_skipped[idx])
+        ]
+        esa_dir = [
+            float(esa_scores[idx])
+            for idx in indices
+            if idx < len(esa_scores) and idx < len(esa_skipped) and (not esa_skipped[idx])
+        ]
+        metricx_m, metricx_s = _mean_std(metricx_dir)
+        metricx_r_m, metricx_r_s = _mean_std(metricx_reward_dir)
+        xcomet_m, xcomet_s = _mean_std(xcomet_dir)
+        mqm_m, mqm_s = _mean_std(mqm_dir)
+        esa_m, esa_s = _mean_std(esa_dir)
+        direction_metrics[direction] = {
+            "num_eval_rollouts": float(len(indices)),
+            "metricx_score_mean": metricx_m,
+            "metricx_score_std": metricx_s,
+            "metricx_reward_mean": metricx_r_m,
+            "metricx_reward_std": metricx_r_s,
+            "xcomet_score_mean": xcomet_m,
+            "xcomet_score_std": xcomet_s,
+            "mqm_score_mean": mqm_m,
+            "mqm_score_std": mqm_s,
+            "mqm_skipped_count": float(sum(1 for idx in indices if idx < len(mqm_skipped) and mqm_skipped[idx])),
+            "esa_score_mean": esa_m,
+            "esa_score_std": esa_s,
+            "esa_skipped_count": float(sum(1 for idx in indices if idx < len(esa_skipped) and esa_skipped[idx])),
+        }
+    return direction_metrics
+
+
 def _validate_optional_bool_rows(*, scorer_name: str, requested: int, skipped_rows: Any | None) -> list[bool]:
     if skipped_rows is None:
         return [False for _ in range(int(requested))]
@@ -628,6 +691,18 @@ def evaluate_on_dataset(
         "avg_completion_len": float(avg_completion_len),
         "num_eval_rollouts": len(rollouts),
     }
+    direction_metrics = _build_direction_metrics(
+        rollouts=rollouts,
+        metricx_scores=metricx_scores,
+        metricx_rewards=metricx_rewards,
+        xcomet_scores=xcomet_scores,
+        mqm_scores=mqm_scores,
+        mqm_skipped=mqm_skipped,
+        esa_scores=esa_scores,
+        esa_skipped=esa_skipped,
+    )
+    if direction_metrics:
+        report["direction_metrics"] = direction_metrics
 
     raw_io_log_enabled = _env_flag("GEMMA27_RL_LOG_RAW_IO", default=False)
     raw_io_max_chars = _env_int("GEMMA27_RL_LOG_RAW_IO_MAX_CHARS", default=20000, minimum=256)
@@ -675,7 +750,12 @@ def evaluate_on_dataset(
             rows.append(
                 {
                     "example_id": rollout.example_id,
+                    "direction": _rollout_direction_label(rollout),
                     "src_text": rollout.src_text,
+                    "src_lang": rollout.src_lang,
+                    "tgt_lang": rollout.tgt_lang,
+                    "src_lang_code": rollout.src_lang_code,
+                    "tgt_lang_code": rollout.tgt_lang_code,
                     "completion_text": rollout.completion_text,
                     "completion_raw_text": (
                         raw_completion_texts[idx]
@@ -720,4 +800,14 @@ def evaluate_on_dataset(
         float(report.get("mqm_score_mean", 0.0)),
         float(report.get("esa_score_mean", 0.0)),
     )
+    if len(direction_metrics) > 1:
+        for direction, stats in sorted(direction_metrics.items()):
+            logger.info(
+                "evaluate_on_dataset: direction=%s metricx=%.4f xcomet=%.4f mqm=%.4f esa=%.4f",
+                direction,
+                float(stats.get("metricx_score_mean", 0.0)),
+                float(stats.get("xcomet_score_mean", 0.0)),
+                float(stats.get("mqm_score_mean", 0.0)),
+                float(stats.get("esa_score_mean", 0.0)),
+            )
     return report
