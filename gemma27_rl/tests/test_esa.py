@@ -129,11 +129,16 @@ def test_openai_esa_request_includes_reasoning_parser(monkeypatch: pytest.Monkey
             reasoning_parser="qwen3",
         )
     )
-    raw = scorer._call_openai_compatible_api([{"role": "user", "content": "test"}], max_tokens=64)
+    raw = scorer._call_openai_compatible_api(
+        [{"role": "user", "content": "test"}],
+        max_tokens=64,
+        chat_template_kwargs_override={"enable_thinking": True},
+    )
 
     assert raw == "Score (0-100): 83"
     assert captured["timeout"] == 120.0
     assert captured["payload"]["reasoning_parser"] == "qwen3"
+    assert captured["payload"]["chat_template_kwargs"] == {"enable_thinking": True}
 
 
 def test_openai_esa_retries_until_error_annotations_are_parseable(monkeypatch: pytest.MonkeyPatch) -> None:

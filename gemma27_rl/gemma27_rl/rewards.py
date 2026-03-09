@@ -2199,7 +2199,13 @@ class OpenAICompatibleESAScorer:
             raise GembaParseError("GEMBA-ESA score parse returned None.")
         return repaired
 
-    def _call_openai_compatible_api(self, messages: list[dict[str, str]], *, max_tokens: int) -> str:
+    def _call_openai_compatible_api(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        max_tokens: int,
+        chat_template_kwargs_override: dict[str, Any] | None = None,
+    ) -> str:
         if self._chat_url is None:
             raise RuntimeError("ESA scorer chat URL is not set.")
 
@@ -2222,8 +2228,13 @@ class OpenAICompatibleESAScorer:
             payload["repetition_penalty"] = float(self.cfg.repetition_penalty)
         if self.cfg.stop:
             payload["stop"] = list(self.cfg.stop)
-        if self.cfg.chat_template_kwargs:
-            payload["chat_template_kwargs"] = dict(self.cfg.chat_template_kwargs)
+        chat_template_kwargs = (
+            chat_template_kwargs_override
+            if chat_template_kwargs_override is not None
+            else self.cfg.chat_template_kwargs
+        )
+        if chat_template_kwargs:
+            payload["chat_template_kwargs"] = dict(chat_template_kwargs)
         if log_io:
             try:
                 payload_text = json.dumps(payload, ensure_ascii=False)
