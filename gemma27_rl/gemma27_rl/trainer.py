@@ -59,7 +59,7 @@ from .rewards import (
     spans_to_token_rewards,
 )
 from .rollout import compute_completion_logprobs, compute_completion_logprobs_batch, generate_rollouts
-from .rl_types import Rollout, SampleForScoring
+from .rl_types import Example, Rollout, SampleForScoring
 from .utils import (
     build_worker_launch_command,
     collect_huggingface_worker_env,
@@ -111,6 +111,63 @@ def _env_float(name: str, default: float) -> float:
         return float(raw.strip())
     except Exception:
         return float(default)
+
+
+def _example_direction_key(example: Example) -> str:
+    src = str(example.src_lang_code or example.src_lang or "").strip().lower() or "unknown-src"
+    tgt = str(example.tgt_lang_code or example.tgt_lang or "").strip().lower() or "unknown-tgt"
+    return f"{src}->{tgt}"
+
+
+class _DirectionBatchSampler:
+    def __init__(self, *, examples: list[Example], rng: random.Random) -> None:
+        self._rng = rng
+        self._indices_by_direction: dict[str, list[int]] = {}
+        self._queues: dict[str, deque[int]] = {}
+        for idx, example in enumerate(examples):
+            direction = _example_direction_key(example)
+            self._indices_by_direction.setdefault(direction, []).append(idx)
+        for direction in self._indices_by_direction:
+            self._queues[direction] = deque()
+            self._refill_direction(direction)
+
+    @property
+    def directions(self) -> list[str]:
+        return sorted(self._indices_by_direction)
+
+    def _refill_direction(self, direction: str) -> None:
+        indices = list(self._indices_by_direction.get(direction, []))
+        self._rng.shuffle(indices)
+        self._queues[direction] = deque(indices)
+
+    def _pick_direction(self, requested: int) -> str:
+        eligible = [direction for direction, queue in self._queues.items() if len(queue) >= requested]
+        candidates = eligible or [direction for direction, queue in self._queues.items() if len(queue) > 0]
+        if not candidates:
+            for direction in self._indices_by_direction:
+                self._refill_direction(direction)
+            eligible = [direction for direction, queue in self._queues.items() if len(queue) >= requested]
+            candidates = eligible or [direction for direction, queue in self._queues.items() if len(queue) > 0]
+        if not candidates:
+            raise ValueError("Direction batch sampler has no examples.")
+        if len(candidates) == 1:
+            return candidates[0]
+        weights = [max(1, len(self._queues[direction])) for direction in candidates]
+        return str(self._rng.choices(candidates, weights=weights, k=1)[0])
+
+    def next_batch(self, batch_size: int) -> tuple[str, list[int]]:
+        requested = max(1, int(batch_size))
+        direction = self._pick_direction(requested)
+        selected: list[int] = []
+        while len(selected) < requested:
+            queue = self._queues[direction]
+            if not queue:
+                self._refill_direction(direction)
+                queue = self._queues[direction]
+                if not queue:
+                    break
+            selected.append(int(queue.popleft()))
+        return direction, selected
 
 
 def _span_overlap_chars(start: int, end: int, tok_s: int, tok_e: int) -> int:
@@ -4326,11 +4383,9 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
     mqm_cache: dict[tuple[str, str, str, str, str], tuple[float, list[dict[str, Any]]]] = {}
     esa_cache: dict[tuple[str, str, str, str, str], float] = {}
     rng = random.Random(cfg.misc.seed)
-    train_indices = list(range(len(train_examples)))
-    rng.shuffle(train_indices)
-    train_cursor = 0
     per_rank_batch_size = max(1, int(cfg.rl.batch_size))
     effective_batch_size = per_rank_batch_size * (world_size if (use_deepspeed and world_size > 1) else 1)
+    train_batch_sampler = _DirectionBatchSampler(examples=train_examples, rng=rng)
     updates_per_epoch = math.ceil(len(train_examples) / max(1, effective_batch_size))
     if (not use_deepspeed) or rank0:
         logger.info(
@@ -4341,6 +4396,11 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
             updates_per_epoch,
             cfg.rl.updates,
         )
+        if len(train_batch_sampler.directions) > 1:
+            logger.info(
+                "Directional train batching enabled: each update uses a single direction. directions=%s",
+                train_batch_sampler.directions,
+            )
 
     if start_update > cfg.rl.updates:
         logger.info(
@@ -4358,27 +4418,19 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
         log_advantages: list[list[float]] = advantages
         if use_deepspeed and world_size > 1:
             per_rank_batches: list[list[int]] = []
+            batch_direction = ""
             if rank0:
                 global_batch_size = per_rank_batch_size * world_size
-                global_indices: list[int] = []
-                while len(global_indices) < global_batch_size:
-                    if train_cursor >= len(train_indices):
-                        rng.shuffle(train_indices)
-                        train_cursor = 0
-                    remaining = len(train_indices) - train_cursor
-                    take = min(global_batch_size - len(global_indices), remaining)
-                    if take <= 0:
-                        break
-                    global_indices.extend(train_indices[train_cursor:train_cursor + take])
-                    train_cursor += take
+                batch_direction, global_indices = train_batch_sampler.next_batch(global_batch_size)
                 per_rank_batches = [
                     global_indices[i * per_rank_batch_size : (i + 1) * per_rank_batch_size]
                     for i in range(world_size)
                 ]
 
-            shared_batch: list[Any] = [per_rank_batches]
+            shared_batch: list[Any] = [per_rank_batches, batch_direction if rank0 else ""]
             _broadcast_object_list(shared_batch, src=0)
             per_rank_batches = shared_batch[0] or []
+            batch_direction = str(shared_batch[1] or "")
             local_indices = (
                 [int(i) for i in per_rank_batches[rank]]
                 if rank < len(per_rank_batches)
@@ -4387,6 +4439,13 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
             if not local_indices:
                 logger.warning("Rank %s has empty rollout shard at update=%s; skipping step.", rank, update_idx)
             local_examples = [train_examples[i] for i in local_indices]
+            if local_examples and rank0 and batch_direction:
+                logger.info(
+                    "update=%s selected training direction=%s prompts=%s",
+                    update_idx,
+                    batch_direction,
+                    len(local_examples) * world_size,
+                )
             local_prompt_instance_ids = [
                 f"u{update_idx}:r{rank}:p{pos}:idx{int(local_indices[pos])}"
                 for pos in range(len(local_examples))
@@ -4548,13 +4607,15 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
                 log_rollouts = rollouts
                 log_advantages = advantages
         elif (not use_deepspeed) or rank0:
-            if train_cursor >= len(train_indices):
-                rng.shuffle(train_indices)
-                train_cursor = 0
-            batch_end = min(train_cursor + max(1, cfg.rl.batch_size), len(train_indices))
-            batch_indices = train_indices[train_cursor:batch_end]
-            train_cursor = batch_end
+            batch_direction, batch_indices = train_batch_sampler.next_batch(max(1, cfg.rl.batch_size))
             batch_examples = [train_examples[i] for i in batch_indices]
+            if batch_examples and batch_direction:
+                logger.info(
+                    "update=%s selected training direction=%s prompts=%s",
+                    update_idx,
+                    batch_direction,
+                    len(batch_examples),
+                )
             prompt_instance_ids = [
                 f"u{update_idx}:r{rank}:p{pos}:idx{int(batch_indices[pos])}"
                 for pos in range(len(batch_examples))
