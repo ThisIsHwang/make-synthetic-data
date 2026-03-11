@@ -313,6 +313,7 @@ class MiscConfig:
     huggingface_cache_dir: str | None = "/media/sdd3"
     huggingface_token: str | None = None
     huggingface_token_env: str = "HF_TOKEN"
+    distributed_timeout_sec: float | None = None
     aux_worker_host: str | None = None
     aux_worker_remote_workdir: str | None = None
 
@@ -344,6 +345,38 @@ def _coerce_dataclass(cls: type[Any], payload: dict[str, Any]) -> Any:
         else:
             kwargs[key] = raw
     return cls(**kwargs)
+
+
+def _find_unknown_config_keys(
+    cls: type[Any],
+    payload: Any,
+    *,
+    path: tuple[str, ...] = (),
+) -> list[str]:
+    if not isinstance(payload, dict):
+        return []
+
+    defaults = cls()
+    field_names = set(cls.__dataclass_fields__.keys())  # type: ignore[attr-defined]
+    unknown_paths: list[str] = []
+
+    for key, value in payload.items():
+        if key not in field_names:
+            joined = ".".join((*path, str(key)))
+            unknown_paths.append(joined)
+            continue
+
+        default_value = getattr(defaults, key)
+        if hasattr(default_value, "__dataclass_fields__") and isinstance(value, dict):
+            unknown_paths.extend(
+                _find_unknown_config_keys(
+                    type(default_value),
+                    value,
+                    path=(*path, str(key)),
+                )
+            )
+
+    return unknown_paths
 
 
 def _resolve_optional_path(value: str | None, base_dir: Path) -> str | None:
@@ -509,6 +542,8 @@ def _validate_config(cfg: RLPostTrainConfig) -> None:
         raise ValueError("logging.keep_last_n_checkpoints must be >= 0")
     if not isinstance(cfg.logging.reset_best_eval_on_resume, bool):
         raise ValueError("logging.reset_best_eval_on_resume must be a bool")
+    if cfg.misc.distributed_timeout_sec is not None and float(cfg.misc.distributed_timeout_sec) <= 0:
+        raise ValueError("misc.distributed_timeout_sec must be > 0 when set")
     if not str(cfg.logging.mqm_parse_failure_jsonl_name or "").strip():
         raise ValueError("logging.mqm_parse_failure_jsonl_name must not be empty")
     if not str(cfg.logging.esa_parse_failure_jsonl_name or "").strip():
@@ -748,6 +783,12 @@ def load_config(path: str | Path) -> RLPostTrainConfig:
     cfg_path = Path(path)
     yaml = _require_yaml()
     payload = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+    if not isinstance(payload, dict):
+        raise ValueError(f"Config root must be a mapping/object, got {type(payload).__name__}.")
+    unknown_paths = _find_unknown_config_keys(RLPostTrainConfig, payload)
+    if unknown_paths:
+        joined = ", ".join(sorted(unknown_paths))
+        raise ValueError(f"Unknown config key(s): {joined}")
     cfg = _coerce_dataclass(RLPostTrainConfig, payload)
 
     base_dir = cfg_path.parent.resolve()

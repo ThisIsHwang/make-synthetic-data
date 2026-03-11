@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime
 from contextlib import nullcontext
 import os
 from types import SimpleNamespace
@@ -14,6 +15,7 @@ from gemma27_rl import trainer as trainer_mod
 from gemma27_rl.trainer import (
     _build_zero3_peft_state_dict,
     _configure_nccl_heartbeat_timeout,
+    _init_deepspeed_distributed,
     _is_deepspeed_resume_shard_mismatch_error,
     _register_qwen35_zero3_external_parameters,
     _load_policy_model,
@@ -128,6 +130,34 @@ def test_configure_nccl_heartbeat_timeout_ignored_for_native(monkeypatch: pytest
     monkeypatch.delenv("TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC", raising=False)
     _configure_nccl_heartbeat_timeout(cfg)
     assert os.environ.get("TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC") is None
+
+
+def test_init_deepspeed_distributed_uses_safe_default_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = _base_cfg()
+    captured: dict[str, object] = {}
+
+    monkeypatch.setenv("WORLD_SIZE", "8")
+    monkeypatch.delenv("TORCH_DISTRIBUTED_TIMEOUT_SEC", raising=False)
+    monkeypatch.setattr(trainer_mod, "deepspeed", SimpleNamespace(init_distributed=lambda **kwargs: captured.update(kwargs)))
+    monkeypatch.setattr(trainer_mod, "_is_distributed_initialized", lambda: False)
+
+    _init_deepspeed_distributed(cfg)
+
+    assert captured["timeout"] == datetime.timedelta(seconds=7200)
+
+
+def test_init_deepspeed_distributed_respects_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = _base_cfg()
+    captured: dict[str, object] = {}
+
+    monkeypatch.setenv("WORLD_SIZE", "8")
+    monkeypatch.setenv("TORCH_DISTRIBUTED_TIMEOUT_SEC", "5400")
+    monkeypatch.setattr(trainer_mod, "deepspeed", SimpleNamespace(init_distributed=lambda **kwargs: captured.update(kwargs)))
+    monkeypatch.setattr(trainer_mod, "_is_distributed_initialized", lambda: False)
+
+    _init_deepspeed_distributed(cfg)
+
+    assert captured["timeout"] == datetime.timedelta(seconds=5400)
 
 
 def test_save_deepspeed_checkpoint_wrapper_passes_hf_model(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:

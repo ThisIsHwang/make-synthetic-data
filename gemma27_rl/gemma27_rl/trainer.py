@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+import datetime
 import json
 import logging
 import math
@@ -78,6 +79,7 @@ _FORBIDDEN_THINK_TAGS: tuple[str, ...] = ("<think>", "</think>")
 _DEFAULT_THINK_TAG_TOKEN_PENALTY = -100.0
 _DEFAULT_THINK_TAG_SEQUENCE_PENALTY = -30.0
 _DEFAULT_REPEAT_TOKEN_PENALTY = -2.0
+_DEFAULT_DEEPSPEED_DISTRIBUTED_TIMEOUT_SEC = 7200.0
 _DEFAULT_REPEAT_SEQUENCE_PENALTY = -0.5
 _DEFAULT_NGRAM_TOKEN_PENALTY = -1.0
 _DEFAULT_NGRAM_SEQUENCE_PENALTY = -0.5
@@ -830,6 +832,48 @@ def _configure_nccl_heartbeat_timeout(cfg: RLPostTrainConfig) -> None:
         logger.info("Set %s=%s (default for long rank0-only sections).", key, os.environ[key])
 
 
+def _torch_default_distributed_timeout_sec() -> float:
+    default_timeout = getattr(torch.distributed.constants, "default_pg_timeout", None)
+    if isinstance(default_timeout, datetime.timedelta):
+        return float(default_timeout.total_seconds())
+    return 1800.0
+
+
+def _resolve_distributed_timeout_sec(cfg: RLPostTrainConfig) -> float:
+    env_key = "TORCH_DISTRIBUTED_TIMEOUT_SEC"
+    raw_env = os.environ.get(env_key)
+    if raw_env is not None and str(raw_env).strip():
+        try:
+            timeout_sec = float(str(raw_env).strip())
+        except Exception as exc:
+            raise ValueError(f"{env_key} must be a positive number of seconds.") from exc
+        if (not math.isfinite(timeout_sec)) or timeout_sec <= 0:
+            raise ValueError(f"{env_key} must be a positive number of seconds.")
+        return timeout_sec
+
+    configured_timeout = cfg.misc.distributed_timeout_sec
+    if configured_timeout is not None:
+        return float(configured_timeout)
+
+    if str(cfg.rl.backend).strip().lower() == "deepspeed" and _distributed_world_size() > 1:
+        return _DEFAULT_DEEPSPEED_DISTRIBUTED_TIMEOUT_SEC
+    return _torch_default_distributed_timeout_sec()
+
+
+def _init_deepspeed_distributed(cfg: RLPostTrainConfig) -> None:
+    if deepspeed is None:
+        raise RuntimeError(
+            "rl.backend=deepspeed but `deepspeed` is not installed. "
+            "Install it and re-run."
+        )
+    if _distributed_world_size() <= 1 or _is_distributed_initialized():
+        return
+
+    timeout_sec = _resolve_distributed_timeout_sec(cfg)
+    logger.info("Initializing DeepSpeed distributed backend with timeout=%.1fs.", timeout_sec)
+    deepspeed.init_distributed(timeout=datetime.timedelta(seconds=timeout_sec))
+
+
 def _configure_cuda_allocator() -> None:
     if not torch.cuda.is_available():
         return
@@ -1000,15 +1044,8 @@ def _deepspeed_initialize(
     cfg: RLPostTrainConfig,
     policy_model: AutoModelForCausalLM,
 ) -> tuple[Any, Any]:
-    if deepspeed is None:
-        raise RuntimeError(
-            "rl.backend=deepspeed but `deepspeed` is not installed. "
-            "Install it and re-run."
-        )
-
+    _init_deepspeed_distributed(cfg)
     world_size = _distributed_world_size()
-    if world_size > 1 and not _is_distributed_initialized():
-        deepspeed.init_distributed()
 
     ds_config = _load_deepspeed_config(cfg, world_size=world_size)
     engine, optimizer, _, _ = deepspeed.initialize(
@@ -3988,12 +4025,8 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
     _apply_aux_worker_defaults(cfg)
     _assign_disjoint_gpu_devices(cfg)
     use_deepspeed = cfg.rl.backend == "deepspeed"
-    if use_deepspeed and _distributed_world_size() > 1 and not _is_distributed_initialized():
-        if deepspeed is None:
-            raise RuntimeError(
-                "rl.backend=deepspeed but deepspeed is not installed. Install it first."
-            )
-        deepspeed.init_distributed()
+    if use_deepspeed:
+        _init_deepspeed_distributed(cfg)
 
     base_device = resolve_device(cfg.misc.device)
     if use_deepspeed:

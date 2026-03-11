@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+from datetime import datetime, timezone
+import json
 import math
 import importlib.util
 import inspect
@@ -17,6 +19,7 @@ from transformers import (
     AutoTokenizer,
     Adafactor,
     Trainer,
+    TrainerCallback,
     TrainingArguments,
 )
 
@@ -25,6 +28,8 @@ from .data import build_datasets
 
 
 logger = logging.getLogger(__name__)
+LOG_FORMAT = "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+_FILE_LOG_PATHS: set[str] = set()
 
 
 class FixedAdafactorTrainer(Trainer):
@@ -60,6 +65,68 @@ class FixedAdafactorTrainer(Trainer):
                 )
                 return None
             raise
+
+
+class JsonlMetricsCallback(TrainerCallback):
+    def __init__(self, path: str | Path) -> None:
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+
+    def _should_write(self, state) -> bool:
+        return bool(getattr(state, "is_world_process_zero", True))
+
+    def _normalize_logs(self, payload: dict[str, Any] | None) -> dict[str, Any]:
+        normalized: dict[str, Any] = {}
+        for key, value in (payload or {}).items():
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                normalized[key] = value
+            else:
+                normalized[key] = str(value)
+        return normalized
+
+    def _write(self, state, event: str, payload: dict[str, Any] | None = None) -> None:
+        if not self._should_write(state):
+            return
+
+        record: dict[str, Any] = {
+            "event": event,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        if getattr(state, "global_step", None) is not None:
+            record["step"] = int(state.global_step)
+        if getattr(state, "epoch", None) is not None:
+            record["epoch"] = float(state.epoch)
+        record.update(self._normalize_logs(payload))
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=True, sort_keys=True) + "\n")
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        del control, kwargs
+        self._write(
+            state,
+            "train_begin",
+            {
+                "output_dir": args.output_dir,
+                "run_name": getattr(args, "run_name", None),
+            },
+        )
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        del args, control, kwargs
+        self._write(state, "log", dict(logs or {}))
+
+    def on_save(self, args, state, control, **kwargs):
+        del control, kwargs
+        checkpoint_dir = Path(args.output_dir) / f"checkpoint-{state.global_step}"
+        self._write(state, "save", {"checkpoint_dir": str(checkpoint_dir)})
+
+    def on_train_end(self, args, state, control, **kwargs):
+        del args, control, kwargs
+        self._write(
+            state,
+            "train_end",
+            {"best_model_checkpoint": getattr(state, "best_model_checkpoint", None)},
+        )
 
 
 class DataCollatorCausalLM:
@@ -105,10 +172,98 @@ class DataCollatorCausalLM:
 
 
 def _setup_logging() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    )
+    root_logger = logging.getLogger()
+    formatter = logging.Formatter(LOG_FORMAT)
+    if not root_logger.handlers:
+        logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
+    else:
+        root_logger.setLevel(logging.INFO)
+        for handler in root_logger.handlers:
+            handler.setLevel(logging.INFO)
+            handler.setFormatter(formatter)
+    for name in ("accelerate", "datasets", "transformers", "trl"):
+        logging.getLogger(name).setLevel(logging.INFO)
+
+
+def _enable_output_file_logging(output_dir: str | Path) -> Path:
+    log_path = (Path(output_dir) / "train.log").resolve()
+    log_key = str(log_path)
+    if log_key in _FILE_LOG_PATHS:
+        return log_path
+
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    handler = logging.FileHandler(log_path, encoding="utf-8")
+    handler.setLevel(logging.INFO)
+    handler.setFormatter(logging.Formatter(LOG_FORMAT))
+
+    root_logger = logging.getLogger()
+    root_logger.addHandler(handler)
+    for name in ("accelerate", "datasets", "transformers", "trl"):
+        library_logger = logging.getLogger(name)
+        if not library_logger.propagate:
+            library_logger.addHandler(handler)
+
+    _FILE_LOG_PATHS.add(log_key)
+    logger.info("File logging enabled path=%s", log_path)
+    return log_path
+
+
+def _metrics_log_path(output_dir: str | Path) -> Path:
+    return Path(output_dir) / "training_metrics.jsonl"
+
+
+def _resolve_report_to(cfg: SFTConfig) -> list[str]:
+    configured = [str(item).strip() for item in cfg.train.report_to if str(item).strip()]
+    normalized = {item.lower() for item in configured}
+    if "none" in normalized:
+        logger.info("HF report_to disabled explicitly with 'none'.")
+        return []
+    if configured:
+        return configured
+
+    auto_report_to: list[str] = []
+    if importlib.util.find_spec("tensorboard") is not None or importlib.util.find_spec("tensorboardX") is not None:
+        auto_report_to.append("tensorboard")
+    if importlib.util.find_spec("wandb") is not None:
+        auto_report_to.append("wandb")
+
+    if auto_report_to:
+        logger.info("Auto-enabled HF report_to=%s", auto_report_to)
+    else:
+        logger.info("No external tracker detected; keeping local file/json logging only.")
+    return auto_report_to
+
+
+def _latest_eval_metrics(trainer: Trainer) -> dict[str, Any] | None:
+    for item in reversed(getattr(trainer.state, "log_history", [])):
+        if not isinstance(item, dict):
+            continue
+        if not any(str(key).startswith("eval_") for key in item):
+            continue
+        metrics: dict[str, Any] = {}
+        for key, value in item.items():
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                metrics[key] = value
+            else:
+                metrics[key] = str(value)
+        return metrics
+    return None
+
+
+def _save_training_artifacts(trainer: Trainer, train_result, train_rows: int, eval_rows: int | None) -> None:
+    train_metrics = dict(train_result.metrics)
+    train_metrics["train_samples"] = train_rows
+    trainer.log_metrics("train", train_metrics)
+    trainer.save_metrics("train", train_metrics)
+
+    eval_metrics = _latest_eval_metrics(trainer)
+    if eval_metrics is not None:
+        if eval_rows is not None:
+            eval_metrics.setdefault("eval_samples", eval_rows)
+        trainer.save_metrics("eval", eval_metrics)
+
+    trainer.save_state()
+
 
 
 def _freeze_embeddings(
@@ -435,6 +590,8 @@ def _build_training_arguments(
 ) -> TrainingArguments:
     output_dir = Path(cfg.train.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    logging_dir = output_dir / "tensorboard"
+    report_to = _resolve_report_to(cfg)
     ta_params = set(inspect.signature(TrainingArguments.__init__).parameters)
     if cfg.train.deepspeed is not None and "deepspeed" not in ta_params:
         raise RuntimeError(
@@ -474,7 +631,7 @@ def _build_training_arguments(
         "tf32": cfg.train.tf32,
         "gradient_checkpointing": hf_gradient_checkpointing,
         "dataloader_num_workers": cfg.train.dataloader_num_workers,
-        "report_to": cfg.train.report_to,
+        "report_to": report_to,
         "remove_unused_columns": False,
         "ddp_find_unused_parameters": cfg.train.ddp_find_unused_parameters,
     }
@@ -516,6 +673,12 @@ def _build_training_arguments(
         kwargs["save_strategy"] = "steps"
     if "logging_strategy" in ta_params:
         kwargs["logging_strategy"] = "steps"
+    if "logging_dir" in ta_params:
+        kwargs["logging_dir"] = str(logging_dir)
+    if "run_name" in ta_params:
+        kwargs["run_name"] = output_dir.name
+    if "logging_first_step" in ta_params:
+        kwargs["logging_first_step"] = True
     if "optim" in ta_params:
         kwargs["optim"] = "adafactor"
     elif "adafactor" in ta_params:
@@ -529,6 +692,12 @@ def _build_training_arguments(
         logger.info("DeepSpeed enabled config=%s", supported_kwargs["deepspeed"])
     if "fsdp" in supported_kwargs:
         logger.info("FSDP enabled mode=%s config=%s", supported_kwargs["fsdp"], supported_kwargs.get("fsdp_config"))
+    logger.info(
+        "Training tracking report_to=%s logging_dir=%s metrics_jsonl=%s",
+        supported_kwargs.get("report_to", []),
+        supported_kwargs.get("logging_dir", "n/a"),
+        _metrics_log_path(output_dir),
+    )
 
     return TrainingArguments(**supported_kwargs)
 
@@ -699,6 +868,14 @@ def _log_training_sanity(cfg: SFTConfig, train_rows: int) -> None:
 def run(cfg: SFTConfig) -> None:
     output_dir = Path(cfg.train.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    log_file = _enable_output_file_logging(output_dir)
+    metrics_log = _metrics_log_path(output_dir)
+    logger.info(
+        "Training artifacts output_dir=%s log_file=%s metrics_jsonl=%s",
+        output_dir,
+        log_file,
+        metrics_log,
+    )
     _apply_runtime_compat_overrides(cfg)
     _validate_launch(cfg)
 
@@ -795,7 +972,14 @@ def run(cfg: SFTConfig) -> None:
         tokenizer=tokenizer,
         collator=collator,
     )
-    trainer.train(resume_from_checkpoint=cfg.train.resume_from_checkpoint)
+    trainer.add_callback(JsonlMetricsCallback(metrics_log))
+    train_result = trainer.train(resume_from_checkpoint=cfg.train.resume_from_checkpoint)
+    _save_training_artifacts(
+        trainer=trainer,
+        train_result=train_result,
+        train_rows=len(train_ds),
+        eval_rows=len(eval_ds) if eval_ds is not None else None,
+    )
     trainer.save_model()
     tokenizer.save_pretrained(cfg.train.output_dir)
     try:

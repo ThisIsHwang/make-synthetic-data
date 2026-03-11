@@ -155,6 +155,136 @@ def test_reset_best_eval_on_resume_loads_from_yaml(tmp_path: Path) -> None:
     assert cfg.logging.reset_best_eval_on_resume is True
 
 
+def test_distributed_timeout_sec_loads_from_yaml(tmp_path: Path) -> None:
+    cfg_path = tmp_path / "train.yaml"
+    cfg_path.write_text(
+        "\n".join(
+            [
+                "data:",
+                "  hf_dataset_name: dummy/dataset",
+                "reward:",
+                "  xcomet:",
+                "    enabled: false",
+                "  mqm:",
+                "    enabled: false",
+                "  esa:",
+                "    enabled: false",
+                "misc:",
+                "  distributed_timeout_sec: 5400",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    cfg = load_config(cfg_path)
+    assert cfg.misc.distributed_timeout_sec == 5400
+
+
+def test_distributed_timeout_sec_must_be_positive_when_set(tmp_path: Path) -> None:
+    cfg_path = tmp_path / "train.yaml"
+    cfg_path.write_text(
+        "\n".join(
+            [
+                "data:",
+                "  hf_dataset_name: dummy/dataset",
+                "reward:",
+                "  xcomet:",
+                "    enabled: false",
+                "  mqm:",
+                "    enabled: false",
+                "  esa:",
+                "    enabled: false",
+                "misc:",
+                "  distributed_timeout_sec: 0",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="misc.distributed_timeout_sec must be > 0 when set"):
+        _ = load_config(cfg_path)
+
+
+def test_unknown_top_level_config_key_raises(tmp_path: Path) -> None:
+    cfg_path = tmp_path / "train.yaml"
+    cfg_path.write_text(
+        "\n".join(
+            [
+                "data:",
+                "  hf_dataset_name: dummy/dataset",
+                "reward:",
+                "  xcomet:",
+                "    enabled: false",
+                "  mqm:",
+                "    enabled: false",
+                "loggging:",
+                "  output_dir: /tmp/out",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=r"Unknown config key\(s\): loggging"):
+        _ = load_config(cfg_path)
+
+
+def test_unknown_nested_config_key_raises_with_full_path(tmp_path: Path) -> None:
+    cfg_path = tmp_path / "train.yaml"
+    cfg_path.write_text(
+        "\n".join(
+            [
+                "data:",
+                "  hf_dataset_name: dummy/dataset",
+                "  hf_eval_splt: validation",
+                "reward:",
+                "  xcomet:",
+                "    enabled: false",
+                "  mqm:",
+                "    enabled: false",
+                "rl:",
+                "  deepspeeed_zero_stage: 2",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=r"Unknown config key\(s\): data\.hf_eval_splt, rl\.deepspeeed_zero_stage"):
+        _ = load_config(cfg_path)
+
+
+def test_freeform_dict_keys_remain_allowed(tmp_path: Path) -> None:
+    cfg_path = tmp_path / "train.yaml"
+    cfg_path.write_text(
+        "\n".join(
+            [
+                "data:",
+                "  hf_dataset_name: dummy/dataset",
+                "generation:",
+                "  chat_template_kwargs:",
+                "    enable_thinking: true",
+                "    custom_server_flag: yes",
+                "reward:",
+                "  xcomet:",
+                "    enabled: false",
+                "  mqm:",
+                "    enabled: false",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    cfg = load_config(cfg_path)
+    assert cfg.generation.chat_template_kwargs == {
+        "enable_thinking": True,
+        "custom_server_flag": True,
+    }
+
+
 def test_disable_reference_model_allows_reference_gpu_settings_without_deepspeed(tmp_path: Path) -> None:
     cfg_path = tmp_path / "train.yaml"
     cfg_path.write_text(

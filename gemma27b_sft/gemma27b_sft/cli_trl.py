@@ -7,8 +7,10 @@ from pathlib import Path
 
 from .cli import (
     DataCollatorCausalLM,
+    JsonlMetricsCallback,
     _apply_runtime_compat_overrides,
     _build_training_arguments,
+    _enable_output_file_logging,
     _ensure_gemma3_tokenizer_attrs,
     _freeze_embeddings,
     _freeze_vision_encoder,
@@ -16,7 +18,9 @@ from .cli import (
     _load_model,
     _load_tokenizer,
     _log_training_sanity,
+    _metrics_log_path,
     _resolve_fsdp_layer_cls_to_wrap,
+    _save_training_artifacts,
     _save_processor_artifacts,
     _setup_logging,
     _validate_launch,
@@ -81,6 +85,14 @@ def run(cfg: SFTConfig) -> None:
 
     output_dir = Path(cfg.train.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    log_file = _enable_output_file_logging(output_dir)
+    metrics_log = _metrics_log_path(output_dir)
+    logger.info(
+        "Training artifacts output_dir=%s log_file=%s metrics_jsonl=%s",
+        output_dir,
+        log_file,
+        metrics_log,
+    )
     _apply_runtime_compat_overrides(cfg)
     _validate_launch(cfg)
 
@@ -174,7 +186,14 @@ def run(cfg: SFTConfig) -> None:
         collator=collator,
     )
 
-    trainer.train(resume_from_checkpoint=cfg.train.resume_from_checkpoint)
+    trainer.add_callback(JsonlMetricsCallback(metrics_log))
+    train_result = trainer.train(resume_from_checkpoint=cfg.train.resume_from_checkpoint)
+    _save_training_artifacts(
+        trainer=trainer,
+        train_result=train_result,
+        train_rows=len(train_ds),
+        eval_rows=len(eval_ds) if eval_ds is not None else None,
+    )
     trainer.save_model()
     tokenizer.save_pretrained(cfg.train.output_dir)
     try:

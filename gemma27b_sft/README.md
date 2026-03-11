@@ -185,6 +185,20 @@ source .venv/bin/activate
 torchrun --nproc_per_node=8 -m gemma27b_sft.cli_trl --config configs/train_8xh100_deepspeed.yaml
 ```
 
+Training leaves tracking artifacts in `train.output_dir`:
+- `train.log`: consolidated runtime log file
+- `training_metrics.jsonl`: step-by-step train/eval/save events
+- `train_results.json` and `trainer_state.json`: Hugging Face summary/state files
+- `eval_results.json`: latest logged eval metrics when eval is enabled
+
+If `tensorboard` or `wandb` is installed and `train.report_to` is empty, the CLI auto-enables the available tracker.
+To disable external trackers explicitly, set:
+
+```yaml
+train:
+  report_to: [none]
+```
+
 5) Resume from a checkpoint:
 
 ```yaml
