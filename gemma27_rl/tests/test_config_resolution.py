@@ -129,6 +129,32 @@ def test_keep_last_n_checkpoints_must_be_non_negative(tmp_path: Path) -> None:
         _ = load_config(cfg_path)
 
 
+def test_reset_best_eval_on_resume_loads_from_yaml(tmp_path: Path) -> None:
+    cfg_path = tmp_path / "train.yaml"
+    cfg_path.write_text(
+        "\n".join(
+            [
+                "data:",
+                "  hf_dataset_name: dummy/dataset",
+                "reward:",
+                "  xcomet:",
+                "    enabled: false",
+                "  mqm:",
+                "    enabled: false",
+                "  esa:",
+                "    enabled: false",
+                "logging:",
+                "  reset_best_eval_on_resume: true",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    cfg = load_config(cfg_path)
+    assert cfg.logging.reset_best_eval_on_resume is True
+
+
 def test_disable_reference_model_allows_reference_gpu_settings_without_deepspeed(tmp_path: Path) -> None:
     cfg_path = tmp_path / "train.yaml"
     cfg_path.write_text(

@@ -8,6 +8,7 @@ from gemma27_rl.config import RLPostTrainConfig
 from gemma27_rl.trainer import (
     _is_deepspeed_checkpoint_dir,
     _prune_old_checkpoints,
+    _restore_best_eval_state_for_resume,
     _resolve_resume_checkpoint,
     _save_trainer_state,
 )
@@ -71,3 +72,43 @@ def test_prune_old_checkpoints_keeps_latest_n(tmp_path) -> None:
     assert (output_dir / "checkpoint-3").exists()
     assert (output_dir / "best").exists()
     assert (output_dir / "checkpoint-latest").exists()
+
+
+def test_restore_best_eval_state_for_resume_uses_saved_and_logged_best(tmp_path) -> None:
+    log_path = tmp_path / "train_log.jsonl"
+    log_path.write_text(
+        "\n".join(
+            [
+                '{"type":"eval","update":3,"model_select_score":0.4}',
+                '{"type":"eval","update":7,"model_select_score":0.8}',
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    best_score, best_update = _restore_best_eval_state_for_resume(
+        resume_state={"best_eval_score": 0.6, "best_eval_update": 5},
+        log_path=log_path,
+        reset_best_eval_on_resume=False,
+    )
+
+    assert best_score == pytest.approx(0.8)
+    assert best_update == 7
+
+
+def test_restore_best_eval_state_for_resume_can_reset_previous_best(tmp_path) -> None:
+    log_path = tmp_path / "train_log.jsonl"
+    log_path.write_text(
+        '{"type":"eval","update":7,"model_select_score":0.8}\n',
+        encoding="utf-8",
+    )
+
+    best_score, best_update = _restore_best_eval_state_for_resume(
+        resume_state={"best_eval_score": 0.9, "best_eval_update": 6},
+        log_path=log_path,
+        reset_best_eval_on_resume=True,
+    )
+
+    assert best_score == float("-inf")
+    assert best_update is None

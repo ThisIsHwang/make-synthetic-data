@@ -117,6 +117,44 @@ def test_grpo_update_smoke_step_no_nan() -> None:
     assert any(not torch.allclose(b, a) for b, a in zip(before, after))
 
 
+def test_update_policy_skips_when_all_rollouts_are_empty() -> None:
+    torch.manual_seed(0)
+    model = TinyCausalLM(vocab_size=64, hidden_size=32)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-2)
+
+    rollout = Rollout(
+        example_id="ex-empty",
+        prompt_text="p",
+        prompt_input_ids=[1, 2, 3],
+        completion_text="",
+        completion_token_ids=[],
+        old_logprobs=[],
+        ref_logprobs=None,
+        token_char_offsets=[],
+        src_text="src",
+        ref_text=None,
+    )
+
+    before = [p.detach().clone() for p in model.parameters()]
+    stats = update_policy(
+        rollouts=[rollout],
+        advantages=[[]],
+        policy_model=model,
+        optimizer=optimizer,
+        rl_cfg=RLConfig(algorithm="grpo", clip_eps=0.2, kl_coef=0.01, entropy_coef=0.0),
+        device="cpu",
+    )
+    after = [p.detach().clone() for p in model.parameters()]
+
+    assert stats.policy_loss == 0.0
+    assert stats.approx_kl == 0.0
+    assert stats.clip_fraction == 0.0
+    assert stats.entropy == 0.0
+    assert stats.kl_to_reference == 0.0
+    assert stats.token_count == 0
+    assert all(torch.allclose(b, a) for b, a in zip(before, after))
+
+
 def test_compute_completion_logprobs_rejects_out_of_vocab_token_ids() -> None:
     model = TinyCausalLM(vocab_size=8, hidden_size=8)
     with pytest.raises(ValueError, match="token id out of range"):

@@ -1002,6 +1002,8 @@ def generate_rollouts(
     model_eos = getattr(getattr(policy_model, "generation_config", None), "eos_token_id", None)
     eot_token_ids = _collect_end_of_turn_token_ids(tokenizer)
     eos_token_ids = _resolve_eos_token_ids(tokenizer.eos_token_id, model_eos, extra_token_ids=eot_token_ids)
+    generation_chat_kwargs = _build_generation_chat_kwargs(gen_cfg)
+    thinking_enabled = bool(generation_chat_kwargs.get("enable_thinking"))
     eos_for_generate: int | list[int] | None
     if not eos_token_ids:
         eos_for_generate = None
@@ -1014,6 +1016,11 @@ def generate_rollouts(
         pad_token_id = eos_token_ids[0]
     if eot_token_ids:
         logger.info("generate_rollouts: end-of-turn stop token ids enabled: %s", eot_token_ids)
+    if thinking_enabled and eot_token_ids:
+        logger.warning(
+            "generate_rollouts: chat_template_kwargs.enable_thinking=true while end-of-turn stop token ids are active. "
+            "Some chat templates emit EOT before answer tokens, which can yield empty completions."
+        )
 
     policy_model.eval()
     if ref_model is not None:

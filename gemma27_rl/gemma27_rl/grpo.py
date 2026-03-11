@@ -289,6 +289,7 @@ def update_policy(
         raise ValueError("optimizer is required unless policy_model is a DeepSpeed-like engine.")
 
     vocab_size = _resolve_model_vocab_size(policy_model)
+    rollouts_with_sampled_tokens = sum(1 for rollout in rollouts if rollout.completion_token_ids)
 
     if use_engine_step:
         zero_grad_fn = getattr(policy_model, "zero_grad", None)
@@ -300,6 +301,20 @@ def update_policy(
     else:
         assert optimizer is not None  # for static type checkers
         optimizer.zero_grad(set_to_none=True)
+
+    if rollouts_with_sampled_tokens <= 0:
+        logger.warning(
+            "update_policy: no sampled completion tokens across %s rollouts; skipping optimizer step.",
+            len(rollouts),
+        )
+        return TrainStats(
+            policy_loss=0.0,
+            approx_kl=0.0,
+            clip_fraction=0.0,
+            entropy=0.0,
+            kl_to_reference=0.0,
+            token_count=0,
+        )
 
     total_tokens = 0
     total_loss_value = 0.0
@@ -552,7 +567,18 @@ def update_policy(
             _flush_grad_accum()
 
     if total_tokens == 0:
-        raise RuntimeError("No valid tokens found for update.")
+        logger.warning(
+            "update_policy: all %s rollouts were skipped after alignment; no optimizer step was taken.",
+            len(rollouts),
+        )
+        return TrainStats(
+            policy_loss=0.0,
+            approx_kl=0.0,
+            clip_fraction=0.0,
+            entropy=0.0,
+            kl_to_reference=0.0,
+            token_count=0,
+        )
     _flush_grad_accum()
 
     mean_loss = float(total_loss_value / total_tokens)

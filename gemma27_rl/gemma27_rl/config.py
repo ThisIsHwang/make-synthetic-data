@@ -299,6 +299,8 @@ class LoggingConfig:
     keep_last_n_checkpoints: int = 0
     auto_resume: bool = True
     resume_from_checkpoint: str | None = None
+    # Resume weights/optimizer/update_idx but ignore previously recorded best eval.
+    reset_best_eval_on_resume: bool = False
 
 
 @dataclass
@@ -503,6 +505,8 @@ def _validate_config(cfg: RLPostTrainConfig) -> None:
         raise ValueError("rl.backend must be native|deepspeed")
     if int(cfg.logging.keep_last_n_checkpoints) < 0:
         raise ValueError("logging.keep_last_n_checkpoints must be >= 0")
+    if not isinstance(cfg.logging.reset_best_eval_on_resume, bool):
+        raise ValueError("logging.reset_best_eval_on_resume must be a bool")
     reference_runtime = str(cfg.model.reference_runtime or "worker").strip().lower()
     if reference_runtime not in {"worker", "in_process", "cpu", "colocate"}:
         raise ValueError("model.reference_runtime must be worker|in_process|cpu|colocate")

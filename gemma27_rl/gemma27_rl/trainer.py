@@ -899,6 +899,39 @@ def _scatter_object_from_rank0(per_rank_objects: list[Any] | None, *, rank: int)
     return None
 
 
+def _count_rollout_completion_tokens(rollouts: list[Rollout]) -> int:
+    total = 0
+    for rollout in rollouts:
+        total += len(list(getattr(rollout, "completion_token_ids", []) or []))
+    return int(total)
+
+
+def _should_use_per_rank_policy_update_shards(
+    *,
+    per_rank_rollouts: list[list[Rollout]],
+    merged_rollouts: list[Rollout],
+    merged_advantages: list[list[float]],
+    reward_stats: dict[str, Any],
+) -> tuple[bool, str]:
+    shard_sizes = [len(shard) for shard in per_rank_rollouts]
+    if not merged_rollouts:
+        return False, "no_rollouts"
+    if not shard_sizes:
+        return False, "no_shards"
+    if min(shard_sizes) <= 0:
+        return False, "empty_shard"
+    if len(set(shard_sizes)) != 1:
+        return False, "uneven_shard_sizes"
+    if len(merged_advantages) != len(merged_rollouts):
+        return False, "advantage_mismatch"
+    if float(reward_stats.get("grpo_dropped_rollouts_count", 0.0)) > 0.0:
+        return False, "dropped_rollouts"
+    shard_token_counts = [_count_rollout_completion_tokens(shard) for shard in per_rank_rollouts]
+    if min(shard_token_counts) <= 0:
+        return False, "zero_token_shard"
+    return True, ""
+
+
 def _local_rank_device(default_device: str) -> str:
     local_rank_text = os.environ.get("LOCAL_RANK")
     if local_rank_text and local_rank_text.isdigit() and torch.cuda.is_available():
@@ -1895,6 +1928,44 @@ def _restore_best_from_log(log_path: Path) -> tuple[float, int | None]:
                 best_score = score
                 best_update = update
     return best_score, best_update
+
+
+def _restore_best_eval_state_for_resume(
+    *,
+    resume_state: dict[str, Any] | None,
+    log_path: Path,
+    reset_best_eval_on_resume: bool,
+) -> tuple[float, int | None]:
+    if reset_best_eval_on_resume:
+        return float("-inf"), None
+
+    best_eval_score = float("-inf")
+    best_eval_update: int | None = None
+
+    if resume_state:
+        score_raw = resume_state.get("best_eval_score")
+        update_raw = resume_state.get("best_eval_update")
+        try:
+            score = float(score_raw)
+        except (TypeError, ValueError):
+            score = float("-inf")
+        try:
+            update = int(update_raw) if update_raw is not None else None
+        except (TypeError, ValueError):
+            update = None
+        if math.isfinite(score):
+            best_eval_score = score
+            best_eval_update = update
+
+    if log_path.exists():
+        log_best_score, log_best_update = _restore_best_from_log(log_path)
+        if log_best_update is not None and (
+            best_eval_update is None or log_best_score > best_eval_score
+        ):
+            best_eval_score = log_best_score
+            best_eval_update = log_best_update
+
+    return best_eval_score, best_eval_update
 
 
 def _resolve_resume_checkpoint(
@@ -4274,28 +4345,17 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
             logger.info("new best eval at update=%s score=%.6f", resolved_update_idx, resolved_score)
 
     if is_resuming:
-        if resume_state:
-            score_raw = resume_state.get("best_eval_score")
-            update_raw = resume_state.get("best_eval_update")
-            try:
-                score = float(score_raw)
-            except (TypeError, ValueError):
-                score = float("-inf")
-            try:
-                update = int(update_raw) if update_raw is not None else None
-            except (TypeError, ValueError):
-                update = None
-            if math.isfinite(score):
-                best_eval_score = score
-                best_eval_update = update
-
-        if log_path.exists():
-            log_best_score, log_best_update = _restore_best_from_log(log_path)
-            if log_best_update is not None and (
-                best_eval_update is None or log_best_score > best_eval_score
-            ):
-                best_eval_score = log_best_score
-                best_eval_update = log_best_update
+        best_eval_score, best_eval_update = _restore_best_eval_state_for_resume(
+            resume_state=resume_state,
+            log_path=log_path,
+            reset_best_eval_on_resume=bool(cfg.logging.reset_best_eval_on_resume),
+        )
+        if cfg.logging.reset_best_eval_on_resume:
+            logger.info(
+                "Resuming training from %s with logging.reset_best_eval_on_resume=true; "
+                "previous best_eval_score/update will be ignored.",
+                resume_ckpt,
+            )
 
         logger.info(
             "Resuming training from %s (resume_update=%s, start_update=%s, best_eval_update=%s, best_eval_score=%s)",
@@ -4545,20 +4605,20 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
 
             if rank0:
                 shard_sizes = [len(shard) for shard in per_rank_rollouts]
-                can_shard_update = (
-                    bool(merged_rollouts)
-                    and bool(shard_sizes)
-                    and min(shard_sizes) > 0
-                    and len(set(shard_sizes)) == 1
-                    and len(merged_advantages) == len(merged_rollouts)
-                    and float(reward_stats.get("grpo_dropped_rollouts_count", 0.0)) <= 0.0
+                shard_token_counts = [_count_rollout_completion_tokens(shard) for shard in per_rank_rollouts]
+                can_shard_update, shard_update_reason = _should_use_per_rank_policy_update_shards(
+                    per_rank_rollouts=per_rank_rollouts,
+                    merged_rollouts=merged_rollouts,
+                    merged_advantages=merged_advantages,
+                    reward_stats=reward_stats,
                 )
                 if can_shard_update:
                     logger.info(
-                        "Using per-rank policy update shards at update=%s shard_size=%s merged_rollouts=%s.",
+                        "Using per-rank policy update shards at update=%s shard_size=%s merged_rollouts=%s shard_token_count=%s.",
                         update_idx,
                         shard_sizes[0] if shard_sizes else 0,
                         len(merged_rollouts),
+                        shard_token_counts[0] if shard_token_counts else 0,
                     )
                     per_rank_advantages: list[list[list[float]]] = []
                     cursor = 0
@@ -4571,17 +4631,25 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
                         for i in range(world_size)
                     ]
                 else:
-                    if float(reward_stats.get("grpo_dropped_rollouts_count", 0.0)) > 0.0:
+                    if shard_update_reason == "dropped_rollouts":
                         logger.warning(
                             "Skipped MQM/ESA rollouts forced replicated policy update at update=%s; dropped_rollouts=%s",
                             update_idx,
                             int(float(reward_stats.get("grpo_dropped_rollouts_count", 0.0))),
                         )
-                    elif merged_rollouts and len(set(shard_sizes)) > 1:
+                    elif shard_update_reason == "uneven_shard_sizes":
                         logger.warning(
                             "Uneven rollout shard sizes at update=%s; falling back to replicated policy update this step. shard_sizes=%s",
                             update_idx,
                             shard_sizes,
+                        )
+                    elif shard_update_reason == "zero_token_shard":
+                        logger.warning(
+                            "Zero-token rollout shard detected at update=%s; falling back to replicated policy update this step. "
+                            "shard_sizes=%s shard_token_counts=%s",
+                            update_idx,
+                            shard_sizes,
+                            shard_token_counts,
                         )
                     per_rank_payload = [
                         {"rollouts": merged_rollouts, "advantages": merged_advantages}
@@ -4667,6 +4735,16 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
             log_advantages = advantages
 
         if not rollouts:
+            _dist_barrier()
+            continue
+        local_completion_token_count = _count_rollout_completion_tokens(rollouts)
+        if local_completion_token_count <= 0:
+            logger.warning(
+                "No sampled completion tokens at update=%s on rank=%s across %s rollouts; skipping policy update.",
+                update_idx,
+                rank,
+                len(rollouts),
+            )
             _dist_barrier()
             continue
 
