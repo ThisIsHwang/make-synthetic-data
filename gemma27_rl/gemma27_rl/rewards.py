@@ -1108,15 +1108,6 @@ def gemba_esa_parse_score(model_output: str | None) -> float | None:
             value = math.nan
         if math.isfinite(value) and 0.0 <= value <= 100.0:
             return value
-
-    all_numbers = re.findall(r"(?<!\d)(\d{1,3}(?:\.\d+)?)(?!\d)", normalized)
-    for raw in reversed(all_numbers):
-        try:
-            value = float(raw)
-        except Exception:
-            continue
-        if math.isfinite(value) and 0.0 <= value <= 100.0:
-            return value
     return None
 
 

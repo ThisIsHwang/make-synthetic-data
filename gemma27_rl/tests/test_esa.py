@@ -34,6 +34,8 @@ fluency/grammar - \"y\"
     assert gemba_esa_parse_score("The quality is 82/100 overall.") == 82.0
     assert gemba_esa_parse_score("**Score: 81 out of 100**") == 81.0
     assert gemba_esa_parse_score("[79]") == 79.0
+    assert gemba_esa_parse_score("1. Check adequacy 2. Check fluency 7. Final note") is None
+    assert gemba_esa_parse_score("The answer mentions 5 issues but gives no score.") is None
 
 
 def test_gemba_esa_parse_errors_rejects_unstructured_output() -> None:
