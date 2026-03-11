@@ -172,6 +172,30 @@ def test_openai_mqm_enables_thinking_after_first_failed_attempt(monkeypatch: pyt
     assert seen_thinking[-1] is True
 
 
+def test_openai_mqm_starts_with_thinking_when_configured(monkeypatch: pytest.MonkeyPatch) -> None:
+    scorer = OpenAICompatibleMQMScorer(
+        cfg=MQMConfig(
+            enabled=True,
+            base_url="http://localhost:8000/v1",
+            max_retries=0,
+            chat_template_kwargs={"enable_thinking": True},
+        )
+    )
+    sample = SampleForScoring(src="hello", mt="안녕", ref=None)
+    seen_thinking: list[bool] = []
+
+    def _fake_call(messages, max_tokens=None, chat_template_kwargs_override=None):
+        seen_thinking.append(bool((chat_template_kwargs_override or {}).get("enable_thinking")))
+        return 'Major:\naccuracy/mistranslation - "안녕"'
+
+    monkeypatch.setattr(scorer, "_call_openai_compatible_api", _fake_call)
+
+    score, _, _ = scorer._score_one_sample(sample, [{"role": "user", "content": "test"}])
+
+    assert score == -5.0
+    assert seen_thinking == [True]
+
+
 def test_openai_mqm_allows_empty_spans_when_score_parses(monkeypatch: pytest.MonkeyPatch) -> None:
     scorer = OpenAICompatibleMQMScorer(
         cfg=MQMConfig(

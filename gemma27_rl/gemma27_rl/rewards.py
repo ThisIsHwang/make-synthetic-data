@@ -392,7 +392,7 @@ _GEMBA_ERROR_LINE_PATTERN = re.compile(
 )
 _MQM_PARSE_ATTEMPTS_WITHOUT_THINKING = 1
 _MQM_PARSE_ATTEMPTS_WITH_THINKING = 1
-_ESA_SCORE_ATTEMPTS_WITHOUT_THINKING = 2
+_ESA_SCORE_ATTEMPTS_WITHOUT_THINKING = 1
 _ESA_SCORE_ATTEMPTS_WITH_THINKING = 10
 
 
@@ -400,14 +400,22 @@ class GembaParseError(ValueError):
     pass
 
 
-def _mqm_parse_phase_specs() -> tuple[tuple[bool, int], ...]:
+def _configured_enable_thinking(chat_template_kwargs: dict[str, Any] | None) -> bool:
+    return bool((chat_template_kwargs or {}).get("enable_thinking"))
+
+
+def _mqm_parse_phase_specs(chat_template_kwargs: dict[str, Any] | None) -> tuple[tuple[bool, int], ...]:
+    if _configured_enable_thinking(chat_template_kwargs):
+        return ((True, _MQM_PARSE_ATTEMPTS_WITH_THINKING),)
     return (
         (False, _MQM_PARSE_ATTEMPTS_WITHOUT_THINKING),
         (True, _MQM_PARSE_ATTEMPTS_WITH_THINKING),
     )
 
 
-def _esa_score_phase_specs() -> tuple[tuple[bool, int], ...]:
+def _esa_score_phase_specs(chat_template_kwargs: dict[str, Any] | None) -> tuple[tuple[bool, int], ...]:
+    if _configured_enable_thinking(chat_template_kwargs):
+        return ((True, _ESA_SCORE_ATTEMPTS_WITH_THINKING),)
     return (
         (False, _ESA_SCORE_ATTEMPTS_WITHOUT_THINKING),
         (True, _ESA_SCORE_ATTEMPTS_WITH_THINKING),
@@ -1812,7 +1820,7 @@ class OpenAICompatibleMQMScorer:
         messages: list[dict[str, str]],
     ) -> tuple[float, str, list[dict[str, Any]]]:
         last_exc: Exception | None = None
-        for enable_thinking, attempts in _mqm_parse_phase_specs():
+        for enable_thinking, attempts in _mqm_parse_phase_specs(self.cfg.chat_template_kwargs):
             for _ in range(attempts):
                 try:
                     raw_text = self._call_openai_compatible_api(
@@ -2117,7 +2125,7 @@ class OpenAICompatibleESAScorer:
             default_source_lang=self.cfg.source_lang,
             default_target_lang=self.cfg.target_lang,
         )
-        for enable_thinking, attempts in _esa_score_phase_specs():
+        for enable_thinking, attempts in _esa_score_phase_specs(self.cfg.chat_template_kwargs):
             for _ in range(attempts):
                 try:
                     raw_error_text = self._call_openai_compatible_api(
