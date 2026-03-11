@@ -9,8 +9,10 @@ from gemma27_rl.trainer import (
     _is_deepspeed_checkpoint_dir,
     _prune_old_checkpoints,
     _restore_best_eval_state_for_resume,
+    _resolve_run_before_train_eval_update_idx,
     _resolve_resume_checkpoint,
     _save_trainer_state,
+    _should_run_eval_before_train,
 )
 
 
@@ -112,3 +114,45 @@ def test_restore_best_eval_state_for_resume_can_reset_previous_best(tmp_path) ->
 
     assert best_score == float("-inf")
     assert best_update is None
+
+
+def test_should_run_eval_before_train_for_fresh_run() -> None:
+    assert _should_run_eval_before_train(
+        eval_enabled=True,
+        has_eval_examples=True,
+        start_update=1,
+        reset_best_eval_on_resume=False,
+    )
+
+
+def test_should_run_eval_before_train_for_resume_only_when_resetting_best() -> None:
+    assert not _should_run_eval_before_train(
+        eval_enabled=True,
+        has_eval_examples=True,
+        start_update=8,
+        reset_best_eval_on_resume=False,
+    )
+    assert _should_run_eval_before_train(
+        eval_enabled=True,
+        has_eval_examples=True,
+        start_update=8,
+        reset_best_eval_on_resume=True,
+    )
+
+
+def test_resolve_run_before_train_eval_update_idx_uses_resume_update_when_resetting_best() -> None:
+    assert _resolve_run_before_train_eval_update_idx(
+        is_resuming=False,
+        resume_update_idx=0,
+        reset_best_eval_on_resume=False,
+    ) == 0
+    assert _resolve_run_before_train_eval_update_idx(
+        is_resuming=True,
+        resume_update_idx=12,
+        reset_best_eval_on_resume=False,
+    ) == 0
+    assert _resolve_run_before_train_eval_update_idx(
+        is_resuming=True,
+        resume_update_idx=12,
+        reset_best_eval_on_resume=True,
+    ) == 12

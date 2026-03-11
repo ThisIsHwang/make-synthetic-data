@@ -1968,6 +1968,31 @@ def _restore_best_eval_state_for_resume(
     return best_eval_score, best_eval_update
 
 
+def _should_run_eval_before_train(
+    *,
+    eval_enabled: bool,
+    has_eval_examples: bool,
+    start_update: int,
+    reset_best_eval_on_resume: bool,
+) -> bool:
+    if not eval_enabled or not has_eval_examples:
+        return False
+    if start_update <= 1:
+        return True
+    return bool(reset_best_eval_on_resume)
+
+
+def _resolve_run_before_train_eval_update_idx(
+    *,
+    is_resuming: bool,
+    resume_update_idx: int,
+    reset_best_eval_on_resume: bool,
+) -> int:
+    if is_resuming and reset_best_eval_on_resume:
+        return int(max(0, resume_update_idx))
+    return 0
+
+
 def _resolve_resume_checkpoint(
     cfg: RLPostTrainConfig,
     output_dir: Path,
@@ -4401,10 +4426,23 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
             distributed_world_size=world_size,
         )
 
-    if cfg.eval.run_before_train and eval_examples and start_update <= 1:
+    run_before_train_eval = _should_run_eval_before_train(
+        eval_enabled=bool(cfg.eval.run_before_train),
+        has_eval_examples=bool(eval_examples),
+        start_update=start_update,
+        reset_best_eval_on_resume=bool(cfg.logging.reset_best_eval_on_resume),
+    )
+    run_before_train_eval_update_idx = _resolve_run_before_train_eval_update_idx(
+        is_resuming=is_resuming,
+        resume_update_idx=resume_update_idx,
+        reset_best_eval_on_resume=bool(cfg.logging.reset_best_eval_on_resume),
+    )
+
+    if run_before_train_eval:
         if (not use_deepspeed) or rank0:
             logger.info(
-                "starting eval (run_before_train): examples=%s metricx=%s xcomet=%s mqm=%s esa=%s",
+                "starting eval (run_before_train): update=%s examples=%s metricx=%s xcomet=%s mqm=%s esa=%s",
+                run_before_train_eval_update_idx,
                 len(eval_examples),
                 bool(metricx_scorer is not None and cfg.reward.metricx.enabled),
                 bool(xcomet_scorer is not None and xcomet_runtime_enabled),
@@ -4419,18 +4457,22 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
             eval_select_score = _compute_eval_selection_score(report, cfg)
             report["model_select_score"] = eval_select_score
             eval_rows = report.pop("eval_rows", [])
-            _log_json_row({"type": "eval", "update": 0, **report})
+            _log_json_row({"type": "eval", "update": run_before_train_eval_update_idx, **report})
             if cfg.logging.save_eval_outputs:
-                _log_eval_rows(update_idx=0, eval_rows=eval_rows)
+                _log_eval_rows(update_idx=run_before_train_eval_update_idx, eval_rows=eval_rows)
             logger.info(
-                "finished eval (run_before_train): update=0 model_select_score=%.6f metricx=%.4f xcomet=%.4f mqm=%.4f esa=%.4f",
+                "finished eval (run_before_train): update=%s model_select_score=%.6f metricx=%.4f xcomet=%.4f mqm=%.4f esa=%.4f",
+                run_before_train_eval_update_idx,
                 float(eval_select_score),
                 float(report.get("metricx_score_mean", 0.0)),
                 float(report.get("xcomet_score_mean", 0.0)),
                 float(report.get("mqm_score_mean", 0.0)),
                 float(report.get("esa_score_mean", 0.0)),
             )
-        _sync_and_save_best_checkpoint(eval_select_score if rank0 else None, update_idx=0)
+        _sync_and_save_best_checkpoint(
+            eval_select_score if rank0 else None,
+            update_idx=run_before_train_eval_update_idx,
+        )
         _dist_barrier()
     elif cfg.eval.run_before_train and eval_examples and start_update > 1:
         logger.info(
