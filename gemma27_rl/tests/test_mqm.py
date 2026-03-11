@@ -243,7 +243,7 @@ def test_openai_mqm_score_batch_falls_back_without_skip_when_score_parse_fails(
     assert out.metadata["error_spans"] == [[]]
 
 
-def test_openai_mqm_request_includes_reasoning_parser(monkeypatch) -> None:
+def test_openai_mqm_request_omits_reasoning_parser(monkeypatch) -> None:
     captured: dict[str, object] = {}
 
     class _FakeResponse:
@@ -276,4 +276,49 @@ def test_openai_mqm_request_includes_reasoning_parser(monkeypatch) -> None:
 
     assert raw == "Minor:\nno-error"
     assert captured["timeout"] == 120.0
-    assert captured["payload"]["reasoning_parser"] == "qwen3"
+    assert "reasoning_parser" not in captured["payload"]
+
+
+def test_openai_mqm_accepts_reasoning_style_content_parts(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return json.dumps(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": [
+                                    {"type": "reasoning", "text": "Let me think."},
+                                    {"type": "text", "text": 'Major:\naccuracy/mistranslation - "안녕"'},
+                                ]
+                            }
+                        }
+                    ]
+                }
+            ).encode("utf-8")
+
+    class _FakeOpener:
+        def open(self, req, timeout=None):
+            return _FakeResponse()
+
+    monkeypatch.setattr(rewards_mod, "_temporarily_unset_proxy_env", lambda: (lambda: None))
+    monkeypatch.setattr(rewards_mod.urllib_request, "build_opener", lambda *args, **kwargs: _FakeOpener())
+
+    scorer = OpenAICompatibleMQMScorer(
+        cfg=MQMConfig(
+            enabled=True,
+            base_url="http://localhost:8000/v1",
+        )
+    )
+    raw = scorer._call_openai_compatible_api(
+        [{"role": "user", "content": "test"}],
+        chat_template_kwargs_override={"enable_thinking": True},
+    )
+
+    assert raw == 'Major:\naccuracy/mistranslation - "안녕"'

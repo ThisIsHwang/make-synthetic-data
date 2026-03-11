@@ -75,6 +75,108 @@ def _truncate_for_log(text: str, max_chars: int) -> str:
     return text[:max_chars] + f"...[truncated {len(text) - max_chars} chars]"
 
 
+_OPENAI_TEXT_KEYS: tuple[str, ...] = (
+    "content",
+    "text",
+    "output_text",
+    "value",
+)
+_OPENAI_REASONING_KEYS: tuple[str, ...] = (
+    "reasoning",
+    "reasoning_content",
+    "thinking",
+)
+_OPENAI_REASONING_ITEM_TYPES: set[str] = {
+    "reasoning",
+    "reasoning_content",
+    "thinking",
+}
+
+
+def _collect_openai_text_fragments(value: Any, *, _depth: int = 0) -> tuple[list[str], list[str]]:
+    if _depth > 6:
+        return [], []
+
+    if isinstance(value, str):
+        text = value.strip()
+        return ([value] if text else []), []
+
+    if isinstance(value, list):
+        direct: list[str] = []
+        reasoning: list[str] = []
+        for item in value:
+            item_direct, item_reasoning = _collect_openai_text_fragments(item, _depth=_depth + 1)
+            direct.extend(item_direct)
+            reasoning.extend(item_reasoning)
+        return direct, reasoning
+
+    if not isinstance(value, dict):
+        return [], []
+
+    direct: list[str] = []
+    reasoning: list[str] = []
+    item_type = str(value.get("type", "") or "").strip().lower()
+    target = reasoning if item_type in _OPENAI_REASONING_ITEM_TYPES else direct
+
+    for key in _OPENAI_TEXT_KEYS:
+        if key not in value:
+            continue
+        item_direct, item_reasoning = _collect_openai_text_fragments(value.get(key), _depth=_depth + 1)
+        if target is reasoning:
+            reasoning.extend(item_direct)
+            reasoning.extend(item_reasoning)
+        else:
+            direct.extend(item_direct)
+            reasoning.extend(item_reasoning)
+
+    for key in _OPENAI_REASONING_KEYS:
+        if key not in value:
+            continue
+        item_direct, item_reasoning = _collect_openai_text_fragments(value.get(key), _depth=_depth + 1)
+        reasoning.extend(item_direct)
+        reasoning.extend(item_reasoning)
+
+    return direct, reasoning
+
+
+def _extract_openai_response_text(
+    *,
+    parsed: dict[str, Any],
+    scorer_name: str,
+    log_io: bool,
+    log_max_chars: int,
+) -> str:
+    choices = parsed.get("choices")
+    if not isinstance(choices, list) or not choices:
+        raise RuntimeError(f"{scorer_name} API response has no choices.")
+
+    first = choices[0]
+    candidates: list[Any] = []
+    if isinstance(first, dict):
+        msg = first.get("message")
+        if isinstance(msg, dict):
+            candidates.append(msg)
+        for key in ("text", "content", "output_text"):
+            if key in first:
+                candidates.append(first.get(key))
+
+    for candidate in candidates:
+        direct_parts, reasoning_parts = _collect_openai_text_fragments(candidate)
+        parts = [part for part in (direct_parts or reasoning_parts) if str(part).strip()]
+        if not parts:
+            continue
+        joined = "\n".join(parts)
+        if log_io:
+            logger.info(
+                "[%s-io] parsed_content=%s",
+                scorer_name.lower(),
+                _truncate_for_log(joined, log_max_chars),
+            )
+        return joined
+
+    raise RuntimeError(f"{scorer_name} API response format is unsupported.")
+
+
 def _temporarily_unset_proxy_env() -> Callable[[], None]:
     keys = (
         "HTTP_PROXY",
@@ -1887,8 +1989,6 @@ class OpenAICompatibleMQMScorer:
             "top_p": float(self.cfg.top_p),
             "max_tokens": int(self.cfg.max_tokens if max_tokens is None else max_tokens),
         }
-        if self.cfg.reasoning_parser:
-            payload["reasoning_parser"] = str(self.cfg.reasoning_parser)
         if self.cfg.top_k is not None:
             payload["top_k"] = int(self.cfg.top_k)
         if self.cfg.presence_penalty is not None:
@@ -1958,44 +2058,12 @@ class OpenAICompatibleMQMScorer:
         except json.JSONDecodeError as exc:
             raise RuntimeError("MQM API response is not valid JSON.") from exc
 
-        choices = parsed.get("choices")
-        if not isinstance(choices, list) or not choices:
-            raise RuntimeError("MQM API response has no choices.")
-        first = choices[0]
-        if isinstance(first, dict):
-            msg = first.get("message")
-            if isinstance(msg, dict):
-                content = msg.get("content")
-                if isinstance(content, str):
-                    if log_io:
-                        logger.info(
-                            "[mqm-io] parsed_content=%s",
-                            _truncate_for_log(content, log_max_chars),
-                        )
-                    return content
-                if isinstance(content, list):
-                    text_parts = []
-                    for item in content:
-                        if isinstance(item, dict) and isinstance(item.get("text"), str):
-                            text_parts.append(item["text"])
-                    if text_parts:
-                        joined = "\n".join(text_parts)
-                        if log_io:
-                            logger.info(
-                                "[mqm-io] parsed_content=%s",
-                                _truncate_for_log(joined, log_max_chars),
-                            )
-                        return joined
-            text = first.get("text")
-            if isinstance(text, str):
-                if log_io:
-                    logger.info(
-                        "[mqm-io] parsed_content=%s",
-                        _truncate_for_log(text, log_max_chars),
-                    )
-                return text
-
-        raise RuntimeError("MQM API response format is unsupported.")
+        return _extract_openai_response_text(
+            parsed=parsed,
+            scorer_name="MQM",
+            log_io=log_io,
+            log_max_chars=log_max_chars,
+        )
 
     def _scale_score(self, score: float) -> float:
         lo = float(self.cfg.score_min)
@@ -2188,8 +2256,6 @@ class OpenAICompatibleESAScorer:
             "top_p": float(self.cfg.top_p),
             "max_tokens": int(max_tokens),
         }
-        if self.cfg.reasoning_parser:
-            payload["reasoning_parser"] = str(self.cfg.reasoning_parser)
         if self.cfg.top_k is not None:
             payload["top_k"] = int(self.cfg.top_k)
         if self.cfg.presence_penalty is not None:
@@ -2259,44 +2325,12 @@ class OpenAICompatibleESAScorer:
         except json.JSONDecodeError as exc:
             raise RuntimeError("ESA API response is not valid JSON.") from exc
 
-        choices = parsed.get("choices")
-        if not isinstance(choices, list) or not choices:
-            raise RuntimeError("ESA API response has no choices.")
-        first = choices[0]
-        if isinstance(first, dict):
-            msg = first.get("message")
-            if isinstance(msg, dict):
-                content = msg.get("content")
-                if isinstance(content, str):
-                    if log_io:
-                        logger.info(
-                            "[esa-io] parsed_content=%s",
-                            _truncate_for_log(content, log_max_chars),
-                        )
-                    return content
-                if isinstance(content, list):
-                    text_parts = []
-                    for item in content:
-                        if isinstance(item, dict) and isinstance(item.get("text"), str):
-                            text_parts.append(item["text"])
-                    if text_parts:
-                        joined = "\n".join(text_parts)
-                        if log_io:
-                            logger.info(
-                                "[esa-io] parsed_content=%s",
-                                _truncate_for_log(joined, log_max_chars),
-                            )
-                        return joined
-            text = first.get("text")
-            if isinstance(text, str):
-                if log_io:
-                    logger.info(
-                        "[esa-io] parsed_content=%s",
-                        _truncate_for_log(text, log_max_chars),
-                    )
-                return text
-
-        raise RuntimeError("ESA API response format is unsupported.")
+        return _extract_openai_response_text(
+            parsed=parsed,
+            scorer_name="ESA",
+            log_io=log_io,
+            log_max_chars=log_max_chars,
+        )
 
     def _scale_score(self, score: float) -> float:
         lo = float(self.cfg.score_min)
