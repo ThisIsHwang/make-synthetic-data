@@ -20,7 +20,26 @@ cd gemma27_rl
 uv venv .venv --python 3.10
 source .venv/bin/activate
 uv pip install -r requirements.txt
+```
+
+`requirements.txt`는 `pyproject.toml`의 `.[full]` extras를 설치하는 thin wrapper입니다.
+
+최소 editable install만 원하면:
+
+```bash
 uv pip install -e .
+```
+
+일반적인 RL 실행 환경은 보통 다음 extras가 필요합니다:
+
+```bash
+uv pip install -e ".[train,reward]"
+```
+
+DeepSpeed multi-GPU 학습까지 포함하면:
+
+```bash
+uv pip install -e ".[train,reward,deepspeed]"
 ```
 
 분리 환경(학습/MetricX/xCOMET)을 쓰려면:

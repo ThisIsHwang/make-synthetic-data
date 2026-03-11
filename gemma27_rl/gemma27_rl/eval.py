@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from collections import Counter
 from copy import deepcopy
+import datetime
 import logging
 import math
 import os
@@ -36,6 +37,8 @@ logger = logging.getLogger(__name__)
 _EVAL_PAD_PREFIX = "__eval_pad__:"
 _EVAL_OBJECT_GROUP: Any | None = None
 _EVAL_OBJECT_GROUP_WORLD_SIZE: int = -1
+_EVAL_OBJECT_GROUP_TIMEOUT_SEC: float = -1.0
+_DEFAULT_DEEPSPEED_EVAL_OBJECT_TIMEOUT_SEC = 7200.0
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -223,6 +226,36 @@ def _distributed_ready(rank: int, world_size: int) -> bool:
     return torch.distributed.is_initialized()
 
 
+def _torch_default_distributed_timeout_sec() -> float:
+    if torch is None:
+        return 1800.0
+    default_timeout = getattr(torch.distributed.constants, "default_pg_timeout", None)
+    if isinstance(default_timeout, datetime.timedelta):
+        return float(default_timeout.total_seconds())
+    return 1800.0
+
+
+def _resolve_eval_object_group_timeout_sec(cfg: RLPostTrainConfig, world_size: int) -> float:
+    env_key = "TORCH_DISTRIBUTED_TIMEOUT_SEC"
+    raw_env = os.environ.get(env_key)
+    if raw_env is not None and str(raw_env).strip():
+        try:
+            timeout_sec = float(str(raw_env).strip())
+        except Exception as exc:
+            raise ValueError(f"{env_key} must be a positive number of seconds.") from exc
+        if (not math.isfinite(timeout_sec)) or timeout_sec <= 0:
+            raise ValueError(f"{env_key} must be a positive number of seconds.")
+        return timeout_sec
+
+    configured_timeout = cfg.misc.distributed_timeout_sec
+    if configured_timeout is not None:
+        return float(configured_timeout)
+
+    if str(cfg.rl.backend).strip().lower() == "deepspeed" and int(world_size) > 1:
+        return _DEFAULT_DEEPSPEED_EVAL_OBJECT_TIMEOUT_SEC
+    return _torch_default_distributed_timeout_sec()
+
+
 def _set_distributed_cuda_device() -> None:
     if torch is None or (not torch.cuda.is_available()):
         return
@@ -232,7 +265,7 @@ def _set_distributed_cuda_device() -> None:
     torch.cuda.set_device(int(local_rank_raw))
 
 
-def _get_eval_object_collective_group(rank: int, world_size: int) -> Any | None:
+def _get_eval_object_collective_group(cfg: RLPostTrainConfig, rank: int, world_size: int) -> Any | None:
     if not _distributed_ready(rank, world_size):
         return None
     if torch is None:
@@ -241,26 +274,44 @@ def _get_eval_object_collective_group(rank: int, world_size: int) -> Any | None:
     if backend == "gloo":
         return None
 
-    global _EVAL_OBJECT_GROUP, _EVAL_OBJECT_GROUP_WORLD_SIZE
-    if _EVAL_OBJECT_GROUP is not None and _EVAL_OBJECT_GROUP_WORLD_SIZE == int(world_size):
+    timeout_sec = _resolve_eval_object_group_timeout_sec(cfg, world_size)
+
+    global _EVAL_OBJECT_GROUP, _EVAL_OBJECT_GROUP_WORLD_SIZE, _EVAL_OBJECT_GROUP_TIMEOUT_SEC
+    if (
+        _EVAL_OBJECT_GROUP is not None
+        and _EVAL_OBJECT_GROUP_WORLD_SIZE == int(world_size)
+        and math.isclose(_EVAL_OBJECT_GROUP_TIMEOUT_SEC, float(timeout_sec), rel_tol=0.0, abs_tol=1e-9)
+    ):
         return _EVAL_OBJECT_GROUP
 
     # Build a dedicated Gloo group for Python-object collectives in eval.
     # This avoids NCCL-specific device alignment issues/deadlocks.
-    _EVAL_OBJECT_GROUP = torch.distributed.new_group(backend="gloo")
+    _EVAL_OBJECT_GROUP = torch.distributed.new_group(
+        backend="gloo",
+        timeout=datetime.timedelta(seconds=float(timeout_sec)),
+    )
     _EVAL_OBJECT_GROUP_WORLD_SIZE = int(world_size)
+    _EVAL_OBJECT_GROUP_TIMEOUT_SEC = float(timeout_sec)
     if rank == 0:
         logger.info(
-            "evaluate_on_dataset: created dedicated gloo group for object collectives (world_size=%s).",
+            "evaluate_on_dataset: created dedicated gloo group for object collectives "
+            "(world_size=%s timeout=%.1fs).",
             world_size,
+            timeout_sec,
         )
     return _EVAL_OBJECT_GROUP
 
 
-def _gather_rollouts_to_rank0(local_rollouts: list[Rollout], *, rank: int, world_size: int) -> list[Rollout]:
+def _gather_rollouts_to_rank0(
+    local_rollouts: list[Rollout],
+    *,
+    cfg: RLPostTrainConfig,
+    rank: int,
+    world_size: int,
+) -> list[Rollout]:
     if not _distributed_ready(rank, world_size):
         return local_rollouts
-    object_group = _get_eval_object_collective_group(rank, world_size)
+    object_group = _get_eval_object_collective_group(cfg, rank, world_size)
     # When falling back to default NCCL group, keep rank/device aligned.
     if object_group is None:
         _set_distributed_cuda_device()
@@ -275,10 +326,16 @@ def _gather_rollouts_to_rank0(local_rollouts: list[Rollout], *, rank: int, world
     return merged
 
 
-def _broadcast_report_from_rank0(report: dict[str, Any] | None, *, rank: int, world_size: int) -> dict[str, Any] | None:
+def _broadcast_report_from_rank0(
+    report: dict[str, Any] | None,
+    *,
+    cfg: RLPostTrainConfig,
+    rank: int,
+    world_size: int,
+) -> dict[str, Any] | None:
     if not _distributed_ready(rank, world_size):
         return report
-    object_group = _get_eval_object_collective_group(rank, world_size)
+    object_group = _get_eval_object_collective_group(cfg, rank, world_size)
     if object_group is None:
         _set_distributed_cuda_device()
     payload: list[Any] = [report if rank == 0 else None]
@@ -438,6 +495,7 @@ def evaluate_on_dataset(
         logger.info("evaluate_on_dataset: gather begin rank=%s", distributed_rank)
         rollouts = _gather_rollouts_to_rank0(
             local_rollouts,
+            cfg=cfg,
             rank=distributed_rank,
             world_size=distributed_world_size,
         )
@@ -787,6 +845,7 @@ def evaluate_on_dataset(
         report_summary.pop("eval_rows", None)
         synced = _broadcast_report_from_rank0(
             report_summary if distributed_rank == 0 else None,
+            cfg=cfg,
             rank=distributed_rank,
             world_size=distributed_world_size,
         )

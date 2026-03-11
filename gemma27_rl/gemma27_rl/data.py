@@ -11,6 +11,9 @@ from .rl_types import Example
 
 
 logger = logging.getLogger(__name__)
+_BAD_SOURCE_FLAG_TRUE_VALUES = {"1", "true", "t", "yes", "y", "on"}
+_BAD_SOURCE_FLAG_FALSE_VALUES = {"0", "false", "f", "no", "n", "off"}
+_WARNED_UNKNOWN_BAD_SOURCE_FLAGS: set[str] = set()
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -121,11 +124,20 @@ def _parse_bad_source_flag(value: Any) -> bool:
     text = str(value).strip().lower()
     if not text:
         return False
-    if text in {"0", "false", "f", "no", "n", "off"}:
+    if text in _BAD_SOURCE_FLAG_FALSE_VALUES:
         return False
-    if text in {"1", "true", "t", "yes", "y", "on"}:
+    if text in _BAD_SOURCE_FLAG_TRUE_VALUES:
         return True
-    return True
+    if text not in _WARNED_UNKNOWN_BAD_SOURCE_FLAGS:
+        _WARNED_UNKNOWN_BAD_SOURCE_FLAGS.add(text)
+        logger.warning(
+            "Unrecognized bad-source flag value %r; treating it as False. "
+            "Use an explicit boolean or one of %s/%s.",
+            value,
+            sorted(_BAD_SOURCE_FLAG_TRUE_VALUES),
+            sorted(_BAD_SOURCE_FLAG_FALSE_VALUES),
+        )
+    return False
 
 
 def _append_example_with_optional_reverse(

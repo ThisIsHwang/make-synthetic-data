@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import json
+import logging
 
 from gemma27_rl.config import DataConfig
-from gemma27_rl.data import load_examples
+from gemma27_rl.data import _WARNED_UNKNOWN_BAD_SOURCE_FLAGS, load_examples
 
 
 def test_load_examples_from_hf_path(monkeypatch) -> None:
@@ -195,6 +196,38 @@ def test_skip_bad_source_parses_common_string_booleans(tmp_path) -> None:
 
     examples = load_examples(cfg, split="train", limit=None)
     assert [example.example_id for example in examples] == ["1", "2", "3", "4"]
+
+
+def test_skip_bad_source_keeps_unknown_string_flags_and_warns_once(tmp_path, caplog) -> None:
+    data_path = tmp_path / "unknown_bad_source.jsonl"
+    rows = [
+        {"id": 1, "source": "keep-unknown", "target": "t1", "is_bad_source": "unknown"},
+        {"id": 2, "source": "keep-clean", "target": "t2", "is_bad_source": "clean"},
+        {"id": 3, "source": "keep-unknown-again", "target": "t3", "is_bad_source": "unknown"},
+        {"id": 4, "source": "drop-true", "target": "t4", "is_bad_source": "true"},
+    ]
+    with data_path.open("w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+    _WARNED_UNKNOWN_BAD_SOURCE_FLAGS.clear()
+    caplog.set_level(logging.WARNING, logger="gemma27_rl.data")
+
+    cfg = DataConfig(
+        train_file=str(data_path),
+        id_field="id",
+        src_text_field="source",
+        ref_text_field="target",
+        skip_bad_source=True,
+    )
+
+    examples = load_examples(cfg, split="train", limit=None)
+
+    assert [example.example_id for example in examples] == ["1", "2", "3"]
+    warnings = [record.message for record in caplog.records if "Unrecognized bad-source flag value" in record.message]
+    assert len(warnings) == 2
+    assert any("'unknown'" in message for message in warnings)
+    assert any("'clean'" in message for message in warnings)
 
 
 def test_load_examples_can_expand_bidirectional_from_reference(tmp_path) -> None:

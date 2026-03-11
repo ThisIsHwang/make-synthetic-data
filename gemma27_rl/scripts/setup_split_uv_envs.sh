@@ -17,8 +17,7 @@ uv venv .venv_metricx --python "${PYTHON_VER}"
 uv venv .venv_xcomet --python "${PYTHON_VER}"
 
 echo "[2/5] Installing training environment packages..."
-uv pip install --python .venv_train/bin/python -r requirements.txt
-uv pip install --python .venv_train/bin/python -e .
+uv pip install --python .venv_train/bin/python -e ".[train,reward,deepspeed]"
 
 echo "[3/5] Installing MetricX environment packages..."
 uv pip install --python .venv_metricx/bin/python \
@@ -26,9 +25,7 @@ uv pip install --python .venv_metricx/bin/python \
 uv pip install --python .venv_metricx/bin/python -e .
 
 echo "[4/5] Installing xCOMET environment packages..."
-uv pip install --python .venv_xcomet/bin/python \
-  torch unbabel-comet "setuptools<81"
-uv pip install --python .venv_xcomet/bin/python -e .
+uv pip install --python .venv_xcomet/bin/python -e ".[reward]"
 
 echo "[5/5] Done."
 echo "train python   : ${ROOT_DIR}/.venv_train/bin/python"
