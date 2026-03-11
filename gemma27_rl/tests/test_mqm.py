@@ -318,7 +318,7 @@ def test_openai_mqm_request_omits_reasoning_parser(monkeypatch) -> None:
     assert "reasoning_parser" not in captured["payload"]
 
 
-def test_openai_mqm_accepts_reasoning_style_content_parts(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_openai_mqm_accepts_message_content_text_parts(monkeypatch: pytest.MonkeyPatch) -> None:
     class _FakeResponse:
         def __enter__(self):
             return self
@@ -333,7 +333,6 @@ def test_openai_mqm_accepts_reasoning_style_content_parts(monkeypatch: pytest.Mo
                         {
                             "message": {
                                 "content": [
-                                    {"type": "reasoning", "text": "Let me think."},
                                     {"type": "text", "text": 'Major:\naccuracy/mistranslation - "안녕"'},
                                 ]
                             }
@@ -361,3 +360,35 @@ def test_openai_mqm_accepts_reasoning_style_content_parts(monkeypatch: pytest.Mo
     )
 
     assert raw == 'Major:\naccuracy/mistranslation - "안녕"'
+
+
+def test_openai_mqm_rejects_non_message_content_fallbacks(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return json.dumps({"choices": [{"text": 'Major:\naccuracy/mistranslation - "안녕"'}]}).encode("utf-8")
+
+    class _FakeOpener:
+        def open(self, req, timeout=None):
+            return _FakeResponse()
+
+    monkeypatch.setattr(rewards_mod, "_temporarily_unset_proxy_env", lambda: (lambda: None))
+    monkeypatch.setattr(rewards_mod.urllib_request, "build_opener", lambda *args, **kwargs: _FakeOpener())
+
+    scorer = OpenAICompatibleMQMScorer(
+        cfg=MQMConfig(
+            enabled=True,
+            base_url="http://localhost:8000/v1",
+        )
+    )
+
+    with pytest.raises(RuntimeError, match=r"expected choices\[0\]\.message\.content"):
+        scorer._call_openai_compatible_api(
+            [{"role": "user", "content": "test"}],
+            chat_template_kwargs_override={"enable_thinking": True},
+        )

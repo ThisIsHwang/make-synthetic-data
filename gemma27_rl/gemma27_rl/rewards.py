@@ -125,68 +125,27 @@ def _record_scorer_parse_failure(
         logger.warning("Failed to append %s parse failure record to %s: %s", scorer_name, log_path, exc)
 
 
-_OPENAI_TEXT_KEYS: tuple[str, ...] = (
-    "content",
-    "text",
-    "output_text",
-    "value",
-)
-_OPENAI_REASONING_KEYS: tuple[str, ...] = (
-    "reasoning",
-    "reasoning_content",
-    "thinking",
-)
-_OPENAI_REASONING_ITEM_TYPES: set[str] = {
-    "reasoning",
-    "reasoning_content",
-    "thinking",
-}
-
-
-def _collect_openai_text_fragments(value: Any, *, _depth: int = 0) -> tuple[list[str], list[str]]:
-    if _depth > 6:
-        return [], []
-
+def _extract_openai_message_content_text(value: Any) -> str | None:
     if isinstance(value, str):
-        text = value.strip()
-        return ([value] if text else []), []
+        return value
 
-    if isinstance(value, list):
-        direct: list[str] = []
-        reasoning: list[str] = []
-        for item in value:
-            item_direct, item_reasoning = _collect_openai_text_fragments(item, _depth=_depth + 1)
-            direct.extend(item_direct)
-            reasoning.extend(item_reasoning)
-        return direct, reasoning
+    if not isinstance(value, list):
+        return None
 
-    if not isinstance(value, dict):
-        return [], []
-
-    direct: list[str] = []
-    reasoning: list[str] = []
-    item_type = str(value.get("type", "") or "").strip().lower()
-    target = reasoning if item_type in _OPENAI_REASONING_ITEM_TYPES else direct
-
-    for key in _OPENAI_TEXT_KEYS:
-        if key not in value:
+    parts: list[str] = []
+    for item in value:
+        if not isinstance(item, dict):
             continue
-        item_direct, item_reasoning = _collect_openai_text_fragments(value.get(key), _depth=_depth + 1)
-        if target is reasoning:
-            reasoning.extend(item_direct)
-            reasoning.extend(item_reasoning)
-        else:
-            direct.extend(item_direct)
-            reasoning.extend(item_reasoning)
-
-    for key in _OPENAI_REASONING_KEYS:
-        if key not in value:
+        item_type = str(item.get("type", "") or "").strip().lower()
+        if item_type != "text":
             continue
-        item_direct, item_reasoning = _collect_openai_text_fragments(value.get(key), _depth=_depth + 1)
-        reasoning.extend(item_direct)
-        reasoning.extend(item_reasoning)
+        text = item.get("text")
+        if isinstance(text, str):
+            parts.append(text)
 
-    return direct, reasoning
+    if not parts:
+        return None
+    return "\n".join(parts)
 
 
 def _extract_openai_response_text(
@@ -201,30 +160,29 @@ def _extract_openai_response_text(
         raise RuntimeError(f"{scorer_name} API response has no choices.")
 
     first = choices[0]
-    candidates: list[Any] = []
-    if isinstance(first, dict):
-        msg = first.get("message")
-        if isinstance(msg, dict):
-            candidates.append(msg)
-        for key in ("text", "content", "output_text"):
-            if key in first:
-                candidates.append(first.get(key))
+    if not isinstance(first, dict):
+        raise RuntimeError(
+            f"{scorer_name} API response format is unsupported; expected choices[0].message.content."
+        )
+    message = first.get("message")
+    if not isinstance(message, dict):
+        raise RuntimeError(
+            f"{scorer_name} API response format is unsupported; expected choices[0].message.content."
+        )
 
-    for candidate in candidates:
-        direct_parts, reasoning_parts = _collect_openai_text_fragments(candidate)
-        parts = [part for part in (direct_parts or reasoning_parts) if str(part).strip()]
-        if not parts:
-            continue
-        joined = "\n".join(parts)
-        if log_io:
-            logger.info(
-                "[%s-io] parsed_content=%s",
-                scorer_name.lower(),
-                _truncate_for_log(joined, log_max_chars),
-            )
-        return joined
+    content = _extract_openai_message_content_text(message.get("content"))
+    if content is None:
+        raise RuntimeError(
+            f"{scorer_name} API response format is unsupported; expected choices[0].message.content."
+        )
 
-    raise RuntimeError(f"{scorer_name} API response format is unsupported.")
+    if log_io:
+        logger.info(
+            "[%s-io] parsed_content=%s",
+            scorer_name.lower(),
+            _truncate_for_log(content, log_max_chars),
+        )
+    return content
 
 
 def _temporarily_unset_proxy_env() -> Callable[[], None]:

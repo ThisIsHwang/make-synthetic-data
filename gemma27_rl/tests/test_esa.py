@@ -172,7 +172,7 @@ def test_openai_esa_request_omits_reasoning_parser(monkeypatch: pytest.MonkeyPat
     assert captured["payload"]["chat_template_kwargs"] == {"enable_thinking": True}
 
 
-def test_openai_esa_accepts_reasoning_style_content_parts(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_openai_esa_accepts_message_content_text_parts(monkeypatch: pytest.MonkeyPatch) -> None:
     class _FakeResponse:
         def __enter__(self):
             return self
@@ -187,7 +187,6 @@ def test_openai_esa_accepts_reasoning_style_content_parts(monkeypatch: pytest.Mo
                         {
                             "message": {
                                 "content": [
-                                    {"type": "reasoning", "text": "Let me think."},
                                     {"type": "text", "text": "Score (0-100): 83"},
                                 ]
                             }
@@ -216,6 +215,39 @@ def test_openai_esa_accepts_reasoning_style_content_parts(monkeypatch: pytest.Mo
     )
 
     assert raw == "Score (0-100): 83"
+
+
+def test_openai_esa_rejects_non_message_content_fallbacks(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return json.dumps({"choices": [{"output_text": "Score (0-100): 83"}]}).encode("utf-8")
+
+    class _FakeOpener:
+        def open(self, req, timeout=None):
+            return _FakeResponse()
+
+    monkeypatch.setattr(rewards_mod, "_temporarily_unset_proxy_env", lambda: (lambda: None))
+    monkeypatch.setattr(rewards_mod.urllib_request, "build_opener", lambda *args, **kwargs: _FakeOpener())
+
+    scorer = OpenAICompatibleESAScorer(
+        cfg=ESAConfig(
+            enabled=True,
+            base_url="http://localhost:8000/v1",
+        )
+    )
+
+    with pytest.raises(RuntimeError, match=r"expected choices\[0\]\.message\.content"):
+        scorer._call_openai_compatible_api(
+            [{"role": "user", "content": "test"}],
+            max_tokens=64,
+            chat_template_kwargs_override={"enable_thinking": True},
+        )
 
 
 def test_openai_esa_retries_until_score_is_parseable(monkeypatch: pytest.MonkeyPatch) -> None:
