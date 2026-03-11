@@ -144,6 +144,45 @@ def test_openai_mqm_parse_failures_raise_when_score_never_parses(monkeypatch: py
         )
 
 
+def test_openai_mqm_parse_failures_are_recorded_to_jsonl(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    log_path = tmp_path / "mqm_parse_failures.jsonl"
+    scorer = OpenAICompatibleMQMScorer(
+        cfg=MQMConfig(
+            enabled=True,
+            base_url="http://localhost:8000/v1",
+        ),
+        parse_failure_log_path=log_path,
+    )
+
+    calls = iter(
+        [
+            "Looks fine overall.",
+            'Major:\naccuracy/mistranslation - "안녕"',
+        ]
+    )
+
+    monkeypatch.setattr(
+        scorer,
+        "_call_openai_compatible_api",
+        lambda messages, max_tokens=None, chat_template_kwargs_override=None: next(calls),
+    )
+
+    score, raw_text, spans = scorer._score_one_sample(
+        SampleForScoring(src="hello", mt="안녕", ref=None),
+        [{"role": "user", "content": "test"}],
+    )
+
+    assert score == -5.0
+    assert raw_text == 'Major:\naccuracy/mistranslation - "안녕"'
+    assert len(spans) == 1
+    rows = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+    assert len(rows) == 1
+    assert rows[0]["scorer"] == "mqm"
+    assert rows[0]["stage"] == "raw_output_parse_failed"
+    assert rows[0]["raw_text"] == "Looks fine overall."
+    assert rows[0]["mt"] == "안녕"
+
+
 def test_openai_mqm_enables_thinking_after_first_failed_attempt(monkeypatch: pytest.MonkeyPatch) -> None:
     scorer = OpenAICompatibleMQMScorer(
         cfg=MQMConfig(

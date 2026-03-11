@@ -291,6 +291,8 @@ class LoggingConfig:
     output_dir: str = "./outputs/gemma27-grpo"
     jsonl_name: str = "train_log.jsonl"
     rollout_jsonl_name: str = "train_rollouts.jsonl"
+    mqm_parse_failure_jsonl_name: str = "mqm_parse_failures.jsonl"
+    esa_parse_failure_jsonl_name: str = "esa_parse_failures.jsonl"
     save_rollouts: bool = False
     eval_output_jsonl_name: str = "eval_outputs.jsonl"
     save_eval_outputs: bool = False
@@ -507,6 +509,10 @@ def _validate_config(cfg: RLPostTrainConfig) -> None:
         raise ValueError("logging.keep_last_n_checkpoints must be >= 0")
     if not isinstance(cfg.logging.reset_best_eval_on_resume, bool):
         raise ValueError("logging.reset_best_eval_on_resume must be a bool")
+    if not str(cfg.logging.mqm_parse_failure_jsonl_name or "").strip():
+        raise ValueError("logging.mqm_parse_failure_jsonl_name must not be empty")
+    if not str(cfg.logging.esa_parse_failure_jsonl_name or "").strip():
+        raise ValueError("logging.esa_parse_failure_jsonl_name must not be empty")
     reference_runtime = str(cfg.model.reference_runtime or "worker").strip().lower()
     if reference_runtime not in {"worker", "in_process", "cpu", "colocate"}:
         raise ValueError("model.reference_runtime must be worker|in_process|cpu|colocate")

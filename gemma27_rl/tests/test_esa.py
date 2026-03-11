@@ -261,6 +261,42 @@ def test_openai_esa_parse_failures_do_not_fallback_to_zero(monkeypatch: pytest.M
         scorer._score_one_sample(SampleForScoring(src="hello", mt="안녕", ref=None))
 
 
+def test_openai_esa_parse_failures_are_recorded_to_jsonl(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    log_path = tmp_path / "esa_parse_failures.jsonl"
+    scorer = OpenAICompatibleESAScorer(
+        cfg=ESAConfig(
+            enabled=True,
+            base_url="http://localhost:8000/v1",
+        ),
+        parse_failure_log_path=log_path,
+    )
+    sample = SampleForScoring(src="hello", mt="안녕", ref=None)
+    monkeypatch.setattr(rewards_mod, "_esa_score_phase_specs", lambda _: ((False, 1),))
+
+    calls = iter(
+        [
+            'Major:\naccuracy/mistranslation - "안녕"',
+            "안녕하세요, 이건 점수 형식이 아닙니다.",
+        ]
+    )
+
+    def _fake_call(messages, max_tokens, chat_template_kwargs_override=None):
+        return next(calls)
+
+    monkeypatch.setattr(scorer, "_call_openai_compatible_api", _fake_call)
+
+    with pytest.raises(GembaParseError, match="score parse returned None"):
+        scorer._score_one_sample(sample)
+
+    rows = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+    assert len(rows) == 1
+    assert rows[0]["scorer"] == "esa"
+    assert rows[0]["stage"] == "score_parse_failed"
+    assert rows[0]["raw_error_text"] == 'Major:\naccuracy/mistranslation - "안녕"'
+    assert rows[0]["raw_score_text"] == "안녕하세요, 이건 점수 형식이 아닙니다."
+    assert rows[0]["mt"] == "안녕"
+
+
 def test_openai_esa_ignores_unparseable_error_annotations_and_retries_score(monkeypatch: pytest.MonkeyPatch) -> None:
     scorer = OpenAICompatibleESAScorer(
         cfg=ESAConfig(

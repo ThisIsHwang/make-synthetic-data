@@ -3939,11 +3939,26 @@ def run_metric_only_eval(cfg: RLPostTrainConfig) -> dict[str, Any]:
     if not (cfg.reward.esa.target_lang or "").strip():
         cfg.reward.esa.target_lang = cfg.data.default_tgt_lang
 
+    output_dir = Path(cfg.logging.output_dir)
     metricx_scorer = MetricXQEScorer(cfg.reward.metricx) if cfg.reward.metricx.enabled else None
     xcomet_runtime_enabled = _should_enable_xcomet_runtime(cfg)
     xcomet_scorer = XCometXLScorer(cfg.reward.xcomet) if xcomet_runtime_enabled else None
-    mqm_scorer = OpenAICompatibleMQMScorer(cfg.reward.mqm) if cfg.reward.mqm.enabled else None
-    esa_scorer = OpenAICompatibleESAScorer(cfg.reward.esa) if cfg.reward.esa.enabled else None
+    mqm_scorer = (
+        OpenAICompatibleMQMScorer(
+            cfg.reward.mqm,
+            parse_failure_log_path=output_dir / cfg.logging.mqm_parse_failure_jsonl_name,
+        )
+        if cfg.reward.mqm.enabled
+        else None
+    )
+    esa_scorer = (
+        OpenAICompatibleESAScorer(
+            cfg.reward.esa,
+            parse_failure_log_path=output_dir / cfg.logging.esa_parse_failure_jsonl_name,
+        )
+        if cfg.reward.esa.enabled
+        else None
+    )
 
     report = evaluate_on_dataset(
         examples=eval_examples,
@@ -4150,12 +4165,18 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
         XCometXLScorer(cfg.reward.xcomet) if xcomet_runtime_enabled and ((not use_deepspeed) or rank0) else None
     )
     mqm_scorer = (
-        OpenAICompatibleMQMScorer(cfg.reward.mqm)
+        OpenAICompatibleMQMScorer(
+            cfg.reward.mqm,
+            parse_failure_log_path=output_dir / cfg.logging.mqm_parse_failure_jsonl_name,
+        )
         if cfg.reward.mqm.enabled and ((not use_deepspeed) or rank0)
         else None
     )
     esa_scorer = (
-        OpenAICompatibleESAScorer(cfg.reward.esa)
+        OpenAICompatibleESAScorer(
+            cfg.reward.esa,
+            parse_failure_log_path=output_dir / cfg.logging.esa_parse_failure_jsonl_name,
+        )
         if cfg.reward.esa.enabled and ((not use_deepspeed) or rank0)
         else None
     )

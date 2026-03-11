@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 import select
 import subprocess
+import threading
 import time
 from textwrap import dedent
 from typing import Any, Callable
@@ -73,6 +74,55 @@ def _truncate_for_log(text: str, max_chars: int) -> str:
     if len(text) <= max_chars:
         return text
     return text[:max_chars] + f"...[truncated {len(text) - max_chars} chars]"
+
+
+_PARSE_FAILURE_LOG_LOCK = threading.Lock()
+
+
+def _append_jsonl_record(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    line = json.dumps(payload, ensure_ascii=False) + "\n"
+    with _PARSE_FAILURE_LOG_LOCK:
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(line)
+
+
+def _record_scorer_parse_failure(
+    *,
+    log_path: Path | None,
+    scorer_name: str,
+    model_name: str,
+    sample: SampleForScoring,
+    enable_thinking: bool,
+    stage: str,
+    error: str,
+    details: dict[str, Any] | None = None,
+) -> None:
+    if log_path is None:
+        return
+    payload: dict[str, Any] = {
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime()),
+        "pid": int(os.getpid()),
+        "scorer": scorer_name,
+        "model_name": model_name,
+        "stage": stage,
+        "enable_thinking": bool(enable_thinking),
+        "error": str(error),
+        "source_lang": sample.source_lang,
+        "target_lang": sample.target_lang,
+        "src": sample.src,
+        "mt": sample.mt,
+        "ref": sample.ref,
+    }
+    if details:
+        for key, value in details.items():
+            if value is None:
+                continue
+            payload[str(key)] = value
+    try:
+        _append_jsonl_record(log_path, payload)
+    except Exception as exc:
+        logger.warning("Failed to append %s parse failure record to %s: %s", scorer_name, log_path, exc)
 
 
 _OPENAI_TEXT_KEYS: tuple[str, ...] = (
@@ -1782,10 +1832,12 @@ class XCometXLScorer:
 class OpenAICompatibleMQMScorer:
     cfg: MQMConfig
     predict_fn: Callable[[list[list[dict[str, str]]]], list[float]] | None = None
+    parse_failure_log_path: str | Path | None = None
 
     def __post_init__(self) -> None:
         self._chat_url: str | None = None
         self._api_key: str | None = None
+        self._parse_failure_log_path = Path(self.parse_failure_log_path) if self.parse_failure_log_path else None
         if self.predict_fn is not None or not self.cfg.enabled:
             return
 
@@ -1937,8 +1989,37 @@ class OpenAICompatibleMQMScorer:
                         raw_text=raw_text,
                         enable_thinking=enable_thinking,
                     )
-                    raw_score = gemba_mqm_score(parsed_text)
+                    try:
+                        raw_score = gemba_mqm_score(parsed_text)
+                    except Exception as exc:
+                        _record_scorer_parse_failure(
+                            log_path=self._parse_failure_log_path,
+                            scorer_name="mqm",
+                            model_name=self.cfg.model_name,
+                            sample=sample,
+                            enable_thinking=enable_thinking,
+                            stage="repair_output_parse_failed",
+                            error=str(exc),
+                            details={
+                                "raw_text": raw_text,
+                                "parsed_text": parsed_text,
+                            },
+                        )
+                        raise
                     if raw_score is None:
+                        _record_scorer_parse_failure(
+                            log_path=self._parse_failure_log_path,
+                            scorer_name="mqm",
+                            model_name=self.cfg.model_name,
+                            sample=sample,
+                            enable_thinking=enable_thinking,
+                            stage="repair_output_parse_failed",
+                            error="GEMBA-MQM score parse returned None.",
+                            details={
+                                "raw_text": raw_text,
+                                "parsed_text": parsed_text,
+                            },
+                        )
                         raise GembaParseError("GEMBA-MQM score parse returned None.")
                     try:
                         spans = gemba_mqm_extract_error_spans(parsed_text, sample.mt)
@@ -1955,8 +2036,25 @@ class OpenAICompatibleMQMScorer:
         raise last_exc
 
     def _repair_mqm_output_if_needed(self, *, sample: SampleForScoring, raw_text: str, enable_thinking: bool) -> str:
-        if gemba_mqm_score(raw_text) is not None:
+        try:
+            raw_score = gemba_mqm_score(raw_text)
+        except Exception as exc:
+            raw_score = None
+            error_text = str(exc)
+        else:
+            error_text = "GEMBA-MQM score parse returned None."
+        if raw_score is not None:
             return raw_text
+        _record_scorer_parse_failure(
+            log_path=self._parse_failure_log_path,
+            scorer_name="mqm",
+            model_name=self.cfg.model_name,
+            sample=sample,
+            enable_thinking=enable_thinking,
+            stage="raw_output_parse_failed",
+            error=error_text,
+            details={"raw_text": raw_text},
+        )
         return self._call_openai_compatible_api(
             build_gemba_mqm_repair_messages(
                 source_seg=sample.src,
@@ -2078,10 +2176,12 @@ class OpenAICompatibleMQMScorer:
 class OpenAICompatibleESAScorer:
     cfg: ESAConfig
     predict_fn: Callable[[list[SampleForScoring]], list[float]] | None = None
+    parse_failure_log_path: str | Path | None = None
 
     def __post_init__(self) -> None:
         self._chat_url: str | None = None
         self._api_key: str | None = None
+        self._parse_failure_log_path = Path(self.parse_failure_log_path) if self.parse_failure_log_path else None
         if self.predict_fn is not None or not self.cfg.enabled:
             return
 
@@ -2226,6 +2326,19 @@ class OpenAICompatibleESAScorer:
                     )
                     raw_score = gemba_esa_parse_score(raw_score_text)
                     if raw_score is None:
+                        _record_scorer_parse_failure(
+                            log_path=self._parse_failure_log_path,
+                            scorer_name="esa",
+                            model_name=self.cfg.model_name,
+                            sample=sample,
+                            enable_thinking=enable_thinking,
+                            stage="score_parse_failed",
+                            error="GEMBA-ESA score parse returned None.",
+                            details={
+                                "raw_error_text": raw_error_text,
+                                "raw_score_text": raw_score_text,
+                            },
+                        )
                         raise GembaParseError("GEMBA-ESA score parse returned None.")
                     scaled = self._scale_score(float(raw_score))
                     return float(scaled), raw_error_text, raw_score_text
