@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 import json
 import logging
@@ -50,6 +50,41 @@ def _capture_exception(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any
         return fn(*args, **kwargs)
     except Exception as exc:  # pragma: no cover - simple wrapper
         return exc
+
+
+def _run_jobs_with_bounded_concurrency(
+    *,
+    executor: ThreadPoolExecutor,
+    jobs: list[tuple[Any, ...]],
+    worker_fn: Callable[..., Any],
+    max_in_flight: int,
+) -> list[Any]:
+    if not jobs:
+        return []
+
+    limit = max(1, min(int(max_in_flight), len(jobs)))
+    results: list[Any] = [None for _ in jobs]
+    in_flight: dict[Any, int] = {}
+    next_job_idx = 0
+
+    def _submit(job_idx: int) -> None:
+        future = executor.submit(worker_fn, *jobs[job_idx])
+        in_flight[future] = int(job_idx)
+
+    while next_job_idx < len(jobs) and len(in_flight) < limit:
+        _submit(next_job_idx)
+        next_job_idx += 1
+
+    while in_flight:
+        done, _ = wait(tuple(in_flight.keys()), return_when=FIRST_COMPLETED)
+        for future in done:
+            job_idx = in_flight.pop(future)
+            results[job_idx] = future.result()
+            if next_job_idx < len(jobs):
+                _submit(next_job_idx)
+                next_job_idx += 1
+
+    return results
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -2010,32 +2045,30 @@ class OpenAICompatibleMQMScorer:
                     skip_reasons.append(None)
         else:
             with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="mqm-scorer") as executor:
-                for i in range(0, len(message_rows), max_workers):
-                    batch_messages = message_rows[i : i + max_workers]
-                    batch_samples = samples[i : i + max_workers]
-                    futures = [
-                        executor.submit(_capture_exception, self._score_one_sample, sample, messages)
-                        for sample, messages in zip(batch_samples, batch_messages)
-                    ]
-                    batch_results = [future.result() for future in futures]
-                    for result in batch_results:
-                        if isinstance(result, Exception):
-                            logger.warning(
-                                "MQM scoring failed after repeated failures; using fallback score=0.0 and empty spans: error=%s",
-                                result,
-                            )
-                            sequence_scores.append(0.0)
-                            raw_outputs.append("")
-                            error_spans.append([])
-                            skipped_rows.append(False)
-                            skip_reasons.append(None)
-                            continue
-                        score, raw_text, spans = result
-                        sequence_scores.append(score)
-                        raw_outputs.append(raw_text)
-                        error_spans.append(spans)
+                batch_results = _run_jobs_with_bounded_concurrency(
+                    executor=executor,
+                    jobs=[(sample, messages) for sample, messages in zip(samples, message_rows)],
+                    worker_fn=lambda sample, messages: _capture_exception(self._score_one_sample, sample, messages),
+                    max_in_flight=max_workers,
+                )
+                for result in batch_results:
+                    if isinstance(result, Exception):
+                        logger.warning(
+                            "MQM scoring failed after repeated failures; using fallback score=0.0 and empty spans: error=%s",
+                            result,
+                        )
+                        sequence_scores.append(0.0)
+                        raw_outputs.append("")
+                        error_spans.append([])
                         skipped_rows.append(False)
                         skip_reasons.append(None)
+                        continue
+                    score, raw_text, spans = result
+                    sequence_scores.append(score)
+                    raw_outputs.append(raw_text)
+                    error_spans.append(spans)
+                    skipped_rows.append(False)
+                    skip_reasons.append(None)
 
         return RewardOutput(
             sequence_scores=sequence_scores,
@@ -2335,25 +2368,27 @@ class OpenAICompatibleESAScorer:
                     skip_reasons.append(str(exc))
         else:
             with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="esa-scorer") as executor:
-                for i in range(0, len(samples), max_workers):
-                    batch_samples = samples[i : i + max_workers]
-                    futures = [executor.submit(_capture_exception, self._score_one_sample, sample) for sample in batch_samples]
-                    batch_results = [future.result() for future in futures]
-                    for result in batch_results:
-                        if isinstance(result, Exception):
-                            logger.warning("Skipping ESA-scoring sample after repeated failures: error=%s", result)
-                            sequence_scores.append(0.0)
-                            raw_error_outputs.append("")
-                            raw_score_outputs.append("")
-                            skipped_rows.append(True)
-                            skip_reasons.append(str(result))
-                            continue
-                        score, raw_error_text, raw_score_text = result
-                        sequence_scores.append(score)
-                        raw_error_outputs.append(raw_error_text)
-                        raw_score_outputs.append(raw_score_text)
-                        skipped_rows.append(False)
-                        skip_reasons.append(None)
+                batch_results = _run_jobs_with_bounded_concurrency(
+                    executor=executor,
+                    jobs=[(sample,) for sample in samples],
+                    worker_fn=lambda sample: _capture_exception(self._score_one_sample, sample),
+                    max_in_flight=max_workers,
+                )
+                for result in batch_results:
+                    if isinstance(result, Exception):
+                        logger.warning("Skipping ESA-scoring sample after repeated failures: error=%s", result)
+                        sequence_scores.append(0.0)
+                        raw_error_outputs.append("")
+                        raw_score_outputs.append("")
+                        skipped_rows.append(True)
+                        skip_reasons.append(str(result))
+                        continue
+                    score, raw_error_text, raw_score_text = result
+                    sequence_scores.append(score)
+                    raw_error_outputs.append(raw_error_text)
+                    raw_score_outputs.append(raw_score_text)
+                    skipped_rows.append(False)
+                    skip_reasons.append(None)
 
         return RewardOutput(
             sequence_scores=sequence_scores,

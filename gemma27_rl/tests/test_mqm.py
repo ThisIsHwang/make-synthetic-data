@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 
 import pytest
 
@@ -239,6 +240,68 @@ def test_openai_mqm_parse_failures_are_recorded_to_jsonl(tmp_path, monkeypatch: 
     assert rows[0]["stage"] == "raw_output_parse_failed"
     assert rows[0]["raw_text"] == "Looks fine overall."
     assert rows[0]["mt"] == "안녕"
+
+
+def test_openai_mqm_score_batch_refills_inflight_window(monkeypatch: pytest.MonkeyPatch) -> None:
+    scorer = OpenAICompatibleMQMScorer(
+        cfg=MQMConfig(
+            enabled=True,
+            base_url="http://localhost:8000/v1",
+            batch_size=2,
+            max_retries=0,
+        )
+    )
+    slow_started = threading.Event()
+    slow_release = threading.Event()
+    third_started = threading.Event()
+    third_started_while_slow_blocked = {"value": False}
+    holder: dict[str, object] = {}
+
+    samples = [
+        SampleForScoring(src="slow", mt="mt-slow", ref=None),
+        SampleForScoring(src="fast", mt="mt-fast", ref=None),
+        SampleForScoring(src="third", mt="mt-third", ref=None),
+    ]
+
+    def _fake_score_one_sample(
+        sample: SampleForScoring,
+        messages: list[dict[str, str]],
+    ) -> tuple[float, str, list[dict[str, object]]]:
+        assert messages[-1]["role"] == "user"
+        if sample.src == "slow":
+            slow_started.set()
+            assert slow_release.wait(timeout=5.0)
+            return (-1.0, "slow", [])
+        if sample.src == "fast":
+            return (-2.0, "fast", [])
+        third_started_while_slow_blocked["value"] = not slow_release.is_set()
+        third_started.set()
+        return (-3.0, "third", [])
+
+    monkeypatch.setattr(scorer, "_score_one_sample", _fake_score_one_sample)
+
+    def _run() -> None:
+        try:
+            holder["out"] = scorer.score_batch(samples)
+        except Exception as exc:  # pragma: no cover - assertion relay
+            holder["exc"] = exc
+
+    thread = threading.Thread(target=_run, name="mqm-bounded-concurrency-test")
+    thread.start()
+
+    assert slow_started.wait(timeout=2.0)
+    assert third_started.wait(timeout=2.0)
+    assert third_started_while_slow_blocked["value"] is True
+
+    slow_release.set()
+    thread.join(timeout=5.0)
+    assert not thread.is_alive()
+    assert "exc" not in holder
+
+    out = holder["out"]
+    assert isinstance(out, rewards_mod.RewardOutput)
+    assert out.sequence_scores == [-1.0, -2.0, -3.0]
+    assert out.metadata["raw_outputs"] == ["slow", "fast", "third"]
 
 
 def test_openai_mqm_enables_thinking_after_first_failed_attempt(monkeypatch: pytest.MonkeyPatch) -> None:

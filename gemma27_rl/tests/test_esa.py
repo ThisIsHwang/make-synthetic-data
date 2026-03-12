@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import threading
 
 import pytest
 
@@ -215,6 +216,65 @@ def test_openai_esa_accepts_message_content_text_parts(monkeypatch: pytest.Monke
     )
 
     assert raw == "Score (0-100): 83"
+
+
+def test_openai_esa_score_batch_refills_inflight_window(monkeypatch: pytest.MonkeyPatch) -> None:
+    scorer = OpenAICompatibleESAScorer(
+        cfg=ESAConfig(
+            enabled=True,
+            base_url="http://localhost:8000/v1",
+            batch_size=2,
+            max_retries=0,
+        )
+    )
+    slow_started = threading.Event()
+    slow_release = threading.Event()
+    third_started = threading.Event()
+    third_started_while_slow_blocked = {"value": False}
+    holder: dict[str, object] = {}
+
+    samples = [
+        SampleForScoring(src="slow", mt="mt-slow", ref=None),
+        SampleForScoring(src="fast", mt="mt-fast", ref=None),
+        SampleForScoring(src="third", mt="mt-third", ref=None),
+    ]
+
+    def _fake_score_one_sample(sample: SampleForScoring) -> tuple[float, str, str]:
+        if sample.src == "slow":
+            slow_started.set()
+            assert slow_release.wait(timeout=5.0)
+            return (61.0, "slow-errors", "61")
+        if sample.src == "fast":
+            return (72.0, "fast-errors", "72")
+        third_started_while_slow_blocked["value"] = not slow_release.is_set()
+        third_started.set()
+        return (83.0, "third-errors", "83")
+
+    monkeypatch.setattr(scorer, "_score_one_sample", _fake_score_one_sample)
+
+    def _run() -> None:
+        try:
+            holder["out"] = scorer.score_batch(samples)
+        except Exception as exc:  # pragma: no cover - assertion relay
+            holder["exc"] = exc
+
+    thread = threading.Thread(target=_run, name="esa-bounded-concurrency-test")
+    thread.start()
+
+    assert slow_started.wait(timeout=2.0)
+    assert third_started.wait(timeout=2.0)
+    assert third_started_while_slow_blocked["value"] is True
+
+    slow_release.set()
+    thread.join(timeout=5.0)
+    assert not thread.is_alive()
+    assert "exc" not in holder
+
+    out = holder["out"]
+    assert isinstance(out, rewards_mod.RewardOutput)
+    assert out.sequence_scores == [61.0, 72.0, 83.0]
+    assert out.metadata["raw_error_outputs"] == ["slow-errors", "fast-errors", "third-errors"]
+    assert out.metadata["raw_score_outputs"] == ["61", "72", "83"]
 
 
 def test_openai_esa_rejects_non_message_content_fallbacks(monkeypatch: pytest.MonkeyPatch) -> None:
