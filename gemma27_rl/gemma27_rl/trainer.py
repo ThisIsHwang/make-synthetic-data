@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 import datetime
 import json
 import logging
@@ -2683,6 +2684,183 @@ def _create_reference_logprob_client(
     return client, requested_device
 
 
+def _should_pipeline_api_rollout_scoring(
+    *,
+    cfg: RLPostTrainConfig,
+    mqm_scorer: OpenAICompatibleMQMScorer | None,
+    esa_scorer: OpenAICompatibleESAScorer | None,
+) -> bool:
+    if _env_flag("GEMMA27_RL_DISABLE_ROLLOUT_PIPELINE", default=False):
+        return False
+    return bool(
+        (cfg.reward.mqm.enabled and mqm_scorer is not None)
+        or (cfg.reward.esa.enabled and esa_scorer is not None)
+    )
+
+
+def _resolve_rollout_pipeline_chunk_size(*, total_examples: int, cfg: RLPostTrainConfig) -> int:
+    total = max(0, int(total_examples))
+    if total <= 1:
+        return total
+
+    raw = os.environ.get("GEMMA27_RL_ROLLOUT_PIPELINE_CHUNK")
+    if raw is not None:
+        try:
+            requested = int(raw.strip())
+        except Exception:
+            requested = 0
+        if requested > 0:
+            return min(total, requested)
+
+    batch_hints: list[int] = []
+    if cfg.reward.mqm.enabled:
+        batch_hints.append(max(1, int(cfg.reward.mqm.batch_size)))
+    if cfg.reward.esa.enabled:
+        batch_hints.append(max(1, int(cfg.reward.esa.batch_size)))
+    hint = min(batch_hints) if batch_hints else total
+    default_chunk = min(hint, int(math.ceil(total / 2.0)))
+    return max(1, min(total, default_chunk))
+
+
+def _prepare_training_batch_rollouts_and_advantages(
+    *,
+    batch_examples: list[Example],
+    prompt_instance_ids: list[str],
+    update_idx: int,
+    policy_model: Any,
+    tokenizer: Any,
+    cfg: RLPostTrainConfig,
+    device: str,
+    metricx_scorer: MetricXQEScorer | None,
+    xcomet_scorer: XCometXLScorer | None,
+    mqm_scorer: OpenAICompatibleMQMScorer | None,
+    esa_scorer: OpenAICompatibleESAScorer | None,
+    metricx_cache: dict[tuple[str, str, str], float],
+    xcomet_cache: dict[tuple[str, str, str], tuple[float, list[dict[str, Any]]]],
+    mqm_cache: dict[tuple[str, str, str, str, str], tuple[float, list[dict[str, Any]]]],
+    esa_cache: dict[tuple[str, str, str, str, str], float],
+) -> tuple[list[Rollout], list[list[float]], dict[str, float], dict[str, float]]:
+    if not batch_examples:
+        return [], [], {}, {}
+
+    chunk_size = _resolve_rollout_pipeline_chunk_size(total_examples=len(batch_examples), cfg=cfg)
+    pipeline_enabled = (
+        _should_pipeline_api_rollout_scoring(cfg=cfg, mqm_scorer=mqm_scorer, esa_scorer=esa_scorer)
+        and chunk_size > 0
+        and chunk_size < len(batch_examples)
+    )
+
+    def _generate_chunk(chunk_idx: int, chunk_examples: list[Example], chunk_prompt_ids: list[str]) -> list[Rollout]:
+        num_chunks = max(1, int(math.ceil(len(batch_examples) / float(max(1, chunk_size)))))
+        progress_desc = f"rollout u{update_idx}"
+        if pipeline_enabled:
+            progress_desc = f"{progress_desc} [{chunk_idx + 1}/{num_chunks}]"
+        return generate_rollouts(
+            examples=chunk_examples,
+            policy_model=policy_model,
+            tokenizer=tokenizer,
+            gen_cfg=cfg.generation,
+            device=device,
+            ref_model=None,
+            ref_device=None,
+            ref_logprob_fn=None,
+            prompt_template=cfg.prompt.template,
+            show_progress=True,
+            progress_desc=progress_desc,
+            prompt_instance_ids=chunk_prompt_ids,
+        )
+
+    if not pipeline_enabled:
+        rollouts = _generate_chunk(0, batch_examples, prompt_instance_ids)
+        if not rollouts:
+            return [], [], {}, {}
+        return _prepare_rewards_and_advantages(
+            rollouts=rollouts,
+            cfg=cfg,
+            metricx_scorer=metricx_scorer,
+            xcomet_scorer=xcomet_scorer,
+            mqm_scorer=mqm_scorer,
+            esa_scorer=esa_scorer,
+            metricx_cache=metricx_cache,
+            xcomet_cache=xcomet_cache,
+            mqm_cache=mqm_cache,
+            esa_cache=esa_cache,
+            tokenizer=tokenizer,
+        )
+
+    chunk_ranges = [
+        (start, min(len(batch_examples), start + chunk_size))
+        for start in range(0, len(batch_examples), chunk_size)
+    ]
+    logger.info(
+        "update=%s pipelining rollout generation with API reward scoring chunk_size=%s chunks=%s prompts=%s",
+        update_idx,
+        chunk_size,
+        len(chunk_ranges),
+        len(batch_examples),
+    )
+
+    first_start, first_end = chunk_ranges[0]
+    current_rollouts = _generate_chunk(
+        0,
+        batch_examples[first_start:first_end],
+        prompt_instance_ids[first_start:first_end],
+    )
+    scored_batches: list[_RewardScoringBatch] = []
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="reward-pipeline") as executor:
+        for chunk_idx, (start, end) in enumerate(chunk_ranges[1:], start=1):
+            score_future = None
+            if current_rollouts:
+                score_future = executor.submit(
+                    _score_reward_rollouts,
+                    rollouts=current_rollouts,
+                    cfg=cfg,
+                    metricx_scorer=metricx_scorer,
+                    xcomet_scorer=xcomet_scorer,
+                    mqm_scorer=mqm_scorer,
+                    esa_scorer=esa_scorer,
+                    metricx_cache=metricx_cache,
+                    xcomet_cache=xcomet_cache,
+                    mqm_cache=mqm_cache,
+                    esa_cache=esa_cache,
+                    tokenizer=tokenizer,
+                )
+            next_rollouts = _generate_chunk(
+                chunk_idx,
+                batch_examples[start:end],
+                prompt_instance_ids[start:end],
+            )
+            if score_future is not None:
+                scored_batches.append(score_future.result())
+            current_rollouts = next_rollouts
+
+    if current_rollouts:
+        scored_batches.append(
+            _score_reward_rollouts(
+                rollouts=current_rollouts,
+                cfg=cfg,
+                metricx_scorer=metricx_scorer,
+                xcomet_scorer=xcomet_scorer,
+                mqm_scorer=mqm_scorer,
+                esa_scorer=esa_scorer,
+                metricx_cache=metricx_cache,
+                xcomet_cache=xcomet_cache,
+                mqm_cache=mqm_cache,
+                esa_cache=esa_cache,
+                tokenizer=tokenizer,
+            )
+        )
+
+    if not scored_batches:
+        return [], [], {}, {}
+
+    return _prepare_rewards_and_advantages_from_scores(
+        scored_batch=_merge_reward_scoring_batches(scored_batches),
+        cfg=cfg,
+        tokenizer=tokenizer,
+    )
+
+
 def _sample_batch(examples: list, batch_size: int, rng: random.Random) -> list:
     if not examples:
         return []
@@ -2927,7 +3105,24 @@ def _score_with_cache_esa(
     return out, skipped
 
 
-def _prepare_rewards_and_advantages(
+@dataclass
+class _RewardScoringBatch:
+    rollouts: list[Rollout]
+    raw_completion_texts: list[str]
+    span_reward_texts: list[str]
+    metricx_scores: list[float]
+    xcomet_scores: list[float]
+    mqm_scores: list[float]
+    esa_scores: list[float]
+    span_rows: list[list[dict[str, Any]]]
+    mqm_skipped: list[bool]
+    esa_skipped: list[bool]
+    sanitized_target_rows: int
+    sanitized_marker_total: int
+
+
+def _score_reward_rollouts(
+    *,
     rollouts: list[Rollout],
     cfg: RLPostTrainConfig,
     metricx_scorer: MetricXQEScorer | None,
@@ -2939,11 +3134,8 @@ def _prepare_rewards_and_advantages(
     mqm_cache: dict[tuple[str, str, str, str, str], tuple[float, list[dict[str, Any]]]],
     esa_cache: dict[tuple[str, str, str, str, str], float],
     tokenizer: Any | None = None,
-) -> tuple[list[Rollout], list[list[float]], dict[str, float], dict[str, float]]:
+) -> _RewardScoringBatch:
     global _ESA_ALL_ZERO_WARNED
-
-    def _filter_rows_by_indices(rows: list[Any], keep_indices: list[int]) -> list[Any]:
-        return [rows[idx] for idx in keep_indices]
 
     def _sanitize(values: list[float], fallback: float) -> tuple[list[float], int]:
         out: list[float] = []
@@ -2958,21 +3150,10 @@ def _prepare_rewards_and_advantages(
 
     samples: list[SampleForScoring] = []
     special_token_strings = _collect_tokenizer_special_token_strings(tokenizer)
-    special_token_ids = _collect_tokenizer_special_token_ids(tokenizer)
-    special_token_id_labels = _build_special_token_id_label_map(tokenizer, special_token_ids)
-    special_token_penalty_strings = [
-        tok for tok in special_token_strings if str(tok).strip().lower() not in {"<think>", "</think>"}
-    ]
-    exempt_final_special_ids, exempt_final_special_strings = _collect_exempt_final_end_of_turn_markers(
-        tokenizer,
-        special_token_strings=special_token_penalty_strings,
-        special_token_ids=special_token_ids,
-    )
-    span_reward_texts: list[str] = []
     span_reward_samples: list[SampleForScoring] = []
     mqm_esa_samples: list[SampleForScoring] = []
     raw_completion_texts: list[str] = []
-    clean_completion_texts: list[str] = []
+    span_reward_texts: list[str] = []
     sanitized_target_rows = 0
     sanitized_marker_total = 0
     for rollout in rollouts:
@@ -2983,71 +3164,20 @@ def _prepare_rewards_and_advantages(
         )
         clean_mt = str(rollout.completion_clean_text if rollout.completion_clean_text is not None else sanitized_mt)
         raw_completion_texts.append(raw_mt)
-        clean_completion_texts.append(clean_mt)
+        span_reward_texts.append(clean_mt)
         if replacement_count > 0:
             sanitized_target_rows += 1
             sanitized_marker_total += int(replacement_count)
-        samples.append(
-            SampleForScoring(
-                src=rollout.src_text,
-                mt=clean_mt,
-                ref=rollout.ref_text,
-                source_lang=rollout.src_lang,
-                target_lang=rollout.tgt_lang,
-            )
+        sample = SampleForScoring(
+            src=rollout.src_text,
+            mt=clean_mt,
+            ref=rollout.ref_text,
+            source_lang=rollout.src_lang,
+            target_lang=rollout.tgt_lang,
         )
-        span_reward_texts.append(clean_mt)
-        span_reward_samples.append(
-            SampleForScoring(
-                src=rollout.src_text,
-                mt=clean_mt,
-                ref=rollout.ref_text,
-                source_lang=rollout.src_lang,
-                target_lang=rollout.tgt_lang,
-            )
-        )
-        mqm_esa_samples.append(
-            SampleForScoring(
-                src=rollout.src_text,
-                mt=clean_mt,
-                ref=rollout.ref_text,
-                source_lang=rollout.src_lang,
-                target_lang=rollout.tgt_lang,
-            )
-        )
-    debug_span_loss = _env_flag("GEMMA27_RL_DEBUG_SPAN_LOSS", default=False)
-    debug_span_max_rollouts = _env_int("GEMMA27_RL_DEBUG_SPAN_MAX_ROLLOUTS", default=1, minimum=1)
-    debug_span_max_tokens = _env_int("GEMMA27_RL_DEBUG_SPAN_MAX_TOKENS", default=256, minimum=1)
-    debug_span_only_nonzero = _env_flag("GEMMA27_RL_DEBUG_SPAN_ONLY_NONZERO", default=False)
-    think_tag_token_penalty = -abs(
-        _env_float("GEMMA27_RL_THINK_TAG_TOKEN_PENALTY", default=_DEFAULT_THINK_TAG_TOKEN_PENALTY)
-    )
-    think_tag_seq_penalty = -abs(
-        _env_float("GEMMA27_RL_THINK_TAG_SEQ_PENALTY", default=_DEFAULT_THINK_TAG_SEQUENCE_PENALTY)
-    )
-    repeat_token_penalty = -abs(
-        _env_float("GEMMA27_RL_REPEAT_TOKEN_PENALTY", default=_DEFAULT_REPEAT_TOKEN_PENALTY)
-    )
-    repeat_seq_penalty = -abs(
-        _env_float("GEMMA27_RL_REPEAT_SEQ_PENALTY", default=_DEFAULT_REPEAT_SEQUENCE_PENALTY)
-    )
-    repeat_min_run = _env_int("GEMMA27_RL_REPEAT_MIN_RUN", default=2, minimum=2)
-    repeat_max_pattern = _env_int("GEMMA27_RL_REPEAT_MAX_PATTERN", default=4, minimum=1)
-    ngram_token_penalty = -abs(
-        _env_float("GEMMA27_RL_NGRAM_TOKEN_PENALTY", default=_DEFAULT_NGRAM_TOKEN_PENALTY)
-    )
-    ngram_seq_penalty = -abs(
-        _env_float("GEMMA27_RL_NGRAM_SEQ_PENALTY", default=_DEFAULT_NGRAM_SEQUENCE_PENALTY)
-    )
-    ngram_repeat_n = _env_int("GEMMA27_RL_NGRAM_REPEAT_N", default=3, minimum=2)
-    ngram_min_occurrences = _env_int("GEMMA27_RL_NGRAM_REPEAT_MIN_OCCURS", default=2, minimum=2)
-    special_token_penalty = -abs(
-        _env_float("GEMMA27_RL_SPECIAL_TOKEN_PENALTY", default=_DEFAULT_SPECIAL_TOKEN_PENALTY)
-    )
-    special_seq_penalty = -abs(
-        _env_float("GEMMA27_RL_SPECIAL_SEQ_PENALTY", default=_DEFAULT_SPECIAL_SEQUENCE_PENALTY)
-    )
-    debug_span_records: list[tuple[int, Rollout, list[dict[str, Any]], list[float], list[float], float]] = []
+        samples.append(sample)
+        span_reward_samples.append(sample)
+        mqm_esa_samples.append(sample)
 
     metricx_enabled = cfg.reward.metricx.enabled and metricx_scorer is not None
     xcomet_enabled = cfg.reward.xcomet.enabled and xcomet_scorer is not None
@@ -3160,8 +3290,6 @@ def _prepare_rewards_and_advantages(
                 "Check MetricX model load/inference and dtype/device settings."
             )
 
-    metricx_rewards = [metricx_score_to_reward(v, offset=cfg.reward.metricx.offset) for v in metricx_scores]
-
     xcomet_scores, xcomet_replaced = _sanitize(xcomet_scores, fallback=0.0)
     if xcomet_replaced > 0:
         logger.warning(
@@ -3196,6 +3324,130 @@ def _prepare_rewards_and_advantages(
             "(GEMMA27_RL_LOG_ESA_IO=1).",
             len(esa_scores),
         )
+
+    merged_span_rows = [
+        [
+            *(span_rows[idx] if idx < len(span_rows) else []),
+            *(mqm_span_rows[idx] if idx < len(mqm_span_rows) else []),
+        ]
+        for idx in range(len(rollouts))
+    ]
+    return _RewardScoringBatch(
+        rollouts=list(rollouts),
+        raw_completion_texts=raw_completion_texts,
+        span_reward_texts=span_reward_texts,
+        metricx_scores=metricx_scores,
+        xcomet_scores=xcomet_scores,
+        mqm_scores=mqm_scores,
+        esa_scores=esa_scores,
+        span_rows=merged_span_rows,
+        mqm_skipped=mqm_skipped,
+        esa_skipped=esa_skipped,
+        sanitized_target_rows=int(sanitized_target_rows),
+        sanitized_marker_total=int(sanitized_marker_total),
+    )
+
+
+def _merge_reward_scoring_batches(scored_batches: list[_RewardScoringBatch]) -> _RewardScoringBatch:
+    merged = _RewardScoringBatch(
+        rollouts=[],
+        raw_completion_texts=[],
+        span_reward_texts=[],
+        metricx_scores=[],
+        xcomet_scores=[],
+        mqm_scores=[],
+        esa_scores=[],
+        span_rows=[],
+        mqm_skipped=[],
+        esa_skipped=[],
+        sanitized_target_rows=0,
+        sanitized_marker_total=0,
+    )
+    for batch in scored_batches:
+        merged.rollouts.extend(batch.rollouts)
+        merged.raw_completion_texts.extend(batch.raw_completion_texts)
+        merged.span_reward_texts.extend(batch.span_reward_texts)
+        merged.metricx_scores.extend(batch.metricx_scores)
+        merged.xcomet_scores.extend(batch.xcomet_scores)
+        merged.mqm_scores.extend(batch.mqm_scores)
+        merged.esa_scores.extend(batch.esa_scores)
+        merged.span_rows.extend(batch.span_rows)
+        merged.mqm_skipped.extend(batch.mqm_skipped)
+        merged.esa_skipped.extend(batch.esa_skipped)
+        merged.sanitized_target_rows += int(batch.sanitized_target_rows)
+        merged.sanitized_marker_total += int(batch.sanitized_marker_total)
+    return merged
+
+
+def _prepare_rewards_and_advantages_from_scores(
+    *,
+    scored_batch: _RewardScoringBatch,
+    cfg: RLPostTrainConfig,
+    tokenizer: Any | None = None,
+) -> tuple[list[Rollout], list[list[float]], dict[str, float], dict[str, float]]:
+    def _filter_rows_by_indices(rows: list[Any], keep_indices: list[int]) -> list[Any]:
+        return [rows[idx] for idx in keep_indices]
+
+    rollouts = list(scored_batch.rollouts)
+    scored_rollout_count = len(rollouts)
+    raw_completion_texts = list(scored_batch.raw_completion_texts)
+    span_reward_texts = list(scored_batch.span_reward_texts)
+    metricx_scores = list(scored_batch.metricx_scores)
+    xcomet_scores = list(scored_batch.xcomet_scores)
+    mqm_scores = list(scored_batch.mqm_scores)
+    esa_scores = list(scored_batch.esa_scores)
+    span_rows = list(scored_batch.span_rows)
+    mqm_skipped = list(scored_batch.mqm_skipped)
+    esa_skipped = list(scored_batch.esa_skipped)
+    sanitized_target_rows = int(scored_batch.sanitized_target_rows)
+    sanitized_marker_total = int(scored_batch.sanitized_marker_total)
+
+    special_token_strings = _collect_tokenizer_special_token_strings(tokenizer)
+    special_token_ids = _collect_tokenizer_special_token_ids(tokenizer)
+    special_token_id_labels = _build_special_token_id_label_map(tokenizer, special_token_ids)
+    special_token_penalty_strings = [
+        tok for tok in special_token_strings if str(tok).strip().lower() not in {"<think>", "</think>"}
+    ]
+    exempt_final_special_ids, exempt_final_special_strings = _collect_exempt_final_end_of_turn_markers(
+        tokenizer,
+        special_token_strings=special_token_penalty_strings,
+        special_token_ids=special_token_ids,
+    )
+    debug_span_loss = _env_flag("GEMMA27_RL_DEBUG_SPAN_LOSS", default=False)
+    debug_span_max_rollouts = _env_int("GEMMA27_RL_DEBUG_SPAN_MAX_ROLLOUTS", default=1, minimum=1)
+    debug_span_max_tokens = _env_int("GEMMA27_RL_DEBUG_SPAN_MAX_TOKENS", default=256, minimum=1)
+    debug_span_only_nonzero = _env_flag("GEMMA27_RL_DEBUG_SPAN_ONLY_NONZERO", default=False)
+    think_tag_token_penalty = -abs(
+        _env_float("GEMMA27_RL_THINK_TAG_TOKEN_PENALTY", default=_DEFAULT_THINK_TAG_TOKEN_PENALTY)
+    )
+    think_tag_seq_penalty = -abs(
+        _env_float("GEMMA27_RL_THINK_TAG_SEQ_PENALTY", default=_DEFAULT_THINK_TAG_SEQUENCE_PENALTY)
+    )
+    repeat_token_penalty = -abs(
+        _env_float("GEMMA27_RL_REPEAT_TOKEN_PENALTY", default=_DEFAULT_REPEAT_TOKEN_PENALTY)
+    )
+    repeat_seq_penalty = -abs(
+        _env_float("GEMMA27_RL_REPEAT_SEQ_PENALTY", default=_DEFAULT_REPEAT_SEQUENCE_PENALTY)
+    )
+    repeat_min_run = _env_int("GEMMA27_RL_REPEAT_MIN_RUN", default=2, minimum=2)
+    repeat_max_pattern = _env_int("GEMMA27_RL_REPEAT_MAX_PATTERN", default=4, minimum=1)
+    ngram_token_penalty = -abs(
+        _env_float("GEMMA27_RL_NGRAM_TOKEN_PENALTY", default=_DEFAULT_NGRAM_TOKEN_PENALTY)
+    )
+    ngram_seq_penalty = -abs(
+        _env_float("GEMMA27_RL_NGRAM_SEQ_PENALTY", default=_DEFAULT_NGRAM_SEQUENCE_PENALTY)
+    )
+    ngram_repeat_n = _env_int("GEMMA27_RL_NGRAM_REPEAT_N", default=3, minimum=2)
+    ngram_min_occurrences = _env_int("GEMMA27_RL_NGRAM_REPEAT_MIN_OCCURS", default=2, minimum=2)
+    special_token_penalty = -abs(
+        _env_float("GEMMA27_RL_SPECIAL_TOKEN_PENALTY", default=_DEFAULT_SPECIAL_TOKEN_PENALTY)
+    )
+    special_seq_penalty = -abs(
+        _env_float("GEMMA27_RL_SPECIAL_SEQ_PENALTY", default=_DEFAULT_SPECIAL_SEQUENCE_PENALTY)
+    )
+    debug_span_records: list[tuple[int, Rollout, list[dict[str, Any]], list[float], list[float], float]] = []
+
+    metricx_rewards = [metricx_score_to_reward(v, offset=cfg.reward.metricx.offset) for v in metricx_scores]
     mqm_skipped_count = int(sum(mqm_skipped))
     esa_skipped_count = int(sum(esa_skipped))
     if mqm_skipped_count > 0:
@@ -3205,16 +3457,9 @@ def _prepare_rewards_and_advantages(
         )
     if esa_skipped_count > 0:
         logger.warning("ESA scorer skipped %s sample(s) after repeated parse/repair failures.", esa_skipped_count)
-    span_rows = [
-        [
-            *(span_rows[idx] if idx < len(span_rows) else []),
-            *(mqm_span_rows[idx] if idx < len(mqm_span_rows) else []),
-        ]
-        for idx in range(len(rollouts))
-    ]
 
     drop_mask = [False for _ in rollouts]
-    if esa_enabled:
+    if cfg.reward.esa.enabled:
         drop_mask = [drop or skipped for drop, skipped in zip(drop_mask, esa_skipped)]
     dropped_rollouts_count = int(sum(drop_mask))
     if dropped_rollouts_count > 0:
@@ -3225,9 +3470,9 @@ def _prepare_rewards_and_advantages(
         )
         rollouts = _filter_rows_by_indices(rollouts, keep_indices)
         raw_completion_texts = _filter_rows_by_indices(raw_completion_texts, keep_indices)
-        clean_completion_texts = _filter_rows_by_indices(clean_completion_texts, keep_indices)
         span_reward_texts = _filter_rows_by_indices(span_reward_texts, keep_indices)
         metricx_scores = _filter_rows_by_indices(metricx_scores, keep_indices)
+        metricx_rewards = _filter_rows_by_indices(metricx_rewards, keep_indices)
         xcomet_scores = _filter_rows_by_indices(xcomet_scores, keep_indices)
         mqm_scores = _filter_rows_by_indices(mqm_scores, keep_indices)
         esa_scores = _filter_rows_by_indices(esa_scores, keep_indices)
@@ -3468,7 +3713,7 @@ def _prepare_rewards_and_advantages(
         logger.info(
             "MQM/ESA target sanitize applied: rows=%s/%s marker_replacements=%s tokenizer_special_tokens=%s",
             int(sanitized_target_rows),
-            len(rollouts),
+            int(scored_rollout_count),
             int(sanitized_marker_total),
             len(special_token_strings),
         )
@@ -3597,6 +3842,39 @@ def _prepare_rewards_and_advantages(
     }
 
     return rollouts, norm_adv_rows, reward_stats, norm_stats
+
+
+def _prepare_rewards_and_advantages(
+    rollouts: list[Rollout],
+    cfg: RLPostTrainConfig,
+    metricx_scorer: MetricXQEScorer | None,
+    xcomet_scorer: XCometXLScorer | None,
+    mqm_scorer: OpenAICompatibleMQMScorer | None,
+    esa_scorer: OpenAICompatibleESAScorer | None,
+    metricx_cache: dict[tuple[str, str, str], float],
+    xcomet_cache: dict[tuple[str, str, str], tuple[float, list[dict[str, Any]]]],
+    mqm_cache: dict[tuple[str, str, str, str, str], tuple[float, list[dict[str, Any]]]],
+    esa_cache: dict[tuple[str, str, str, str, str], float],
+    tokenizer: Any | None = None,
+) -> tuple[list[Rollout], list[list[float]], dict[str, float], dict[str, float]]:
+    scored_batch = _score_reward_rollouts(
+        rollouts=rollouts,
+        cfg=cfg,
+        metricx_scorer=metricx_scorer,
+        xcomet_scorer=xcomet_scorer,
+        mqm_scorer=mqm_scorer,
+        esa_scorer=esa_scorer,
+        metricx_cache=metricx_cache,
+        xcomet_cache=xcomet_cache,
+        mqm_cache=mqm_cache,
+        esa_cache=esa_cache,
+        tokenizer=tokenizer,
+    )
+    return _prepare_rewards_and_advantages_from_scores(
+        scored_batch=scored_batch,
+        cfg=cfg,
+        tokenizer=tokenizer,
+    )
 
 
 def _fill_missing_reference_logprobs(
@@ -4784,36 +5062,24 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
                 f"u{update_idx}:r{rank}:p{pos}:idx{int(batch_indices[pos])}"
                 for pos in range(len(batch_examples))
             ]
-            rollouts = generate_rollouts(
-                examples=batch_examples,
+            rollouts, advantages, reward_stats, adv_stats = _prepare_training_batch_rollouts_and_advantages(
+                batch_examples=batch_examples,
+                prompt_instance_ids=prompt_instance_ids,
+                update_idx=update_idx,
                 policy_model=policy_eval_model,
                 tokenizer=tokenizer,
-                gen_cfg=cfg.generation,
+                cfg=cfg,
                 device=device,
-                # Keep rollout generation free of reference model calls; fill reference
-                # logprobs in one batched step right after rewards.
-                ref_model=None,
-                ref_device=None,
-                ref_logprob_fn=None,
-                prompt_template=cfg.prompt.template,
-                show_progress=True,
-                progress_desc=f"rollout u{update_idx}",
-                prompt_instance_ids=prompt_instance_ids,
+                metricx_scorer=metricx_scorer,
+                xcomet_scorer=xcomet_scorer,
+                mqm_scorer=mqm_scorer,
+                esa_scorer=esa_scorer,
+                metricx_cache=metricx_cache,
+                xcomet_cache=xcomet_cache,
+                mqm_cache=mqm_cache,
+                esa_cache=esa_cache,
             )
             if rollouts:
-                rollouts, advantages, reward_stats, adv_stats = _prepare_rewards_and_advantages(
-                    rollouts=rollouts,
-                    cfg=cfg,
-                    metricx_scorer=metricx_scorer,
-                    xcomet_scorer=xcomet_scorer,
-                    mqm_scorer=mqm_scorer,
-                    esa_scorer=esa_scorer,
-                    metricx_cache=metricx_cache,
-                    xcomet_cache=xcomet_cache,
-                    mqm_cache=mqm_cache,
-                    esa_cache=esa_cache,
-                    tokenizer=tokenizer,
-                )
                 if reference_kl_enabled:
                     _ = _fill_missing_reference_logprobs(
                         merged_rollouts=rollouts,

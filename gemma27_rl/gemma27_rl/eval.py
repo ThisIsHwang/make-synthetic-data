@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from collections import Counter
 from copy import deepcopy
+from dataclasses import dataclass
 import datetime
 import logging
 import math
@@ -390,130 +391,71 @@ def _pad_eval_shard_examples(
     return padded, pad_count
 
 
-def evaluate_on_dataset(
-    examples: list[Example],
-    policy_model: PreTrainedModel,
+@dataclass
+class _EvalScoringBatch:
+    rollouts: list[Rollout]
+    raw_completion_texts: list[str]
+    clean_completion_texts: list[str]
+    metricx_scores: list[float]
+    metricx_rewards: list[float]
+    xcomet_scores: list[float]
+    mqm_scores: list[float]
+    esa_scores: list[float]
+    spans: list[list[dict[str, Any]]]
+    mqm_skipped: list[bool]
+    esa_skipped: list[bool]
+    sanitized_target_rows: int
+    sanitized_marker_total: int
+
+
+def _should_pipeline_eval_api_scoring(
+    *,
+    cfg: RLPostTrainConfig,
+    mqm_scorer: OpenAICompatibleMQMScorer | None,
+    esa_scorer: OpenAICompatibleESAScorer | None,
+) -> bool:
+    if _env_flag("GEMMA27_RL_DISABLE_ROLLOUT_PIPELINE", default=False):
+        return False
+    return bool(
+        (cfg.reward.mqm.enabled and mqm_scorer is not None)
+        or (cfg.reward.esa.enabled and esa_scorer is not None)
+    )
+
+
+def _resolve_eval_rollout_pipeline_chunk_size(*, total_examples: int, cfg: RLPostTrainConfig) -> int:
+    total = max(0, int(total_examples))
+    if total <= 1:
+        return total
+
+    raw = os.environ.get("GEMMA27_RL_ROLLOUT_PIPELINE_CHUNK")
+    if raw is not None:
+        try:
+            requested = int(raw.strip())
+        except Exception:
+            requested = 0
+        if requested > 0:
+            return min(total, requested)
+
+    batch_hints: list[int] = []
+    if cfg.reward.mqm.enabled:
+        batch_hints.append(max(1, int(cfg.reward.mqm.batch_size)))
+    if cfg.reward.esa.enabled:
+        batch_hints.append(max(1, int(cfg.reward.esa.batch_size)))
+    hint = min(batch_hints) if batch_hints else total
+    default_chunk = min(hint, int(math.ceil(total / 2.0)))
+    return max(1, min(total, default_chunk))
+
+
+def _score_eval_rollouts(
+    *,
+    rollouts: list[Rollout],
     tokenizer: PreTrainedTokenizerBase,
     cfg: RLPostTrainConfig,
-    device: str,
     metricx_scorer: MetricXQEScorer | None = None,
     xcomet_scorer: XCometXLScorer | None = None,
     mqm_scorer: OpenAICompatibleMQMScorer | None = None,
     esa_scorer: OpenAICompatibleESAScorer | None = None,
-    collect_outputs: bool = False,
-    show_progress: bool = False,
-    distributed_eval_shard: bool = False,
-    distributed_rank: int = 0,
-    distributed_world_size: int = 1,
-) -> dict[str, Any]:
-    if not examples:
-        empty = {
-            "metricx_score_mean": 0.0,
-            "metricx_reward_mean": 0.0,
-            "xcomet_score_mean": 0.0,
-            "mqm_score_mean": 0.0,
-            "esa_score_mean": 0.0,
-            "esa_score_std": 0.0,
-            "avg_span_count": 0.0,
-            "severity_counts": {},
-            "avg_completion_len": 0.0,
-        }
-        if collect_outputs:
-            empty["eval_rows"] = []
-        return empty
-
-    logger.info(
-        "evaluate_on_dataset: start examples=%s collect_outputs=%s",
-        len(examples),
-        bool(collect_outputs),
-    )
-    gen_cfg = deepcopy(cfg.generation)
-    gen_cfg.num_samples_per_prompt = 1
-    gen_cfg.do_sample = False
-    gen_cfg.temperature = 0.0
-    eval_overrides = dict(getattr(cfg.eval, "generation_overrides", {}) or {})
-    if eval_overrides:
-        for key, value in eval_overrides.items():
-            if hasattr(gen_cfg, key):
-                setattr(gen_cfg, key, value)
-            else:
-                logger.warning("Ignoring unknown eval.generation_overrides key: %s", key)
-        logger.info("evaluate_on_dataset: applied eval generation overrides: %s", eval_overrides)
-    if int(getattr(gen_cfg, "num_samples_per_prompt", 1)) != 1:
-        logger.warning(
-            "Eval always uses one sample per prompt; overriding num_samples_per_prompt=%s -> 1.",
-            getattr(gen_cfg, "num_samples_per_prompt", None),
-        )
-        gen_cfg.num_samples_per_prompt = 1
-    if bool(getattr(gen_cfg, "do_sample", False)):
-        logger.warning(
-            "Eval enforces deterministic decoding; overriding do_sample=%s -> False.",
-            getattr(gen_cfg, "do_sample", None),
-        )
-    gen_cfg.do_sample = False
-    shard_eval = bool(distributed_eval_shard and distributed_world_size > 1)
-    if shard_eval:
-        local_examples, pad_count = _pad_eval_shard_examples(
-            examples,
-            rank=distributed_rank,
-            world_size=distributed_world_size,
-        )
-        if distributed_rank == 0:
-            logger.info(
-                "evaluate_on_dataset: distributed shard mode enabled world_size=%s rank=%s local_examples=%s pad=%s",
-                distributed_world_size,
-                distributed_rank,
-                len(local_examples),
-                pad_count,
-            )
-    else:
-        local_examples = examples
-        pad_count = 0
-
-    local_rollouts = generate_rollouts(
-        examples=local_examples,
-        policy_model=policy_model,
-        tokenizer=tokenizer,
-        gen_cfg=gen_cfg,
-        device=device,
-        ref_model=None,
-        prompt_template=cfg.prompt.template,
-        show_progress=bool(show_progress),
-        progress_desc="eval rollout",
-        compute_old_logprobs=False,
-        compute_token_offsets=False,
-        include_prompt_input_ids=False,
-    )
-    if pad_count > 0:
-        local_rollouts = [r for r in local_rollouts if not str(r.example_id).startswith(_EVAL_PAD_PREFIX)]
-    if shard_eval:
-        logger.info(
-            "evaluate_on_dataset: local rollout done rank=%s local_rollouts=%s",
-            distributed_rank,
-            len(local_rollouts),
-        )
-        logger.info("evaluate_on_dataset: gather begin rank=%s", distributed_rank)
-        rollouts = _gather_rollouts_to_rank0(
-            local_rollouts,
-            cfg=cfg,
-            rank=distributed_rank,
-            world_size=distributed_world_size,
-        )
-        logger.info("evaluate_on_dataset: gather done rank=%s merged_rollouts=%s", distributed_rank, len(rollouts))
-    else:
-        # Non-sharded distributed eval runs generation on all ranks for ZeRO/NCCL safety,
-        # but report/scoring must use only one copy of each example (rank0 local results).
-        rollouts = local_rollouts if distributed_rank == 0 else []
-        if distributed_world_size > 1 and distributed_rank == 0:
-            logger.info(
-                "evaluate_on_dataset: non-sharded distributed eval; using rank0 local rollouts only "
-                "(rollouts=%s, world_size=%s).",
-                len(rollouts),
-                distributed_world_size,
-            )
-    if (not shard_eval) or distributed_rank == 0:
-        logger.info("evaluate_on_dataset: rollout complete rollouts=%s", len(rollouts))
-
+) -> _EvalScoringBatch:
     special_token_strings = collect_tokenizer_special_token_strings(tokenizer)
     samples: list[SampleForScoring] = []
     raw_completion_texts: list[str] = []
@@ -540,14 +482,6 @@ def evaluate_on_dataset(
                 source_lang=rollout.src_lang,
                 target_lang=rollout.tgt_lang,
             )
-        )
-    if sanitized_target_rows > 0:
-        logger.info(
-            "evaluate_on_dataset: scorer target sanitize applied: rows=%s/%s marker_replacements=%s tokenizer_special_tokens=%s",
-            int(sanitized_target_rows),
-            len(rollouts),
-            int(sanitized_marker_total),
-            len(special_token_strings),
         )
 
     metricx_scores = [0.0 for _ in rollouts]
@@ -617,7 +551,7 @@ def evaluate_on_dataset(
         ]
         return xcomet_local_scores, xcomet_local_spans
 
-    def _score_mqm_eval() -> tuple[list[float], list[list[dict[str, Any]]]]:
+    def _score_mqm_eval() -> tuple[list[float], list[list[dict[str, Any]]], list[bool]]:
         mqm_out = mqm_scorer.score_batch(samples)
         mqm_local_scores, span_rows = _validate_scorer_batch_lengths(
             scorer_name="MQM",
@@ -707,13 +641,339 @@ def evaluate_on_dataset(
         if esa_enabled:
             logger.info("evaluate_on_dataset: scoring esa...")
             esa_scores, esa_skipped = _score_esa_eval()
-    spans = [
+
+    merged_spans = [
         [
             *(spans[idx] if idx < len(spans) else []),
             *(mqm_spans[idx] if idx < len(mqm_spans) else []),
         ]
         for idx in range(len(rollouts))
     ]
+    return _EvalScoringBatch(
+        rollouts=list(rollouts),
+        raw_completion_texts=raw_completion_texts,
+        clean_completion_texts=clean_completion_texts,
+        metricx_scores=metricx_scores,
+        metricx_rewards=metricx_rewards,
+        xcomet_scores=xcomet_scores,
+        mqm_scores=mqm_scores,
+        esa_scores=esa_scores,
+        spans=merged_spans,
+        mqm_skipped=mqm_skipped,
+        esa_skipped=esa_skipped,
+        sanitized_target_rows=int(sanitized_target_rows),
+        sanitized_marker_total=int(sanitized_marker_total),
+    )
+
+
+def _merge_eval_scoring_batches(scored_batches: list[_EvalScoringBatch]) -> _EvalScoringBatch:
+    merged = _EvalScoringBatch(
+        rollouts=[],
+        raw_completion_texts=[],
+        clean_completion_texts=[],
+        metricx_scores=[],
+        metricx_rewards=[],
+        xcomet_scores=[],
+        mqm_scores=[],
+        esa_scores=[],
+        spans=[],
+        mqm_skipped=[],
+        esa_skipped=[],
+        sanitized_target_rows=0,
+        sanitized_marker_total=0,
+    )
+    for batch in scored_batches:
+        merged.rollouts.extend(batch.rollouts)
+        merged.raw_completion_texts.extend(batch.raw_completion_texts)
+        merged.clean_completion_texts.extend(batch.clean_completion_texts)
+        merged.metricx_scores.extend(batch.metricx_scores)
+        merged.metricx_rewards.extend(batch.metricx_rewards)
+        merged.xcomet_scores.extend(batch.xcomet_scores)
+        merged.mqm_scores.extend(batch.mqm_scores)
+        merged.esa_scores.extend(batch.esa_scores)
+        merged.spans.extend(batch.spans)
+        merged.mqm_skipped.extend(batch.mqm_skipped)
+        merged.esa_skipped.extend(batch.esa_skipped)
+        merged.sanitized_target_rows += int(batch.sanitized_target_rows)
+        merged.sanitized_marker_total += int(batch.sanitized_marker_total)
+    return merged
+
+
+def _generate_and_score_eval_rollouts_pipelined(
+    *,
+    examples: list[Example],
+    policy_model: PreTrainedModel,
+    tokenizer: PreTrainedTokenizerBase,
+    gen_cfg: GenerationConfig,
+    cfg: RLPostTrainConfig,
+    device: str,
+    show_progress: bool,
+    score_on_this_rank: bool,
+    metricx_scorer: MetricXQEScorer | None = None,
+    xcomet_scorer: XCometXLScorer | None = None,
+    mqm_scorer: OpenAICompatibleMQMScorer | None = None,
+    esa_scorer: OpenAICompatibleESAScorer | None = None,
+) -> tuple[list[Rollout], _EvalScoringBatch | None]:
+    if not examples:
+        return [], None
+
+    chunk_size = _resolve_eval_rollout_pipeline_chunk_size(total_examples=len(examples), cfg=cfg)
+    chunk_ranges = [
+        (start, min(len(examples), start + chunk_size))
+        for start in range(0, len(examples), max(1, chunk_size))
+    ]
+    if score_on_this_rank:
+        logger.info(
+            "evaluate_on_dataset: pipelining rollout generation with API scoring chunk_size=%s chunks=%s examples=%s",
+            chunk_size,
+            len(chunk_ranges),
+            len(examples),
+        )
+
+    def _generate_chunk(chunk_idx: int, chunk_examples: list[Example]) -> list[Rollout]:
+        return generate_rollouts(
+            examples=chunk_examples,
+            policy_model=policy_model,
+            tokenizer=tokenizer,
+            gen_cfg=gen_cfg,
+            device=device,
+            ref_model=None,
+            prompt_template=cfg.prompt.template,
+            show_progress=bool(show_progress),
+            progress_desc=f"eval rollout [{chunk_idx + 1}/{len(chunk_ranges)}]",
+            compute_old_logprobs=False,
+            compute_token_offsets=False,
+            include_prompt_input_ids=False,
+        )
+
+    first_start, first_end = chunk_ranges[0]
+    current_rollouts = _generate_chunk(0, examples[first_start:first_end])
+    local_rollouts = list(current_rollouts)
+    scored_batches: list[_EvalScoringBatch] = []
+    executor: ThreadPoolExecutor | None = None
+    try:
+        if score_on_this_rank:
+            executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="eval-pipeline")
+        for chunk_idx, (start, end) in enumerate(chunk_ranges[1:], start=1):
+            score_future = None
+            if score_on_this_rank and executor is not None and current_rollouts:
+                score_future = executor.submit(
+                    _score_eval_rollouts,
+                    rollouts=current_rollouts,
+                    tokenizer=tokenizer,
+                    cfg=cfg,
+                    metricx_scorer=metricx_scorer,
+                    xcomet_scorer=xcomet_scorer,
+                    mqm_scorer=mqm_scorer,
+                    esa_scorer=esa_scorer,
+                )
+            next_rollouts = _generate_chunk(chunk_idx, examples[start:end])
+            local_rollouts.extend(next_rollouts)
+            if score_future is not None:
+                scored_batches.append(score_future.result())
+            current_rollouts = next_rollouts
+    finally:
+        if executor is not None:
+            executor.shutdown(wait=True)
+
+    if score_on_this_rank and current_rollouts:
+        scored_batches.append(
+            _score_eval_rollouts(
+                rollouts=current_rollouts,
+                tokenizer=tokenizer,
+                cfg=cfg,
+                metricx_scorer=metricx_scorer,
+                xcomet_scorer=xcomet_scorer,
+                mqm_scorer=mqm_scorer,
+                esa_scorer=esa_scorer,
+            )
+        )
+
+    merged_scores = _merge_eval_scoring_batches(scored_batches) if scored_batches else None
+    return local_rollouts, merged_scores
+
+
+def evaluate_on_dataset(
+    examples: list[Example],
+    policy_model: PreTrainedModel,
+    tokenizer: PreTrainedTokenizerBase,
+    cfg: RLPostTrainConfig,
+    device: str,
+    metricx_scorer: MetricXQEScorer | None = None,
+    xcomet_scorer: XCometXLScorer | None = None,
+    mqm_scorer: OpenAICompatibleMQMScorer | None = None,
+    esa_scorer: OpenAICompatibleESAScorer | None = None,
+    collect_outputs: bool = False,
+    show_progress: bool = False,
+    distributed_eval_shard: bool = False,
+    distributed_rank: int = 0,
+    distributed_world_size: int = 1,
+) -> dict[str, Any]:
+    if not examples:
+        empty = {
+            "metricx_score_mean": 0.0,
+            "metricx_reward_mean": 0.0,
+            "xcomet_score_mean": 0.0,
+            "mqm_score_mean": 0.0,
+            "esa_score_mean": 0.0,
+            "esa_score_std": 0.0,
+            "avg_span_count": 0.0,
+            "severity_counts": {},
+            "avg_completion_len": 0.0,
+        }
+        if collect_outputs:
+            empty["eval_rows"] = []
+        return empty
+
+    logger.info(
+        "evaluate_on_dataset: start examples=%s collect_outputs=%s",
+        len(examples),
+        bool(collect_outputs),
+    )
+    gen_cfg = deepcopy(cfg.generation)
+    gen_cfg.num_samples_per_prompt = 1
+    gen_cfg.do_sample = False
+    gen_cfg.temperature = 0.0
+    eval_overrides = dict(getattr(cfg.eval, "generation_overrides", {}) or {})
+    if eval_overrides:
+        for key, value in eval_overrides.items():
+            if hasattr(gen_cfg, key):
+                setattr(gen_cfg, key, value)
+            else:
+                logger.warning("Ignoring unknown eval.generation_overrides key: %s", key)
+        logger.info("evaluate_on_dataset: applied eval generation overrides: %s", eval_overrides)
+    if int(getattr(gen_cfg, "num_samples_per_prompt", 1)) != 1:
+        logger.warning(
+            "Eval always uses one sample per prompt; overriding num_samples_per_prompt=%s -> 1.",
+            getattr(gen_cfg, "num_samples_per_prompt", None),
+        )
+        gen_cfg.num_samples_per_prompt = 1
+    if bool(getattr(gen_cfg, "do_sample", False)):
+        logger.warning(
+            "Eval enforces deterministic decoding; overriding do_sample=%s -> False.",
+            getattr(gen_cfg, "do_sample", None),
+        )
+    gen_cfg.do_sample = False
+    shard_eval = bool(distributed_eval_shard and distributed_world_size > 1)
+    if shard_eval:
+        local_examples, pad_count = _pad_eval_shard_examples(
+            examples,
+            rank=distributed_rank,
+            world_size=distributed_world_size,
+        )
+        if distributed_rank == 0:
+            logger.info(
+                "evaluate_on_dataset: distributed shard mode enabled world_size=%s rank=%s local_examples=%s pad=%s",
+                distributed_world_size,
+                distributed_rank,
+                len(local_examples),
+                pad_count,
+            )
+    else:
+        local_examples = examples
+        pad_count = 0
+
+    pipeline_enabled = (
+        (not shard_eval)
+        and _should_pipeline_eval_api_scoring(cfg=cfg, mqm_scorer=mqm_scorer, esa_scorer=esa_scorer)
+        and _resolve_eval_rollout_pipeline_chunk_size(total_examples=len(local_examples), cfg=cfg) < len(local_examples)
+    )
+    local_scored_rollouts: _EvalScoringBatch | None = None
+    if pipeline_enabled:
+        local_rollouts, local_scored_rollouts = _generate_and_score_eval_rollouts_pipelined(
+            examples=local_examples,
+            policy_model=policy_model,
+            tokenizer=tokenizer,
+            gen_cfg=gen_cfg,
+            cfg=cfg,
+            device=device,
+            show_progress=bool(show_progress),
+            score_on_this_rank=bool(distributed_world_size <= 1 or distributed_rank == 0),
+            metricx_scorer=metricx_scorer,
+            xcomet_scorer=xcomet_scorer,
+            mqm_scorer=mqm_scorer,
+            esa_scorer=esa_scorer,
+        )
+    else:
+        local_rollouts = generate_rollouts(
+            examples=local_examples,
+            policy_model=policy_model,
+            tokenizer=tokenizer,
+            gen_cfg=gen_cfg,
+            device=device,
+            ref_model=None,
+            prompt_template=cfg.prompt.template,
+            show_progress=bool(show_progress),
+            progress_desc="eval rollout",
+            compute_old_logprobs=False,
+            compute_token_offsets=False,
+            include_prompt_input_ids=False,
+        )
+    if pad_count > 0:
+        local_rollouts = [r for r in local_rollouts if not str(r.example_id).startswith(_EVAL_PAD_PREFIX)]
+    if shard_eval:
+        logger.info(
+            "evaluate_on_dataset: local rollout done rank=%s local_rollouts=%s",
+            distributed_rank,
+            len(local_rollouts),
+        )
+        logger.info("evaluate_on_dataset: gather begin rank=%s", distributed_rank)
+        rollouts = _gather_rollouts_to_rank0(
+            local_rollouts,
+            cfg=cfg,
+            rank=distributed_rank,
+            world_size=distributed_world_size,
+        )
+        logger.info("evaluate_on_dataset: gather done rank=%s merged_rollouts=%s", distributed_rank, len(rollouts))
+    else:
+        # Non-sharded distributed eval runs generation on all ranks for ZeRO/NCCL safety,
+        # but report/scoring must use only one copy of each example (rank0 local results).
+        rollouts = local_rollouts if distributed_rank == 0 else []
+        scored_rollouts = local_scored_rollouts if distributed_rank == 0 else None
+        if distributed_world_size > 1 and distributed_rank == 0:
+            logger.info(
+                "evaluate_on_dataset: non-sharded distributed eval; using rank0 local rollouts only "
+                "(rollouts=%s, world_size=%s).",
+                len(rollouts),
+                distributed_world_size,
+            )
+    if shard_eval:
+        scored_rollouts = None
+    if (not shard_eval) or distributed_rank == 0:
+        logger.info("evaluate_on_dataset: rollout complete rollouts=%s", len(rollouts))
+
+    if scored_rollouts is None and rollouts:
+        scored_rollouts = _score_eval_rollouts(
+            rollouts=rollouts,
+            tokenizer=tokenizer,
+            cfg=cfg,
+            metricx_scorer=metricx_scorer,
+            xcomet_scorer=xcomet_scorer,
+            mqm_scorer=mqm_scorer,
+            esa_scorer=esa_scorer,
+        )
+
+    raw_completion_texts = list(scored_rollouts.raw_completion_texts) if scored_rollouts is not None else []
+    clean_completion_texts = list(scored_rollouts.clean_completion_texts) if scored_rollouts is not None else []
+    metricx_scores = list(scored_rollouts.metricx_scores) if scored_rollouts is not None else []
+    metricx_rewards = list(scored_rollouts.metricx_rewards) if scored_rollouts is not None else []
+    xcomet_scores = list(scored_rollouts.xcomet_scores) if scored_rollouts is not None else []
+    mqm_scores = list(scored_rollouts.mqm_scores) if scored_rollouts is not None else []
+    esa_scores = list(scored_rollouts.esa_scores) if scored_rollouts is not None else []
+    spans = list(scored_rollouts.spans) if scored_rollouts is not None else []
+    mqm_skipped = list(scored_rollouts.mqm_skipped) if scored_rollouts is not None else []
+    esa_skipped = list(scored_rollouts.esa_skipped) if scored_rollouts is not None else []
+    sanitized_target_rows = int(scored_rollouts.sanitized_target_rows) if scored_rollouts is not None else 0
+    sanitized_marker_total = int(scored_rollouts.sanitized_marker_total) if scored_rollouts is not None else 0
+    if sanitized_target_rows > 0:
+        special_token_strings = collect_tokenizer_special_token_strings(tokenizer)
+        logger.info(
+            "evaluate_on_dataset: scorer target sanitize applied: rows=%s/%s marker_replacements=%s tokenizer_special_tokens=%s",
+            int(sanitized_target_rows),
+            len(rollouts),
+            int(sanitized_marker_total),
+            len(special_token_strings),
+        )
 
     span_counts = [len(s) for s in spans]
     severity = Counter()
