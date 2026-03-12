@@ -46,7 +46,7 @@ from .advantage import (
 )
 from .config import RLPostTrainConfig, dump_config
 from .data import load_examples
-from .eval import evaluate_on_dataset
+from .eval import build_eval_report_from_rollouts, evaluate_on_dataset, prepare_eval_rollouts
 from .grpo import update_policy
 from .prompting import (
     collect_tokenizer_special_token_strings as _collect_special_token_strings_shared,
@@ -1941,6 +1941,36 @@ class _ExperimentTracker:
             except Exception:
                 pass
             self._wandb_run = None
+
+
+@dataclass
+class _PendingAsyncEval:
+    update_idx: int
+    run_before_train: bool
+    future: Any | None = None
+
+
+def _should_async_eval_scoring(
+    *,
+    cfg: RLPostTrainConfig,
+    distributed_eval_shard: bool,
+    metricx_scorer: MetricXQEScorer | None,
+    xcomet_scorer: XCometXLScorer | None,
+    mqm_scorer: OpenAICompatibleMQMScorer | None,
+    esa_scorer: OpenAICompatibleESAScorer | None,
+) -> bool:
+    if _env_flag("GEMMA27_RL_DISABLE_ASYNC_EVAL_SCORING", default=False):
+        return False
+    if distributed_eval_shard:
+        return False
+    if cfg.reward.metricx.enabled and metricx_scorer is not None:
+        return False
+    if cfg.reward.xcomet.enabled and xcomet_scorer is not None:
+        return False
+    return bool(
+        (cfg.reward.mqm.enabled and mqm_scorer is not None)
+        or (cfg.reward.esa.enabled and esa_scorer is not None)
+    )
 
 
 def _truncate_jsonl_by_update(path: Path, max_update: int) -> None:
@@ -4908,6 +4938,25 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
         logger.info(
             "Eval distributed sharding is disabled; keeping all ranks in eval generation to avoid ZeRO/NCCL deadlock."
         )
+    async_eval_enabled = _should_async_eval_scoring(
+        cfg=cfg,
+        distributed_eval_shard=distributed_eval_shard,
+        metricx_scorer=metricx_scorer,
+        xcomet_scorer=xcomet_scorer,
+        mqm_scorer=mqm_scorer,
+        esa_scorer=esa_scorer,
+    )
+    async_eval_executor: ThreadPoolExecutor | None = (
+        ThreadPoolExecutor(max_workers=1, thread_name_prefix="async-eval")
+        if async_eval_enabled and rank0
+        else None
+    )
+    pending_async_eval: _PendingAsyncEval | None = None
+    if async_eval_enabled and ((not use_deepspeed) or rank0):
+        logger.info(
+            "Async eval scoring enabled: eval rollout generation stays synchronous, "
+            "but MQM/ESA report scoring overlaps the next training rollout before policy update."
+        )
 
     def _run_eval_once(*, collect_outputs: bool, show_progress: bool) -> dict[str, Any]:
         return evaluate_on_dataset(
@@ -4927,6 +4976,117 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
             distributed_world_size=world_size,
         )
 
+    def _finalize_eval_report(
+        *,
+        report: dict[str, Any] | None,
+        update_idx: int,
+        run_before_train: bool,
+    ) -> float | None:
+        eval_select_score: float | None = None
+        if (not use_deepspeed) or rank0:
+            assert report is not None
+            eval_select_score = _compute_eval_selection_score(report, cfg)
+            report_payload = dict(report)
+            report_payload["model_select_score"] = eval_select_score
+            eval_rows = report_payload.pop("eval_rows", [])
+            _log_json_row({"type": "eval", "update": update_idx, **report_payload})
+            _log_monitor_metrics(prefix="eval", payload=report_payload, step=update_idx)
+            if cfg.logging.save_eval_outputs:
+                _log_eval_rows(update_idx=update_idx, eval_rows=eval_rows)
+            stage_text = " (run_before_train)" if run_before_train else ""
+            logger.info(
+                "finished eval%s: update=%s model_select_score=%.6f metricx=%.4f xcomet=%.4f mqm=%.4f esa=%.4f",
+                stage_text,
+                update_idx,
+                float(eval_select_score),
+                float(report_payload.get("metricx_score_mean", 0.0)),
+                float(report_payload.get("xcomet_score_mean", 0.0)),
+                float(report_payload.get("mqm_score_mean", 0.0)),
+                float(report_payload.get("esa_score_mean", 0.0)),
+            )
+        _sync_and_save_best_checkpoint(eval_select_score if rank0 else None, update_idx=update_idx)
+        return eval_select_score
+
+    def _launch_async_eval(
+        *,
+        update_idx: int,
+        run_before_train: bool,
+        collect_outputs: bool,
+        show_progress: bool,
+    ) -> None:
+        nonlocal pending_async_eval
+        if pending_async_eval is not None:
+            _maybe_finalize_pending_async_eval(block=True)
+        eval_rollouts = prepare_eval_rollouts(
+            examples=eval_examples,
+            policy_model=policy_eval_model,
+            tokenizer=tokenizer,
+            cfg=cfg,
+            device=device,
+            show_progress=show_progress,
+            distributed_eval_shard=distributed_eval_shard,
+            distributed_rank=rank,
+            distributed_world_size=world_size,
+        )
+        future = None
+        if rank0:
+            assert async_eval_executor is not None
+            future = async_eval_executor.submit(
+                build_eval_report_from_rollouts,
+                rollouts=eval_rollouts,
+                tokenizer=tokenizer,
+                cfg=cfg,
+                metricx_scorer=metricx_scorer,
+                xcomet_scorer=xcomet_scorer,
+                mqm_scorer=mqm_scorer,
+                esa_scorer=esa_scorer,
+                collect_outputs=collect_outputs,
+            )
+        pending_async_eval = _PendingAsyncEval(
+            update_idx=update_idx,
+            run_before_train=run_before_train,
+            future=future,
+        )
+
+    def _maybe_finalize_pending_async_eval(*, block: bool) -> bool:
+        nonlocal pending_async_eval
+        if pending_async_eval is None:
+            return False
+
+        should_finalize_local = False
+        if rank0:
+            future = pending_async_eval.future
+            should_finalize_local = bool(block or future is None or future.done())
+        ready_shared: list[Any] = [should_finalize_local if rank0 else False]
+        _broadcast_object_list(ready_shared, src=0)
+        if not bool(ready_shared[0]):
+            return False
+
+        report: dict[str, Any] | None = None
+        error_text: str | None = None
+        pending = pending_async_eval
+        if rank0:
+            try:
+                if pending.future is None:
+                    raise RuntimeError("Pending async eval future is missing on rank0.")
+                report = pending.future.result()
+            except Exception as exc:
+                logger.exception("Async eval scoring failed at update=%s", pending.update_idx)
+                error_text = f"{type(exc).__name__}: {exc}"
+
+        error_shared: list[Any] = [error_text if rank0 else None]
+        _broadcast_object_list(error_shared, src=0)
+        pending_async_eval = None
+        if error_shared[0]:
+            raise RuntimeError(f"Async eval scoring failed at update={pending.update_idx}: {error_shared[0]}")
+
+        _finalize_eval_report(
+            report=report if rank0 else None,
+            update_idx=pending.update_idx,
+            run_before_train=pending.run_before_train,
+        )
+        return True
+
     run_before_train_eval = _should_run_eval_before_train(
         eval_enabled=bool(cfg.eval.run_before_train),
         has_eval_examples=bool(eval_examples),
@@ -4942,7 +5102,8 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
     if run_before_train_eval:
         if (not use_deepspeed) or rank0:
             logger.info(
-                "starting eval (run_before_train): update=%s examples=%s metricx=%s xcomet=%s mqm=%s esa=%s",
+                "starting eval%s: update=%s examples=%s metricx=%s xcomet=%s mqm=%s esa=%s",
+                " async" if async_eval_enabled else " (run_before_train)",
                 run_before_train_eval_update_idx,
                 len(eval_examples),
                 bool(metricx_scorer is not None and cfg.reward.metricx.enabled),
@@ -4950,32 +5111,26 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
                 bool(mqm_scorer is not None and cfg.reward.mqm.enabled),
                 bool(esa_scorer is not None and cfg.reward.esa.enabled),
             )
-        report = _run_eval_once(
-            collect_outputs=bool(cfg.logging.save_eval_outputs and ((not use_deepspeed) or rank0)),
-            show_progress=bool((not use_deepspeed) or rank0),
-        )
-        if (not use_deepspeed) or rank0:
-            eval_select_score = _compute_eval_selection_score(report, cfg)
-            report["model_select_score"] = eval_select_score
-            eval_rows = report.pop("eval_rows", [])
-            _log_json_row({"type": "eval", "update": run_before_train_eval_update_idx, **report})
-            _log_monitor_metrics(prefix="eval", payload=report, step=run_before_train_eval_update_idx)
-            if cfg.logging.save_eval_outputs:
-                _log_eval_rows(update_idx=run_before_train_eval_update_idx, eval_rows=eval_rows)
-            logger.info(
-                "finished eval (run_before_train): update=%s model_select_score=%.6f metricx=%.4f xcomet=%.4f mqm=%.4f esa=%.4f",
-                run_before_train_eval_update_idx,
-                float(eval_select_score),
-                float(report.get("metricx_score_mean", 0.0)),
-                float(report.get("xcomet_score_mean", 0.0)),
-                float(report.get("mqm_score_mean", 0.0)),
-                float(report.get("esa_score_mean", 0.0)),
+        collect_eval_outputs = bool(cfg.logging.save_eval_outputs and ((not use_deepspeed) or rank0))
+        show_eval_progress = bool((not use_deepspeed) or rank0)
+        if async_eval_enabled:
+            _launch_async_eval(
+                update_idx=run_before_train_eval_update_idx,
+                run_before_train=True,
+                collect_outputs=collect_eval_outputs,
+                show_progress=show_eval_progress,
             )
-        _sync_and_save_best_checkpoint(
-            eval_select_score if rank0 else None,
-            update_idx=run_before_train_eval_update_idx,
-        )
-        _dist_barrier()
+        else:
+            report = _run_eval_once(
+                collect_outputs=collect_eval_outputs,
+                show_progress=show_eval_progress,
+            )
+            _finalize_eval_report(
+                report=report if ((not use_deepspeed) or rank0) else None,
+                update_idx=run_before_train_eval_update_idx,
+                run_before_train=True,
+            )
+            _dist_barrier()
     elif cfg.eval.run_before_train and eval_examples and start_update > 1:
         logger.info(
             "Skipping run_before_train eval because training is resumed from update=%s.",
@@ -5280,6 +5435,9 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
             _dist_barrier()
             continue
 
+        if pending_async_eval is not None:
+            _maybe_finalize_pending_async_eval(block=True)
+
         step_stats = []
         for _ in range(max(1, cfg.rl.ppo_epochs)):
             step_stats.append(
@@ -5437,7 +5595,8 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
         ):
             if (not use_deepspeed) or rank0:
                 logger.info(
-                    "starting eval: update=%s examples=%s metricx=%s xcomet=%s mqm=%s esa=%s",
+                    "starting eval%s: update=%s examples=%s metricx=%s xcomet=%s mqm=%s esa=%s",
+                    " async" if async_eval_enabled else "",
                     update_idx,
                     len(eval_examples),
                     bool(metricx_scorer is not None and cfg.reward.metricx.enabled),
@@ -5445,33 +5604,35 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
                     bool(mqm_scorer is not None and cfg.reward.mqm.enabled),
                     bool(esa_scorer is not None and cfg.reward.esa.enabled),
                 )
-            report = _run_eval_once(
-                collect_outputs=bool(cfg.logging.save_eval_outputs and ((not use_deepspeed) or rank0)),
-                show_progress=bool((not use_deepspeed) or rank0),
-            )
-            if (not use_deepspeed) or rank0:
-                eval_select_score = _compute_eval_selection_score(report, cfg)
-                report["model_select_score"] = eval_select_score
-                eval_rows = report.pop("eval_rows", [])
-                _log_json_row({"type": "eval", "update": update_idx, **report})
-                _log_monitor_metrics(prefix="eval", payload=report, step=update_idx)
-                if cfg.logging.save_eval_outputs:
-                    _log_eval_rows(update_idx=update_idx, eval_rows=eval_rows)
-                logger.info(
-                    "finished eval: update=%s model_select_score=%.6f metricx=%.4f xcomet=%.4f mqm=%.4f esa=%.4f",
-                    update_idx,
-                    float(eval_select_score),
-                    float(report.get("metricx_score_mean", 0.0)),
-                    float(report.get("xcomet_score_mean", 0.0)),
-                    float(report.get("mqm_score_mean", 0.0)),
-                    float(report.get("esa_score_mean", 0.0)),
+            collect_eval_outputs = bool(cfg.logging.save_eval_outputs and ((not use_deepspeed) or rank0))
+            show_eval_progress = bool((not use_deepspeed) or rank0)
+            if async_eval_enabled:
+                if pending_async_eval is not None:
+                    _maybe_finalize_pending_async_eval(block=True)
+                _launch_async_eval(
+                    update_idx=update_idx,
+                    run_before_train=False,
+                    collect_outputs=collect_eval_outputs,
+                    show_progress=show_eval_progress,
                 )
-            _sync_and_save_best_checkpoint(eval_select_score if rank0 else None, update_idx=update_idx)
+            else:
+                report = _run_eval_once(
+                    collect_outputs=collect_eval_outputs,
+                    show_progress=show_eval_progress,
+                )
+                _finalize_eval_report(
+                    report=report if ((not use_deepspeed) or rank0) else None,
+                    update_idx=update_idx,
+                    run_before_train=False,
+                )
 
         # Early-stop guard for divergence in toy runs.
         if not math.isfinite(train_stats.policy_loss):
             raise RuntimeError(f"Non-finite loss at update {update_idx}")
         _dist_barrier()
+
+    if pending_async_eval is not None:
+        _maybe_finalize_pending_async_eval(block=True)
 
     if async_json_writer is not None:
         async_json_writer.flush()
@@ -5514,6 +5675,8 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
 
     if ref_logprob_client is not None:
         ref_logprob_client.close()
+    if async_eval_executor is not None:
+        async_eval_executor.shutdown(wait=True)
     if experiment_tracker is not None:
         experiment_tracker.close()
     if async_json_writer is not None:
