@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 import datetime
 import json
 import logging
@@ -1777,6 +1777,170 @@ class _AsyncJsonlWriter:
     def close(self) -> None:
         self.flush()
         self._executor.shutdown(wait=True)
+
+
+def _flatten_monitor_metrics(*, prefix: str, payload: dict[str, Any]) -> dict[str, float]:
+    out: dict[str, float] = {}
+
+    def _visit(path_parts: list[str], value: Any) -> None:
+        if isinstance(value, dict):
+            for raw_key, child in value.items():
+                key = str(raw_key).strip()
+                if not key or key in {"type", "update", "eval_rows"}:
+                    continue
+                _visit([*path_parts, key], child)
+            return
+        if isinstance(value, bool):
+            return
+        if isinstance(value, (int, float)):
+            scalar = float(value)
+            if math.isfinite(scalar):
+                out["/".join(path_parts)] = scalar
+
+    root = str(prefix).strip().strip("/")
+    if not root:
+        return out
+    _visit([root], payload)
+    return out
+
+
+class _ExperimentTracker:
+    def __init__(self, *, cfg: RLPostTrainConfig, output_dir: Path) -> None:
+        self._cfg = cfg
+        self._output_dir = output_dir
+        self._summary_writer: Any | None = None
+        self._wandb_run: Any | None = None
+        self.tensorboard_log_dir: Path | None = None
+        self.wandb_run_id: str | None = None
+        self.wandb_url: str | None = None
+
+        if bool(cfg.logging.tensorboard_enabled):
+            self._init_tensorboard()
+        if bool(cfg.logging.wandb_enabled):
+            self._init_wandb()
+
+    def _init_tensorboard(self) -> None:
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+        except Exception as exc:
+            logger.warning("TensorBoard logging disabled because SummaryWriter import failed: %s", exc)
+            return
+
+        log_dir = Path(self._cfg.logging.tensorboard_dir) if self._cfg.logging.tensorboard_dir else (self._output_dir / "tensorboard")
+        log_dir.mkdir(parents=True, exist_ok=True)
+        writer = SummaryWriter(log_dir=str(log_dir))
+        self._summary_writer = writer
+        self.tensorboard_log_dir = log_dir
+        try:
+            writer.add_text(
+                "config/resolved",
+                json.dumps(asdict(self._cfg), ensure_ascii=False, indent=2),
+                global_step=0,
+            )
+            writer.flush()
+        except Exception:
+            pass
+        logger.info("TensorBoard logging enabled: log_dir=%s", log_dir)
+
+    def _init_wandb(self) -> None:
+        mode = str(self._cfg.logging.wandb_mode or "online").strip().lower() or "online"
+        if mode == "disabled":
+            logger.info("W&B logging requested but mode=disabled; skipping W&B init.")
+            return
+
+        try:
+            import wandb
+        except Exception as exc:
+            logger.warning("W&B logging disabled because wandb import failed: %s", exc)
+            return
+
+        run_id_path = self._output_dir / "wandb_run_id.txt"
+        run_id = None
+        if run_id_path.exists():
+            run_id = str(run_id_path.read_text(encoding="utf-8")).strip() or None
+        init_kwargs: dict[str, Any] = {
+            "project": str(self._cfg.logging.wandb_project or "gemma27-rl").strip() or "gemma27-rl",
+            "entity": self._cfg.logging.wandb_entity,
+            "name": self._cfg.logging.wandb_run_name or self._output_dir.name,
+            "dir": str(self._output_dir),
+            "mode": mode,
+            "config": asdict(self._cfg),
+            "tags": list(self._cfg.logging.wandb_tags or []),
+        }
+        if run_id is not None:
+            init_kwargs["id"] = run_id
+            init_kwargs["resume"] = "allow"
+
+        run = wandb.init(**init_kwargs)
+        if run is None:
+            logger.warning("W&B logging disabled because wandb.init returned no run.")
+            return
+
+        self._wandb_run = run
+        run_id_text = str(getattr(run, "id", "") or "").strip()
+        if run_id_text:
+            run_id_path.write_text(run_id_text + "\n", encoding="utf-8")
+            self.wandb_run_id = run_id_text
+        run_url = str(getattr(run, "url", "") or "").strip()
+        self.wandb_url = run_url or None
+        logger.info(
+            "W&B logging enabled: project=%s run_id=%s mode=%s",
+            init_kwargs["project"],
+            self.wandb_run_id or "unknown",
+            mode,
+        )
+
+    def _disable_tensorboard(self, exc: Exception) -> None:
+        logger.warning("Disabling TensorBoard logging after error: %s", exc)
+        writer = self._summary_writer
+        self._summary_writer = None
+        if writer is not None:
+            try:
+                writer.close()
+            except Exception:
+                pass
+
+    def _disable_wandb(self, exc: Exception) -> None:
+        logger.warning("Disabling W&B logging after error: %s", exc)
+        run = self._wandb_run
+        self._wandb_run = None
+        if run is not None:
+            try:
+                run.finish(exit_code=1)
+            except Exception:
+                pass
+
+    def log_metrics(self, *, prefix: str, payload: dict[str, Any], step: int) -> None:
+        metrics = _flatten_monitor_metrics(prefix=prefix, payload=payload)
+        if not metrics:
+            return
+        if self._summary_writer is not None:
+            try:
+                for key, value in metrics.items():
+                    self._summary_writer.add_scalar(key, value, global_step=int(step))
+                self._summary_writer.flush()
+            except Exception as exc:
+                self._disable_tensorboard(exc)
+        if self._wandb_run is not None:
+            try:
+                self._wandb_run.log(metrics, step=int(step))
+            except Exception as exc:
+                self._disable_wandb(exc)
+
+    def close(self) -> None:
+        if self._summary_writer is not None:
+            try:
+                self._summary_writer.flush()
+                self._summary_writer.close()
+            except Exception:
+                pass
+            self._summary_writer = None
+        if self._wandb_run is not None:
+            try:
+                self._wandb_run.finish(exit_code=0)
+            except Exception:
+                pass
+            self._wandb_run = None
 
 
 def _truncate_jsonl_by_update(path: Path, max_update: int) -> None:
@@ -4324,6 +4488,7 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
     log_path = output_dir / cfg.logging.jsonl_name
     rollout_log_path = output_dir / cfg.logging.rollout_jsonl_name
     eval_output_path = output_dir / cfg.logging.eval_output_jsonl_name
+    experiment_tracker: _ExperimentTracker | None = _ExperimentTracker(cfg=cfg, output_dir=output_dir) if rank0 else None
 
     resume_ckpt, resume_update_idx = _resolve_resume_checkpoint(cfg, output_dir)
     resume_state = _load_trainer_state(resume_ckpt) if resume_ckpt is not None else None
@@ -4596,6 +4761,10 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
         else:
             _append_jsonl(log_path, payload)
 
+    def _log_monitor_metrics(*, prefix: str, payload: dict[str, Any], step: int) -> None:
+        if experiment_tracker is not None:
+            experiment_tracker.log_metrics(prefix=prefix, payload=payload, step=step)
+
     def _log_rollout_rows(
         *,
         update_idx: int,
@@ -4790,6 +4959,7 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
             report["model_select_score"] = eval_select_score
             eval_rows = report.pop("eval_rows", [])
             _log_json_row({"type": "eval", "update": run_before_train_eval_update_idx, **report})
+            _log_monitor_metrics(prefix="eval", payload=report, step=run_before_train_eval_update_idx)
             if cfg.logging.save_eval_outputs:
                 _log_eval_rows(update_idx=run_before_train_eval_update_idx, eval_rows=eval_rows)
             logger.info(
@@ -5144,6 +5314,7 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
         }
         if (not use_deepspeed) or rank0:
             _log_json_row(payload)
+            _log_monitor_metrics(prefix="train", payload=payload, step=update_idx)
             if cfg.logging.save_rollouts:
                 _log_rollout_rows(
                     update_idx=update_idx,
@@ -5283,6 +5454,7 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
                 report["model_select_score"] = eval_select_score
                 eval_rows = report.pop("eval_rows", [])
                 _log_json_row({"type": "eval", "update": update_idx, **report})
+                _log_monitor_metrics(prefix="eval", payload=report, step=update_idx)
                 if cfg.logging.save_eval_outputs:
                     _log_eval_rows(update_idx=update_idx, eval_rows=eval_rows)
                 logger.info(
@@ -5328,6 +5500,12 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
         artifacts["best_eval_update"] = best_eval_update
         artifacts["best_eval_score"] = best_eval_score if best_eval_update is not None else None
         artifacts["log_path"] = str(log_path)
+        if experiment_tracker is not None and experiment_tracker.tensorboard_log_dir is not None:
+            artifacts["tensorboard_log_dir"] = str(experiment_tracker.tensorboard_log_dir)
+        if experiment_tracker is not None and experiment_tracker.wandb_run_id is not None:
+            artifacts["wandb_run_id"] = str(experiment_tracker.wandb_run_id)
+        if experiment_tracker is not None and experiment_tracker.wandb_url is not None:
+            artifacts["wandb_run_url"] = str(experiment_tracker.wandb_url)
         if cfg.logging.save_rollouts:
             artifacts["rollout_log_path"] = str(rollout_log_path)
         if cfg.logging.save_eval_outputs:
@@ -5336,6 +5514,8 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
 
     if ref_logprob_client is not None:
         ref_logprob_client.close()
+    if experiment_tracker is not None:
+        experiment_tracker.close()
     if async_json_writer is not None:
         async_json_writer.close()
 

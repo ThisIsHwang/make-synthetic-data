@@ -293,6 +293,14 @@ class LoggingConfig:
     rollout_jsonl_name: str = "train_rollouts.jsonl"
     mqm_parse_failure_jsonl_name: str = "mqm_parse_failures.jsonl"
     esa_parse_failure_jsonl_name: str = "esa_parse_failures.jsonl"
+    tensorboard_enabled: bool = True
+    tensorboard_dir: str | None = None
+    wandb_enabled: bool = False
+    wandb_project: str = "gemma27-rl"
+    wandb_entity: str | None = None
+    wandb_run_name: str | None = None
+    wandb_mode: str = "online"  # online|offline|disabled
+    wandb_tags: list[str] = field(default_factory=list)
     save_rollouts: bool = False
     eval_output_jsonl_name: str = "eval_outputs.jsonl"
     save_eval_outputs: bool = False
@@ -542,6 +550,17 @@ def _validate_config(cfg: RLPostTrainConfig) -> None:
         raise ValueError("logging.keep_last_n_checkpoints must be >= 0")
     if not isinstance(cfg.logging.reset_best_eval_on_resume, bool):
         raise ValueError("logging.reset_best_eval_on_resume must be a bool")
+    if not isinstance(cfg.logging.tensorboard_enabled, bool):
+        raise ValueError("logging.tensorboard_enabled must be a bool")
+    if not isinstance(cfg.logging.wandb_enabled, bool):
+        raise ValueError("logging.wandb_enabled must be a bool")
+    if str(cfg.logging.wandb_mode or "").strip().lower() not in {"online", "offline", "disabled"}:
+        raise ValueError("logging.wandb_mode must be online|offline|disabled")
+    if not isinstance(cfg.logging.wandb_tags, list):
+        raise ValueError("logging.wandb_tags must be a list")
+    for idx, tag in enumerate(cfg.logging.wandb_tags):
+        if not str(tag).strip():
+            raise ValueError(f"logging.wandb_tags[{idx}] must not be empty")
     if cfg.misc.distributed_timeout_sec is not None and float(cfg.misc.distributed_timeout_sec) <= 0:
         raise ValueError("misc.distributed_timeout_sec must be > 0 when set")
     if not str(cfg.logging.mqm_parse_failure_jsonl_name or "").strip():
@@ -802,8 +821,13 @@ def load_config(path: str | Path) -> RLPostTrainConfig:
     cfg.model.tokenizer_name_or_path = _resolve_model_name_or_path(cfg.model.tokenizer_name_or_path, base_dir)
     cfg.logging.output_dir = _resolve_optional_path(cfg.logging.output_dir, base_dir) or cfg.logging.output_dir
     cfg.logging.resume_from_checkpoint = _resolve_optional_path(cfg.logging.resume_from_checkpoint, base_dir)
+    cfg.logging.tensorboard_dir = _resolve_optional_path(cfg.logging.tensorboard_dir, base_dir)
     cfg.misc.huggingface_cache_dir = _resolve_optional_path(cfg.misc.huggingface_cache_dir, base_dir)
     cfg.rl.deepspeed_config_path = _resolve_optional_path(cfg.rl.deepspeed_config_path, base_dir)
+    cfg.logging.wandb_entity = _normalize_optional_text(cfg.logging.wandb_entity)
+    cfg.logging.wandb_run_name = _normalize_optional_text(cfg.logging.wandb_run_name)
+    cfg.logging.wandb_mode = str(cfg.logging.wandb_mode or "online").strip().lower() or "online"
+    cfg.logging.wandb_tags = [str(tag).strip() for tag in list(cfg.logging.wandb_tags or []) if str(tag).strip()]
     cfg.misc.aux_worker_remote_workdir = _normalize_optional_text(cfg.misc.aux_worker_remote_workdir)
     cfg.model.reference_worker_remote_workdir = _normalize_optional_text(cfg.model.reference_worker_remote_workdir)
     cfg.reward.metricx.worker_remote_workdir = _normalize_optional_text(cfg.reward.metricx.worker_remote_workdir)

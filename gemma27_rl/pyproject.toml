@@ -21,6 +21,10 @@ dependencies = [
 train = [
   "accelerate>=0.34.0",
 ]
+monitor = [
+  "tensorboard>=2.16.0",
+  "wandb>=0.19.0",
+]
 reward = [
   "setuptools<81",
   "unbabel-comet>=2.2.0",
@@ -36,7 +40,9 @@ full = [
   "deepspeed>=0.15.4",
   "pytest>=8.0.0",
   "setuptools<81",
+  "tensorboard>=2.16.0",
   "unbabel-comet>=2.2.0",
+  "wandb>=0.19.0",
 ]
 
 [project.scripts]

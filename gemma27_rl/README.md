@@ -36,6 +36,12 @@ uv pip install -e .
 uv pip install -e ".[train,reward]"
 ```
 
+TensorBoard/W&B 모니터링까지 쓰려면:
+
+```bash
+uv pip install -e ".[train,reward,monitor]"
+```
+
 DeepSpeed multi-GPU 학습까지 포함하면:
 
 ```bash
@@ -78,6 +84,9 @@ Qwen3.5 + MQM 전용 예시: `configs/qwen35_mqm/`
 - ESA를 MQM과 비슷한 기여도로 시작하려면 `reward.w_esa_seq: 0.2`,
   `reward.esa_seq_scale: 0.25` 권장 (실효: `ESA*0.05`, 즉 0~100 -> 0~5)
 - `reward.metricx.python_executable`: MetricX를 별도 uv 환경 파이썬으로 실행할 때 지정
+- `logging.tensorboard_enabled`: 기본 `true`, `output_dir/tensorboard`에 scalar 기록
+- `logging.wandb_enabled`: `true`면 W&B로 같은 metric을 함께 기록
+- `logging.wandb_project`, `logging.wandb_run_name`, `logging.wandb_mode`
 - `reward.xcomet.python_executable`: xCOMET을 별도 uv 환경 파이썬으로 실행할 때 지정
 - `misc.aux_worker_host`: reference/MetricX/xCOMET을 올릴 전용 aux 노드 host (SSH 접속 가능해야 함)
 - `misc.aux_worker_remote_workdir`: aux 노드에서 worker 실행 전 `cd`할 경로
@@ -176,6 +185,7 @@ python -m gemma27_rl.cli --config configs/train_toy.yaml --eval-only
 로그/체크포인트:
 - `logging.output_dir/resolved_config.yaml`
 - `logging.output_dir/train_log.jsonl`
+- `logging.output_dir/tensorboard` (`logging.tensorboard_enabled: true`일 때)
 - `logging.output_dir/train_rollouts.jsonl` (`logging.save_rollouts: true`일 때)
 - `logging.output_dir/eval_outputs.jsonl` (`logging.save_eval_outputs: true`일 때)
 - `logging.output_dir/checkpoint-*`
@@ -189,3 +199,19 @@ python -m gemma27_rl.cli --config configs/train_toy.yaml --eval-only
 - `logging.save_only_best: true`면 주기적 `checkpoint-*` 대신 `best` + `resume_latest`만 유지
 - `logging.keep_last_n_checkpoints: N`(N>0)이면 주기 저장 시 `checkpoint-*`를 최신 N개만 유지
   (`best` 체크포인트는 별도 유지)
+
+TensorBoard 보기:
+
+```bash
+tensorboard --logdir /path/to/output_dir/tensorboard
+```
+
+W&B 예시:
+
+```yaml
+logging:
+  wandb_enabled: true
+  wandb_project: gemma27-rl
+  wandb_run_name: exp001-mqm
+  wandb_mode: offline
+```
