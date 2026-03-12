@@ -88,6 +88,64 @@ def test_gemba_mqm_parse_errors_rejects_unstructured_output() -> None:
         gemba_mqm_parse_errors("The translation looks mostly fine to me.")
 
 
+def test_gemba_mqm_parse_accepts_unquoted_and_punctuation_only_details() -> None:
+    raw = (
+        "Critical:\n"
+        "no-error\n"
+        "Major:\n"
+        "terminology/inappropriate for context - 자유 공화당 (Freedom Caucus)\n"
+        "Minor:\n"
+        "accuracy/omission - 통과시키려는\n"
+        'fluency/punctuation - """\n'
+    )
+    parsed = gemba_mqm_parse_errors(raw)
+
+    assert parsed["critical"] == []
+    assert parsed["major"] == ['terminology/inappropriate for context - 자유 공화당 (Freedom Caucus)']
+    assert parsed["minor"] == ['accuracy/omission - 통과시키려는', 'fluency/punctuation - """']
+    assert gemba_mqm_score(raw) == -7
+
+
+def test_gemba_mqm_parse_accepts_multiline_quoted_details() -> None:
+    raw = (
+        "Critical:\n"
+        "no-error\n"
+        "Major:\n"
+        "no-error\n"
+        "Minor:\n"
+        'accuracy/omission - "천안함"\n'
+        'fluency/other - "장관\n'
+        '정경두는"\n'
+        'fluency/punctuation - "9 일, 천안함"\n'
+    )
+    parsed = gemba_mqm_parse_errors(raw)
+
+    assert parsed["major"] == []
+    assert parsed["minor"] == [
+        'accuracy/omission - "천안함"',
+        'fluency/other - "장관 정경두는"',
+        'fluency/punctuation - "9 일, 천안함"',
+    ]
+    assert gemba_mqm_score(raw) == -3
+
+
+def test_gemba_mqm_extract_error_spans_tolerates_unquoted_details_and_unmatched_punctuation() -> None:
+    mt = "아버지가 동생이 짓궂게 굴어서 혼냈다."
+    raw = (
+        "Critical:\n"
+        "no-error\n"
+        "Major:\n"
+        "accuracy/mistranslation - 동생\n"
+        "Minor:\n"
+        "accuracy/omission - 짓궂게 굴어서\n"
+        'fluency/punctuation - """\n'
+    )
+    spans = gemba_mqm_extract_error_spans(raw, mt)
+
+    assert [span["text"] for span in spans] == ["동생", "짓궂게 굴어서"]
+    assert [span["severity"] for span in spans] == ["MAJOR", "MINOR"]
+
+
 def test_openai_mqm_retries_until_output_is_parseable(monkeypatch: pytest.MonkeyPatch) -> None:
     scorer = OpenAICompatibleMQMScorer(
         cfg=MQMConfig(
@@ -137,7 +195,7 @@ def test_openai_mqm_parse_failures_raise_when_score_never_parses(monkeypatch: py
         lambda messages, max_tokens=None, chat_template_kwargs_override=None: "Looks fine overall.",
     )
 
-    with pytest.raises(GembaParseError, match="score parse returned None"):
+    with pytest.raises(GembaParseError, match="unparseable lines"):
         scorer._score_one_sample(
             SampleForScoring(src="hello", mt="안녕", ref=None),
             [{"role": "user", "content": "test"}],

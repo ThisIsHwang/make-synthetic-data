@@ -567,6 +567,62 @@ def _is_gemba_no_error_line(line: str) -> bool:
     return text in {"no-error", "no error"}
 
 
+def _looks_like_gemba_level_header(line: str, *, allowed_levels: tuple[str, ...]) -> bool:
+    line_l = str(line).strip().lower()
+    if not line_l:
+        return False
+    for allowed in allowed_levels:
+        header = f"{allowed}:"
+        if line_l == header or line_l.startswith(header):
+            return True
+    return False
+
+
+def _has_unbalanced_gemba_quotes(text: str) -> bool:
+    raw = str(text or "")
+    if raw.count('"') % 2 != 0:
+        return True
+    if raw.count("`") % 2 != 0:
+        return True
+    if raw.count("“") != raw.count("”"):
+        return True
+    return False
+
+
+def _coalesce_gemba_response_lines(
+    model_output: str | None,
+    *,
+    allowed_levels: tuple[str, ...],
+) -> list[str]:
+    entries: list[str] = []
+    pending: str | None = None
+
+    for raw_line in str(model_output or "").splitlines():
+        line = _normalize_gemba_response_line(raw_line)
+        if not line:
+            continue
+        if pending is None:
+            pending = line
+            continue
+
+        line_starts_new_item = (
+            _looks_like_gemba_level_header(line, allowed_levels=allowed_levels)
+            or (_GEMBA_ERROR_LINE_PATTERN.match(line) is not None)
+            or _is_gemba_no_error_line(line)
+        )
+        if _has_unbalanced_gemba_quotes(pending) or (not line_starts_new_item):
+            joiner = "" if pending.endswith(("-", ":", "–", "—", "/", "(", "[", "{", "“", '"', "'", "`")) else " "
+            pending = (pending + joiner + line).strip()
+            continue
+
+        entries.append(pending)
+        pending = line
+
+    if pending is not None:
+        entries.append(pending)
+    return entries
+
+
 def _is_structured_gemba_error_line(line: str) -> bool:
     match = _GEMBA_ERROR_LINE_PATTERN.match(str(line).strip())
     if match is None:
@@ -574,9 +630,7 @@ def _is_structured_gemba_error_line(line: str) -> bool:
     detail = str(match.group(2)).strip()
     if not detail:
         return False
-    if _extract_mqm_quoted_text(line) is not None:
-        return True
-    return "non-translation" in str(line).lower()
+    return True
 
 
 def _parse_gemba_error_output(
@@ -595,10 +649,7 @@ def _parse_gemba_error_output(
     saw_explicit_no_error = False
     invalid_lines: list[str] = []
 
-    for raw_line in text.splitlines():
-        line = _normalize_gemba_response_line(raw_line)
-        if not line:
-            continue
+    for line in _coalesce_gemba_response_lines(text, allowed_levels=allowed_levels):
         line_l = line.lower()
 
         matched_header = False
@@ -667,27 +718,93 @@ def gemba_mqm_score(model_output: str | None) -> int | None:
     return -penalty
 
 
-_MQM_QUOTED_TEXT_PATTERNS: tuple[str, ...] = (
-    r'"([^"\n]+)"',
-    r"“([^”\n]+)”",
-    r"'([^'\n]+)'",
-    r"`([^`\n]+)`",
-)
-
-
 def _extract_mqm_quoted_text(line: str) -> str | None:
-    matches: list[str] = []
-    for pattern in _MQM_QUOTED_TEXT_PATTERNS:
-        for found in re.findall(pattern, line):
-            value = str(found).strip()
-            if not value:
-                continue
-            if value.lower() in {"no-error", "no error"}:
-                continue
-            matches.append(value)
-    if not matches:
+    candidates: list[str] = []
+    text = str(line or "")
+    for open_quote, close_quote in (('"', '"'), ("“", "”"), ("'", "'"), ("`", "`")):
+        start = text.find(open_quote)
+        end = text.rfind(close_quote)
+        if start < 0 or end <= start:
+            continue
+        value = text[start + len(open_quote):end].strip()
+        if not value:
+            continue
+        if value.lower() in {"no-error", "no error"}:
+            continue
+        candidates.append(value)
+    if not candidates:
         return None
-    return max(matches, key=len)
+    return max(candidates, key=len)
+
+
+def _extract_mqm_error_detail(line: str) -> str | None:
+    match = _GEMBA_ERROR_LINE_PATTERN.match(str(line).strip())
+    if match is None:
+        return None
+    detail = str(match.group(2)).strip()
+    return detail or None
+
+
+def _strip_matching_quotes(text: str) -> str:
+    out = str(text or "").strip()
+    if not out:
+        return ""
+    pairs = (('"', '"'), ("“", "”"), ("'", "'"), ("`", "`"))
+    changed = True
+    while changed:
+        changed = False
+        for open_quote, close_quote in pairs:
+            if out.startswith(open_quote) and out.endswith(close_quote) and len(out) > (len(open_quote) + len(close_quote)):
+                out = out[len(open_quote): len(out) - len(close_quote)].strip()
+                changed = True
+                break
+    return out
+
+
+def _normalize_mqm_error_text_candidate(text: str) -> str:
+    value = re.sub(r"\s+", " ", str(text or "").strip())
+    if not value:
+        return ""
+    value = re.sub(r"\s+([)\]\}])", r"\1", value)
+    value = re.sub(r"([(\[\{])\s+", r"\1", value)
+    return value.strip()
+
+
+def _mqm_error_text_candidates(line: str) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def _add(candidate: str | None) -> None:
+        if candidate is None:
+            return
+        normalized = _normalize_mqm_error_text_candidate(candidate)
+        if not normalized or normalized in seen:
+            return
+        seen.add(normalized)
+        out.append(normalized)
+
+    quoted = _extract_mqm_quoted_text(line)
+    detail = _extract_mqm_error_detail(line)
+    for candidate in (quoted, detail):
+        _add(candidate)
+        stripped = _strip_matching_quotes(candidate or "")
+        _add(stripped)
+        if stripped and "(" in stripped and ")" in stripped:
+            before_paren = stripped.split("(", 1)[0].strip()
+            inner = stripped.split("(", 1)[1].rsplit(")", 1)[0].strip()
+            _add(before_paren)
+            _add(inner)
+            if before_paren and inner:
+                _add(f"{before_paren}({inner})")
+                _add(f"{before_paren} ({inner})")
+    return out
+
+
+def _build_whitespace_flexible_pattern(text: str) -> str | None:
+    parts = [re.escape(part) for part in re.split(r"\s+", str(text or "").strip()) if part]
+    if len(parts) <= 1:
+        return None
+    return r"\s*".join(parts)
 
 
 def _find_text_span(
@@ -720,6 +837,18 @@ def _find_text_span(
             start = idx + 1
 
     if not candidates:
+        flexible_pattern = _build_whitespace_flexible_pattern(needle)
+        if flexible_pattern is not None:
+            for flags in (0, re.IGNORECASE):
+                try:
+                    for match in re.finditer(flexible_pattern, text, flags=flags):
+                        candidates.append((int(match.start()), int(match.end())))
+                except re.error:
+                    candidates = []
+                if candidates:
+                    break
+
+    if not candidates:
         return None
 
     def _overlap(span: tuple[int, int], other: tuple[int, int]) -> bool:
@@ -744,12 +873,13 @@ def gemba_mqm_extract_error_spans(model_output: str | None, mt_text: str) -> lis
         for line in parsed.get(severity, []):
             if len(out) >= max_items:
                 return out
-            quoted = _extract_mqm_quoted_text(line)
-            if quoted is None:
-                raise GembaParseError(f"MQM response error line is missing a quoted span: {line}")
-            span = _find_text_span(mt_text, quoted, used_spans)
+            span = None
+            for candidate in _mqm_error_text_candidates(line):
+                span = _find_text_span(mt_text, candidate, used_spans)
+                if span is not None:
+                    break
             if span is None:
-                raise GembaParseError(f"MQM response quoted span was not found in translation: {quoted}")
+                continue
             start, end = span
             used_spans.append(span)
             out.append(
