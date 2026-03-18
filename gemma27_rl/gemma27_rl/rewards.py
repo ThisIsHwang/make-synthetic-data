@@ -1173,14 +1173,11 @@ def gemba_mqm_extract_error_spans(model_output: str | None, mt_text: str) -> lis
     parsed = gemba_mqm_parse_structured_errors(model_output)
     out: list[dict[str, Any]] = []
     used_spans: list[tuple[int, int]] = []
-    max_items = 5
 
     for severity in ("critical", "major", "minor"):
         for error in parsed:
             if str(error.get("severity", "")).strip().lower() != severity:
                 continue
-            if len(out) >= max_items:
-                return out
             target_span = _normalize_optional_gemba_span(error.get("target_span"))
             label = str(error.get("label") or _structured_gemba_error_label(error)).strip()
             span = None

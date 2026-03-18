@@ -106,7 +106,22 @@ def test_gemba_mqm_extract_error_spans_maps_quoted_text() -> None:
     assert spans[0]["confidence"] == pytest.approx(0.92)
     assert spans[1]["severity"] == "MAJOR"
 
+def test_gemba_mqm_extract_error_spans_returns_all_detected_spans() -> None:
+    mt = "a b c d e f"
+    raw = _mqm_json_errors(
+        [
+            {"severity": "major", "type": "accuracy/mistranslation", "target_span": "a", "source_span": None, "confidence": 0.9},
+            {"severity": "major", "type": "accuracy/mistranslation", "target_span": "b", "source_span": None, "confidence": 0.9},
+            {"severity": "major", "type": "accuracy/mistranslation", "target_span": "c", "source_span": None, "confidence": 0.9},
+            {"severity": "major", "type": "accuracy/mistranslation", "target_span": "d", "source_span": None, "confidence": 0.9},
+            {"severity": "major", "type": "accuracy/mistranslation", "target_span": "e", "source_span": None, "confidence": 0.9},
+            {"severity": "major", "type": "accuracy/mistranslation", "target_span": "f", "source_span": None, "confidence": 0.9},
+        ]
+    )
 
+    spans = gemba_mqm_extract_error_spans(raw, mt)
+
+    assert [span["text"] for span in spans] == ["a", "b", "c", "d", "e", "f"]
 def test_gemba_mqm_parse_errors_rejects_unstructured_output() -> None:
     with pytest.raises(ValueError, match="structured errors|unparseable"):
         gemba_mqm_parse_errors("The translation looks mostly fine to me.")
