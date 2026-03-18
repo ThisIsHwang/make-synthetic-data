@@ -766,17 +766,70 @@ def _extract_balanced_json_object(text: str) -> str | None:
     return None
 
 
+def _repair_unescaped_json_inner_quotes(text: str | None) -> str:
+    raw = str(text or "")
+    if not raw:
+        return raw
+
+    out: list[str] = []
+    in_string = False
+    escape = False
+    length = len(raw)
+
+    for idx, ch in enumerate(raw):
+        if escape:
+            out.append(ch)
+            escape = False
+            continue
+
+        if ch == "\\" and in_string:
+            out.append(ch)
+            escape = True
+            continue
+
+        if ch != '"':
+            out.append(ch)
+            continue
+
+        if not in_string:
+            in_string = True
+            out.append(ch)
+            continue
+
+        next_idx = idx + 1
+        while next_idx < length and raw[next_idx] in {" ", "\t", "\r", "\n"}:
+            next_idx += 1
+        next_char = raw[next_idx] if next_idx < length else ""
+        if next_char in {",", "}", "]", ":"} or next_char == "":
+            in_string = False
+            out.append(ch)
+            continue
+
+        out.append('\\"')
+
+    return "".join(out)
+
+
 def _try_parse_json_object(text: str | None) -> dict[str, Any] | None:
     candidates: list[str] = []
     stripped = str(text or "").strip()
     if stripped:
         candidates.append(stripped)
+        repaired = _repair_unescaped_json_inner_quotes(stripped)
+        if repaired and repaired not in candidates:
+            candidates.append(repaired)
         fenced = _strip_json_code_fence(stripped)
         if fenced and fenced not in candidates:
             candidates.append(fenced)
+        repaired_fenced = _repair_unescaped_json_inner_quotes(fenced)
+        if repaired_fenced and repaired_fenced not in candidates:
+            candidates.append(repaired_fenced)
         balanced = _extract_balanced_json_object(fenced)
         if balanced and balanced not in candidates:
             candidates.append(balanced)
+        repaired_balanced = _extract_balanced_json_object(repaired_fenced)
+        if repaired_balanced and repaired_balanced not in candidates:
+            candidates.append(repaired_balanced)
     for candidate in candidates:
         try:
             parsed = json.loads(candidate)

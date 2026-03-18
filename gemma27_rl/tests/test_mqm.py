@@ -15,6 +15,7 @@ from gemma27_rl.rewards import (
     gemba_mqm_extract_error_annotations,
     gemba_mqm_extract_error_spans,
     gemba_mqm_parse_errors,
+    gemba_mqm_parse_structured_errors,
     gemba_mqm_score,
 )
 from gemma27_rl.rl_types import SampleForScoring
@@ -37,6 +38,29 @@ def test_gemba_mqm_parse_and_score() -> None:
     assert len(parsed["major"]) == 1
     assert len(parsed["minor"]) == 1
     assert gemba_mqm_score(raw) == -25
+
+
+def test_gemba_mqm_parse_structured_errors_repairs_unescaped_inner_quotes_in_json_spans() -> None:
+    raw = """{
+  "errors": [
+    {
+      "severity": "minor",
+      "type": "fluency/grammar",
+      "target_span": "referred to as the "Center"",
+      "source_span": ""센터"이라 한다",
+      "confidence": 0.85
+    }
+  ]
+}"""
+
+    parsed = gemba_mqm_parse_structured_errors(raw)
+
+    assert len(parsed) == 1
+    assert parsed[0]["severity"] == "minor"
+    assert parsed[0]["type"] == "fluency/grammar"
+    assert parsed[0]["target_span"] == 'referred to as the "Center"'
+    assert parsed[0]["source_span"] == '"센터"이라 한다'
+    assert parsed[0]["confidence"] == pytest.approx(0.85)
 
 
 def test_openai_mqm_predict_fn_path() -> None:
