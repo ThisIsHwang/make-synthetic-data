@@ -87,6 +87,46 @@ def test_gemba_esa_build_messages_fewshot_outputs_json() -> None:
     assert "confidence" in assistant_contents[0]
 
 
+def test_gemba_esa_build_messages_prompt_pack_enterprise_contains_extra_guidance() -> None:
+    messages = build_gemba_esa_error_messages(
+        source_lang="English",
+        target_lang="Korean",
+        source_seg="This is source text.",
+        target_seg="이것은 번역입니다.",
+        prompt_pack="ko_en_enterprise_v1",
+    )
+    combined = "\n".join(message["content"] for message in messages)
+
+    assert "Translation evaluation only. Do not repair or normalize the source." in combined
+    assert "Noisy chat, typos, abbreviations, and partial sentences must still be evaluated" in combined
+    assert "This is a no-reply email address. Please do not reply to this message." in combined
+    assert "발신자만 볼 수 있는 주소입니다. 이 메시지에 회신하지 마세요." in combined
+    assert "애드인 서버 knox/brity 반영 예정입니다." not in combined
+
+
+def test_gemba_esa_build_messages_generic_unchanged() -> None:
+    messages = build_gemba_esa_error_messages(
+        source_lang="English",
+        target_lang="Korean",
+        source_seg="hello",
+        target_seg="안녕",
+    )
+    explicit_generic = build_gemba_esa_error_messages(
+        source_lang="English",
+        target_lang="Korean",
+        source_seg="hello",
+        target_seg="안녕",
+        use_fewshot=True,
+        prompt_pack="generic",
+    )
+
+    assert messages == explicit_generic
+    assert len(messages) == 8
+    assert messages[0]["content"] == rewards_mod.GEMBA_ESA_SYSTEM_PROMPT
+    assert messages[1]["content"] == rewards_mod.GEMBA_ESA_FEWSHOT_USER_1
+    assert messages[2]["content"] == rewards_mod.GEMBA_ESA_FEWSHOT_ASSISTANT_1
+
+
 def test_openai_esa_predict_fn_path() -> None:
     captured: list[SampleForScoring] = []
 

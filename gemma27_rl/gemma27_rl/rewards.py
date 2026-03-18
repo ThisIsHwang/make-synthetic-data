@@ -1261,67 +1261,93 @@ def gemba_mqm_extract_error_spans(model_output: str | None, mt_text: str) -> lis
     return spans
 
 
-def _gemba_eval_user_message(
+_GEMBA_PROMPT_DIRECTION_ANY: tuple[str, str] = ("*", "*")
+_VALID_GEMBA_PROMPT_PACKS = frozenset({"generic", "ko_en_enterprise_v1"})
+
+
+@dataclass(frozen=True)
+class _GembaPromptPack:
+    mqm_system_prompt: str
+    mqm_task_prompt: str
+    mqm_fewshot_turns: dict[tuple[str, str], list[dict[str, str]]]
+    esa_system_prompt: str
+    esa_task_prompt: str
+    esa_fewshot_turns: dict[tuple[str, str], list[dict[str, str]]]
+
+
+def _normalize_gemba_prompt_lang(value: str | None) -> str:
+    text = str(value or "").strip().lower()
+    if text in {"ko", "korean"}:
+        return "korean"
+    if text in {"en", "english"}:
+        return "english"
+    return text
+
+
+def _gemba_prompt_direction_key(source_lang: str, target_lang: str) -> tuple[str, str]:
+    return (
+        _normalize_gemba_prompt_lang(source_lang),
+        _normalize_gemba_prompt_lang(target_lang),
+    )
+
+
+def _copy_gemba_turns(turns: list[dict[str, str]]) -> list[dict[str, str]]:
+    return [{"role": str(turn["role"]), "content": str(turn["content"])} for turn in turns]
+
+
+def _select_gemba_fewshot_turns(
+    turns_by_direction: dict[tuple[str, str], list[dict[str, str]]],
+    *,
+    source_lang: str,
+    target_lang: str,
+) -> list[dict[str, str]]:
+    out = _copy_gemba_turns(turns_by_direction.get(_GEMBA_PROMPT_DIRECTION_ANY, []))
+    direction_key = _gemba_prompt_direction_key(source_lang, target_lang)
+    if direction_key != _GEMBA_PROMPT_DIRECTION_ANY:
+        out.extend(_copy_gemba_turns(turns_by_direction.get(direction_key, [])))
+    return out
+
+
+def _append_gemba_guidance(base_prompt: str, guidance: str) -> str:
+    extra = str(guidance or "").strip()
+    if not extra:
+        return base_prompt
+    return f"{base_prompt}\n\n{extra}"
+
+
+def _gemba_mqm_fewshot_user_message(
     *,
     source_lang: str,
     target_lang: str,
     source_seg: str,
     target_seg: str,
+    task_prompt: str,
 ) -> str:
     return (
         f"{source_lang} source:\n"
         f"```{source_seg}```\n"
         f"{target_lang} translation:\n"
         f"```{target_seg}```\n\n"
-        f"{GEMBA_USER_TASK_PROMPT}"
-        f"{_gemba_json_output_instructions(allowed_levels=('critical', 'major', 'minor'))}"
+        f"{task_prompt}"
     )
 
 
-def build_gemba_mqm_messages(
+def _gemba_eval_user_message(
     *,
     source_lang: str,
     target_lang: str,
     source_seg: str,
     target_seg: str,
-) -> list[dict[str, str]]:
-    return [
-        {"role": "system", "content": GEMBA_SYSTEM_PROMPT},
-        {"role": "user", "content": GEMBA_FEWSHOT_USER_1},
-        {"role": "assistant", "content": GEMBA_FEWSHOT_ASSISTANT_1},
-        {"role": "user", "content": GEMBA_FEWSHOT_USER_2},
-        {"role": "assistant", "content": GEMBA_FEWSHOT_ASSISTANT_2},
-        {"role": "user", "content": GEMBA_FEWSHOT_USER_3},
-        {"role": "assistant", "content": GEMBA_FEWSHOT_ASSISTANT_3},
-        {
-            "role": "user",
-            "content": _gemba_eval_user_message(
-                source_lang=source_lang,
-                target_lang=target_lang,
-                source_seg=source_seg,
-                target_seg=target_seg,
-            ),
-        },
-    ]
-
-
-def build_gemba_mqm_repair_messages(
-    *,
-    source_seg: str,
-    target_seg: str,
-    raw_output: str,
-) -> list[dict[str, str]]:
-    return [
-        {"role": "system", "content": GEMBA_MQM_REPAIR_SYSTEM_PROMPT},
-        {
-            "role": "user",
-            "content": GEMBA_MQM_REPAIR_PROMPT_TEMPLATE.format(
-                source_seg=source_seg,
-                target_seg=target_seg,
-                raw_output=raw_output,
-            ),
-        },
-    ]
+    task_prompt: str = GEMBA_USER_TASK_PROMPT,
+) -> str:
+    return (
+        f"{source_lang} source:\n"
+        f"```{source_seg}```\n"
+        f"{target_lang} translation:\n"
+        f"```{target_seg}```\n\n"
+        f"{task_prompt}"
+        f"{_gemba_json_output_instructions(allowed_levels=('critical', 'major', 'minor'))}"
+    )
 
 
 GEMBA_ESA_SYSTEM_PROMPT = (
@@ -1442,15 +1468,381 @@ def _gemba_esa_error_user_message(
     target_lang: str,
     source_seg: str,
     target_seg: str,
+    task_prompt: str = GEMBA_ESA_USER_TASK_PROMPT,
 ) -> str:
     return (
         f"{source_lang} source:\n"
         f"```{source_seg}```\n"
         f"{target_lang} translation:\n"
         f"```{target_seg}```\n\n"
-        f"{GEMBA_ESA_USER_TASK_PROMPT}"
+        f"{task_prompt}"
         f"{_gemba_json_output_instructions(allowed_levels=('major', 'minor'))}"
     )
+
+
+GEMBA_ESA_FEWSHOT_USER_1 = _gemba_esa_error_user_message(
+    source_lang="English",
+    target_lang="German",
+    source_seg=(
+        "I do apologise about this, we must gain permission from the account holder to discuss "
+        "an order with another person, I apologise if this was done previously, however, I would "
+        "not be able to discuss this with yourself without the account holders permission."
+    ),
+    target_seg=(
+        "Ich entschuldige mich dafür, wir müssen die Erlaubnis einholen, um eine Bestellung mit "
+        "einer anderen Person zu besprechen. Ich entschuldige mich, falls dies zuvor geschehen "
+        "wäre, aber ohne die Erlaubnis des Kontoinhabers wäre ich nicht in der Lage, dies mit dir "
+        "involvement."
+    ),
+)
+
+GEMBA_ESA_FEWSHOT_USER_2 = _gemba_esa_error_user_message(
+    source_lang="English",
+    target_lang="Czech",
+    source_seg=(
+        "Talks have resumed in Vienna to try to revive the nuclear pact, with both sides trying "
+        "to gauge the prospects of success after the latest exchanges in the stop-start negotiations."
+    ),
+    target_seg=(
+        "Ve Vídni se ve Vídni obnovily rozhovory o oživení jaderného paktu, přičemž obě partaje "
+        "se snaží posoudit vyhlídky na úspěch po posledních výměnách v jednáních."
+    ),
+)
+
+GEMBA_ESA_FEWSHOT_USER_3 = _gemba_esa_error_user_message(
+    source_lang="Chinese",
+    target_lang="English",
+    source_seg="大众点评乌鲁木齐家居卖场频道为您提供高铁居然之家地址，电话，营业时间等最新商户信息，找装修公司，就上大众点评",
+    target_seg=(
+        "Urumqi Home Furnishing Store Channel provides you with the latest business information "
+        "such as the address, telephone number, business hours, etc., of high-speed rail, and "
+        "find a decoration company, and go to the reviews."
+    ),
+)
+
+_GEMBA_KO_EN_ENTERPRISE_EXTRA_GUIDANCE = dedent(
+    """\
+    Additional guidance for ko<->en enterprise/noisy-chat evaluation:
+    - Translation evaluation only. Do not repair or normalize the source.
+    - If the output responds like an assistant, asks for more input, or explains instead of translating, treat it as non-translation / severe error.
+    - In enterprise or product contexts, terminology mismatch is more serious than minor stylistic awkwardness.
+    - Preserve roles, honorifics, team names, organization names, and internal product naming faithfully.
+    - Noisy chat, typos, abbreviations, and partial sentences must still be evaluated as translation outputs, not rewritten into a new intended meaning.
+    """
+).strip()
+
+_GEMBA_KO_EN_ENTERPRISE_MQM_TASK_PROMPT = _append_gemba_guidance(
+    GEMBA_USER_TASK_PROMPT,
+    _GEMBA_KO_EN_ENTERPRISE_EXTRA_GUIDANCE,
+)
+_GEMBA_KO_EN_ENTERPRISE_ESA_TASK_PROMPT = _append_gemba_guidance(
+    GEMBA_ESA_USER_TASK_PROMPT,
+    _GEMBA_KO_EN_ENTERPRISE_EXTRA_GUIDANCE,
+)
+
+GEMBA_KO_EN_ENTERPRISE_MQM_FEWSHOT_ASSISTANT_1 = dedent(
+    """\
+    {
+      "errors": [
+        {"severity": "major", "type": "terminology/inappropriate for context", "target_span": "reflect", "source_span": null, "confidence": 0.97},
+        {"severity": "minor", "type": "style/awkward", "target_span": "the add-in server knox/brity", "source_span": null, "confidence": 0.9}
+      ]
+    }
+    """
+).strip()
+
+GEMBA_KO_EN_ENTERPRISE_MQM_FEWSHOT_ASSISTANT_2 = dedent(
+    """\
+    {
+      "errors": [
+        {"severity": "major", "type": "accuracy/mistranslation", "target_span": "love meeting room", "source_span": null, "confidence": 0.98},
+        {"severity": "minor", "type": "terminology/inappropriate for context", "target_span": "Pro-nim", "source_span": null, "confidence": 0.93},
+        {"severity": "minor", "type": "style/awkward", "target_span": "?? ^^;;", "source_span": null, "confidence": 0.88}
+      ]
+    }
+    """
+).strip()
+
+GEMBA_KO_EN_ENTERPRISE_MQM_FEWSHOT_ASSISTANT_3 = dedent(
+    """\
+    {
+      "errors": [
+        {"severity": "major", "type": "accuracy/mistranslation", "target_span": "발신자만 볼 수 있는", "source_span": null, "confidence": 0.98},
+        {"severity": "minor", "type": "terminology/inappropriate for context", "target_span": "주소", "source_span": null, "confidence": 0.91}
+      ]
+    }
+    """
+).strip()
+
+GEMBA_KO_EN_ENTERPRISE_MQM_FEWSHOT_ASSISTANT_4 = dedent(
+    """\
+    {
+      "errors": [
+        {"severity": "critical", "type": "non-translation", "target_span": "Please provide the Korean text you would like translated.", "source_span": "@", "confidence": 0.99}
+      ]
+    }
+    """
+).strip()
+
+GEMBA_KO_EN_ENTERPRISE_ESA_FEWSHOT_ASSISTANT_1 = dedent(
+    """\
+    {
+      "errors": [
+        {"severity": "major", "type": "terminology/inappropriate for context", "target_span": "reflect", "source_span": null, "confidence": 0.97},
+        {"severity": "minor", "type": "style/awkward", "target_span": "the add-in server knox/brity", "source_span": null, "confidence": 0.9}
+      ]
+    }
+    """
+).strip()
+
+GEMBA_KO_EN_ENTERPRISE_ESA_FEWSHOT_ASSISTANT_2 = dedent(
+    """\
+    {
+      "errors": [
+        {"severity": "major", "type": "accuracy/mistranslation", "target_span": "love meeting room", "source_span": null, "confidence": 0.98},
+        {"severity": "minor", "type": "terminology/inappropriate for context", "target_span": "Pro-nim", "source_span": null, "confidence": 0.93},
+        {"severity": "minor", "type": "style/awkward", "target_span": "?? ^^;;", "source_span": null, "confidence": 0.88}
+      ]
+    }
+    """
+).strip()
+
+GEMBA_KO_EN_ENTERPRISE_ESA_FEWSHOT_ASSISTANT_3 = dedent(
+    """\
+    {
+      "errors": [
+        {"severity": "major", "type": "accuracy/mistranslation", "target_span": "발신자만 볼 수 있는", "source_span": null, "confidence": 0.98},
+        {"severity": "minor", "type": "terminology/inappropriate for context", "target_span": "주소", "source_span": null, "confidence": 0.91}
+      ]
+    }
+    """
+).strip()
+
+GEMBA_KO_EN_ENTERPRISE_ESA_FEWSHOT_ASSISTANT_4 = dedent(
+    """\
+    {
+      "errors": [
+        {"severity": "major", "type": "non-translation", "target_span": "Please provide the Korean text you would like translated.", "source_span": "@", "confidence": 0.99}
+      ]
+    }
+    """
+).strip()
+
+
+def _build_generic_mqm_fewshot_turns() -> list[dict[str, str]]:
+    return [
+        {"role": "user", "content": GEMBA_FEWSHOT_USER_1},
+        {"role": "assistant", "content": GEMBA_FEWSHOT_ASSISTANT_1},
+        {"role": "user", "content": GEMBA_FEWSHOT_USER_2},
+        {"role": "assistant", "content": GEMBA_FEWSHOT_ASSISTANT_2},
+        {"role": "user", "content": GEMBA_FEWSHOT_USER_3},
+        {"role": "assistant", "content": GEMBA_FEWSHOT_ASSISTANT_3},
+    ]
+
+
+def _build_generic_esa_fewshot_turns() -> list[dict[str, str]]:
+    return [
+        {"role": "user", "content": GEMBA_ESA_FEWSHOT_USER_1},
+        {"role": "assistant", "content": GEMBA_ESA_FEWSHOT_ASSISTANT_1},
+        {"role": "user", "content": GEMBA_ESA_FEWSHOT_USER_2},
+        {"role": "assistant", "content": GEMBA_ESA_FEWSHOT_ASSISTANT_2},
+        {"role": "user", "content": GEMBA_ESA_FEWSHOT_USER_3},
+        {"role": "assistant", "content": GEMBA_ESA_FEWSHOT_ASSISTANT_3},
+    ]
+
+
+def _build_ko_en_enterprise_mqm_fewshot_turns() -> dict[tuple[str, str], list[dict[str, str]]]:
+    return {
+        ("korean", "english"): [
+            {
+                "role": "user",
+                "content": _gemba_mqm_fewshot_user_message(
+                    source_lang="Korean",
+                    target_lang="English",
+                    source_seg="애드인 서버 knox/brity 반영 예정입니다.",
+                    target_seg="We will reflect the add-in server knox/brity.",
+                    task_prompt=_GEMBA_KO_EN_ENTERPRISE_MQM_TASK_PROMPT,
+                ),
+            },
+            {"role": "assistant", "content": GEMBA_KO_EN_ENTERPRISE_MQM_FEWSHOT_ASSISTANT_1},
+            {
+                "role": "user",
+                "content": _gemba_mqm_fewshot_user_message(
+                    source_lang="Korean",
+                    target_lang="English",
+                    source_seg="프로님 안녕하세요~ 사랑회의실 몇시부터 이용하시나요?? ^^;;",
+                    target_seg="Hello Pro-nim, what time can I use the love meeting room?? ^^;;",
+                    task_prompt=_GEMBA_KO_EN_ENTERPRISE_MQM_TASK_PROMPT,
+                ),
+            },
+            {"role": "assistant", "content": GEMBA_KO_EN_ENTERPRISE_MQM_FEWSHOT_ASSISTANT_2},
+            {
+                "role": "user",
+                "content": _gemba_mqm_fewshot_user_message(
+                    source_lang="Korean",
+                    target_lang="English",
+                    source_seg="@",
+                    target_seg="Please provide the Korean text you would like translated.",
+                    task_prompt=_GEMBA_KO_EN_ENTERPRISE_MQM_TASK_PROMPT,
+                ),
+            },
+            {"role": "assistant", "content": GEMBA_KO_EN_ENTERPRISE_MQM_FEWSHOT_ASSISTANT_4},
+        ],
+        ("english", "korean"): [
+            {
+                "role": "user",
+                "content": _gemba_mqm_fewshot_user_message(
+                    source_lang="English",
+                    target_lang="Korean",
+                    source_seg="This is a no-reply email address. Please do not reply to this message.",
+                    target_seg="이 메일은 발신자만 볼 수 있는 주소입니다. 이 메시지에 회신하지 마세요.",
+                    task_prompt=_GEMBA_KO_EN_ENTERPRISE_MQM_TASK_PROMPT,
+                ),
+            },
+            {"role": "assistant", "content": GEMBA_KO_EN_ENTERPRISE_MQM_FEWSHOT_ASSISTANT_3},
+        ],
+    }
+
+
+def _build_ko_en_enterprise_esa_fewshot_turns() -> dict[tuple[str, str], list[dict[str, str]]]:
+    return {
+        ("korean", "english"): [
+            {
+                "role": "user",
+                "content": _gemba_esa_error_user_message(
+                    source_lang="Korean",
+                    target_lang="English",
+                    source_seg="애드인 서버 knox/brity 반영 예정입니다.",
+                    target_seg="We will reflect the add-in server knox/brity.",
+                    task_prompt=_GEMBA_KO_EN_ENTERPRISE_ESA_TASK_PROMPT,
+                ),
+            },
+            {"role": "assistant", "content": GEMBA_KO_EN_ENTERPRISE_ESA_FEWSHOT_ASSISTANT_1},
+            {
+                "role": "user",
+                "content": _gemba_esa_error_user_message(
+                    source_lang="Korean",
+                    target_lang="English",
+                    source_seg="프로님 안녕하세요~ 사랑회의실 몇시부터 이용하시나요?? ^^;;",
+                    target_seg="Hello Pro-nim, what time can I use the love meeting room?? ^^;;",
+                    task_prompt=_GEMBA_KO_EN_ENTERPRISE_ESA_TASK_PROMPT,
+                ),
+            },
+            {"role": "assistant", "content": GEMBA_KO_EN_ENTERPRISE_ESA_FEWSHOT_ASSISTANT_2},
+            {
+                "role": "user",
+                "content": _gemba_esa_error_user_message(
+                    source_lang="Korean",
+                    target_lang="English",
+                    source_seg="@",
+                    target_seg="Please provide the Korean text you would like translated.",
+                    task_prompt=_GEMBA_KO_EN_ENTERPRISE_ESA_TASK_PROMPT,
+                ),
+            },
+            {"role": "assistant", "content": GEMBA_KO_EN_ENTERPRISE_ESA_FEWSHOT_ASSISTANT_4},
+        ],
+        ("english", "korean"): [
+            {
+                "role": "user",
+                "content": _gemba_esa_error_user_message(
+                    source_lang="English",
+                    target_lang="Korean",
+                    source_seg="This is a no-reply email address. Please do not reply to this message.",
+                    target_seg="이 메일은 발신자만 볼 수 있는 주소입니다. 이 메시지에 회신하지 마세요.",
+                    task_prompt=_GEMBA_KO_EN_ENTERPRISE_ESA_TASK_PROMPT,
+                ),
+            },
+            {"role": "assistant", "content": GEMBA_KO_EN_ENTERPRISE_ESA_FEWSHOT_ASSISTANT_3},
+        ],
+    }
+
+
+_GEMBA_PROMPT_PACKS: dict[str, _GembaPromptPack] = {
+    "generic": _GembaPromptPack(
+        mqm_system_prompt=GEMBA_SYSTEM_PROMPT,
+        mqm_task_prompt=GEMBA_USER_TASK_PROMPT,
+        mqm_fewshot_turns={_GEMBA_PROMPT_DIRECTION_ANY: _build_generic_mqm_fewshot_turns()},
+        esa_system_prompt=GEMBA_ESA_SYSTEM_PROMPT,
+        esa_task_prompt=GEMBA_ESA_USER_TASK_PROMPT,
+        esa_fewshot_turns={_GEMBA_PROMPT_DIRECTION_ANY: _build_generic_esa_fewshot_turns()},
+    ),
+    "ko_en_enterprise_v1": _GembaPromptPack(
+        mqm_system_prompt=GEMBA_SYSTEM_PROMPT,
+        mqm_task_prompt=_GEMBA_KO_EN_ENTERPRISE_MQM_TASK_PROMPT,
+        mqm_fewshot_turns={
+            _GEMBA_PROMPT_DIRECTION_ANY: _build_generic_mqm_fewshot_turns(),
+            **_build_ko_en_enterprise_mqm_fewshot_turns(),
+        },
+        esa_system_prompt=GEMBA_ESA_SYSTEM_PROMPT,
+        esa_task_prompt=_GEMBA_KO_EN_ENTERPRISE_ESA_TASK_PROMPT,
+        esa_fewshot_turns={
+            _GEMBA_PROMPT_DIRECTION_ANY: _build_generic_esa_fewshot_turns(),
+            **_build_ko_en_enterprise_esa_fewshot_turns(),
+        },
+    ),
+}
+
+
+def _resolve_gemba_prompt_pack(prompt_pack: str) -> _GembaPromptPack:
+    pack_key = str(prompt_pack or "generic").strip() or "generic"
+    pack = _GEMBA_PROMPT_PACKS.get(pack_key)
+    if pack is None:
+        supported = ", ".join(sorted(_VALID_GEMBA_PROMPT_PACKS))
+        raise ValueError(f"Unsupported GEMBA prompt_pack={pack_key!r}. Supported: {supported}")
+    return pack
+
+
+def build_gemba_mqm_messages(
+    *,
+    source_lang: str,
+    target_lang: str,
+    source_seg: str,
+    target_seg: str,
+    use_fewshot: bool = True,
+    prompt_pack: str = "generic",
+) -> list[dict[str, str]]:
+    pack = _resolve_gemba_prompt_pack(prompt_pack)
+    messages: list[dict[str, str]] = [{"role": "system", "content": pack.mqm_system_prompt}]
+    if use_fewshot:
+        messages.extend(
+            _select_gemba_fewshot_turns(
+                pack.mqm_fewshot_turns,
+                source_lang=source_lang,
+                target_lang=target_lang,
+            )
+        )
+    messages.append(
+        {
+            "role": "user",
+            "content": _gemba_eval_user_message(
+                source_lang=source_lang,
+                target_lang=target_lang,
+                source_seg=source_seg,
+                target_seg=target_seg,
+                task_prompt=pack.mqm_task_prompt,
+            ),
+        }
+    )
+    return messages
+
+
+def build_gemba_mqm_repair_messages(
+    *,
+    source_seg: str,
+    target_seg: str,
+    raw_output: str,
+) -> list[dict[str, str]]:
+    return [
+        {"role": "system", "content": GEMBA_MQM_REPAIR_SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": GEMBA_MQM_REPAIR_PROMPT_TEMPLATE.format(
+                source_seg=source_seg,
+                target_seg=target_seg,
+                raw_output=raw_output,
+            ),
+        },
+    ]
 
 
 def build_gemba_esa_error_messages(
@@ -1460,54 +1852,17 @@ def build_gemba_esa_error_messages(
     source_seg: str,
     target_seg: str,
     use_fewshot: bool = True,
+    prompt_pack: str = "generic",
 ) -> list[dict[str, str]]:
-    messages: list[dict[str, str]] = [{"role": "system", "content": GEMBA_ESA_SYSTEM_PROMPT}]
+    pack = _resolve_gemba_prompt_pack(prompt_pack)
+    messages: list[dict[str, str]] = [{"role": "system", "content": pack.esa_system_prompt}]
     if use_fewshot:
         messages.extend(
-            [
-                {"role": "user", "content": _gemba_esa_error_user_message(
-                    source_lang="English",
-                    target_lang="German",
-                    source_seg=(
-                        "I do apologise about this, we must gain permission from the account holder to discuss "
-                        "an order with another person, I apologise if this was done previously, however, I would "
-                        "not be able to discuss this with yourself without the account holders permission."
-                    ),
-                    target_seg=(
-                        "Ich entschuldige mich dafür, wir müssen die Erlaubnis einholen, um eine Bestellung mit "
-                        "einer anderen Person zu besprechen. Ich entschuldige mich, falls dies zuvor geschehen "
-                        "wäre, aber ohne die Erlaubnis des Kontoinhabers wäre ich nicht in der Lage, dies mit dir "
-                        "involvement."
-                    ),
-                )},
-                {"role": "assistant", "content": GEMBA_ESA_FEWSHOT_ASSISTANT_1},
-                {"role": "user", "content": _gemba_esa_error_user_message(
-                    source_lang="English",
-                    target_lang="Czech",
-                    source_seg=(
-                        "Talks have resumed in Vienna to try to revive the nuclear pact, with both sides trying "
-                        "to gauge the prospects of success after the latest exchanges in the stop-start negotiations."
-                    ),
-                    target_seg=(
-                        "Ve Vídni se ve Vídni obnovily rozhovory o oživení jaderného paktu, přičemž obě partaje "
-                        "se snaží posoudit vyhlídky na úspěch po posledních výměnách v jednáních."
-                    ),
-                )},
-                {"role": "assistant", "content": GEMBA_ESA_FEWSHOT_ASSISTANT_2},
-                {"role": "user", "content": _gemba_esa_error_user_message(
-                    source_lang="Chinese",
-                    target_lang="English",
-                    source_seg=(
-                        "大众点评乌鲁木齐家居卖场频道为您提供高铁居然之家地址，电话，营业时间等最新商户信息，找装修公司，就上大众点评"
-                    ),
-                    target_seg=(
-                        "Urumqi Home Furnishing Store Channel provides you with the latest business information "
-                        "such as the address, telephone number, business hours, etc., of high-speed rail, and "
-                        "find a decoration company, and go to the reviews."
-                    ),
-                )},
-                {"role": "assistant", "content": GEMBA_ESA_FEWSHOT_ASSISTANT_3},
-            ]
+            _select_gemba_fewshot_turns(
+                pack.esa_fewshot_turns,
+                source_lang=source_lang,
+                target_lang=target_lang,
+            )
         )
     messages.append(
         {
@@ -1517,6 +1872,7 @@ def build_gemba_esa_error_messages(
                 target_lang=target_lang,
                 source_seg=source_seg,
                 target_seg=target_seg,
+                task_prompt=pack.esa_task_prompt,
             ),
         }
     )
@@ -2366,6 +2722,8 @@ class OpenAICompatibleMQMScorer:
                 target_lang=target_lang,
                 source_seg=sample.src,
                 target_seg=sample.mt,
+                use_fewshot=bool(self.cfg.use_fewshot),
+                prompt_pack=str(self.cfg.prompt_pack or "generic"),
             )
             for sample in samples
             for source_lang, target_lang in [
@@ -2829,6 +3187,7 @@ class OpenAICompatibleESAScorer:
                             source_seg=sample.src,
                             target_seg=sample.mt,
                             use_fewshot=bool(self.cfg.use_fewshot),
+                            prompt_pack=str(self.cfg.prompt_pack or "generic"),
                         ),
                         max_tokens=int(self.cfg.max_tokens_error_spans),
                         chat_template_kwargs_override=_override_enable_thinking(

@@ -181,6 +181,8 @@ class MQMConfig:
     max_tokens: int = 1024
     stop: list[str] = field(default_factory=list)
     chat_template_kwargs: dict[str, Any] = field(default_factory=lambda: {"enable_thinking": False})
+    use_fewshot: bool = True
+    prompt_pack: str = "generic"
     score_min: float = -25.0
     score_max: float = 0.0
     scale_to_unit_interval: bool = False
@@ -214,6 +216,7 @@ class ESAConfig:
     stop: list[str] = field(default_factory=list)
     chat_template_kwargs: dict[str, Any] = field(default_factory=lambda: {"enable_thinking": False})
     use_fewshot: bool = True
+    prompt_pack: str = "generic"
     score_min: float = 0.0
     score_max: float = 100.0
     scale_to_unit_interval: bool = False
@@ -750,8 +753,21 @@ def _validate_config(cfg: RLPostTrainConfig) -> None:
         raise ValueError("reward.mqm.failure_seq_penalty must be a float.") from exc
     if not math.isfinite(mqm_failure_seq_penalty):
         raise ValueError("reward.mqm.failure_seq_penalty must be finite.")
+    valid_gemba_prompt_packs = {"generic", "ko_en_enterprise_v1"}
+    if not isinstance(cfg.reward.mqm.use_fewshot, bool):
+        raise ValueError("reward.mqm.use_fewshot must be a bool")
+    if str(cfg.reward.mqm.prompt_pack or "").strip() not in valid_gemba_prompt_packs:
+        raise ValueError(
+            "reward.mqm.prompt_pack must be one of: generic, ko_en_enterprise_v1"
+        )
     if cfg.reward.esa.error_policy not in {"raise", "zero"}:
         raise ValueError("reward.esa.error_policy must be raise|zero")
+    if not isinstance(cfg.reward.esa.use_fewshot, bool):
+        raise ValueError("reward.esa.use_fewshot must be a bool")
+    if str(cfg.reward.esa.prompt_pack or "").strip() not in valid_gemba_prompt_packs:
+        raise ValueError(
+            "reward.esa.prompt_pack must be one of: generic, ko_en_enterprise_v1"
+        )
     if cfg.reward.mqm.enabled:
         if not cfg.reward.mqm.base_url or not str(cfg.reward.mqm.base_url).strip():
             raise ValueError("reward.mqm.base_url must be set when reward.mqm.enabled=true")
@@ -798,8 +814,6 @@ def _validate_config(cfg: RLPostTrainConfig) -> None:
             raise ValueError("reward.esa.top_k must be > 0 when set")
         if cfg.reward.esa.repetition_penalty is not None and float(cfg.reward.esa.repetition_penalty) <= 0:
             raise ValueError("reward.esa.repetition_penalty must be > 0 when set")
-        if not isinstance(cfg.reward.esa.use_fewshot, bool):
-            raise ValueError("reward.esa.use_fewshot must be a bool")
     if cfg.data.eval_sampling_count is not None:
         if int(cfg.data.eval_sampling_count) <= 0:
             raise ValueError("data.eval_sampling_count must be > 0 when set.")

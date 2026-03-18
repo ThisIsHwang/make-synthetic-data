@@ -93,6 +93,63 @@ def test_build_gemba_mqm_messages_fewshot_outputs_json() -> None:
     assert "confidence" in assistant_contents[0]
 
 
+def test_gemba_mqm_build_messages_generic_preserves_existing_behavior() -> None:
+    messages = build_gemba_mqm_messages(
+        source_lang="English",
+        target_lang="Korean",
+        source_seg="hello",
+        target_seg="안녕",
+    )
+    explicit_generic = build_gemba_mqm_messages(
+        source_lang="English",
+        target_lang="Korean",
+        source_seg="hello",
+        target_seg="안녕",
+        use_fewshot=True,
+        prompt_pack="generic",
+    )
+
+    assert messages == explicit_generic
+    assert len(messages) == 8
+    assert messages[0]["content"] == rewards_mod.GEMBA_SYSTEM_PROMPT
+    assert messages[1]["content"] == rewards_mod.GEMBA_FEWSHOT_USER_1
+    assert messages[2]["content"] == rewards_mod.GEMBA_FEWSHOT_ASSISTANT_1
+
+
+def test_gemba_mqm_build_messages_prompt_pack_enterprise_contains_extra_guidance() -> None:
+    messages = build_gemba_mqm_messages(
+        source_lang="Korean",
+        target_lang="English",
+        source_seg="원문",
+        target_seg="translation",
+        prompt_pack="ko_en_enterprise_v1",
+    )
+    combined = "\n".join(message["content"] for message in messages)
+
+    assert "Translation evaluation only. Do not repair or normalize the source." in combined
+    assert "assistant, asks for more input, or explains instead of translating" in combined
+    assert "애드인 서버 knox/brity 반영 예정입니다." in combined
+    assert "프로님 안녕하세요~ 사랑회의실 몇시부터 이용하시나요?? ^^;;" in combined
+    assert "Please provide the Korean text you would like translated." in combined
+    assert "This is a no-reply email address." not in combined
+
+
+def test_gemba_mqm_build_messages_use_fewshot_false_omits_fewshot_turns() -> None:
+    messages = build_gemba_mqm_messages(
+        source_lang="Korean",
+        target_lang="English",
+        source_seg="원문",
+        target_seg="translation",
+        use_fewshot=False,
+        prompt_pack="ko_en_enterprise_v1",
+    )
+
+    assert len(messages) == 2
+    assert [message["role"] for message in messages] == ["system", "user"]
+    assert "애드인 서버 knox/brity 반영 예정입니다." not in messages[-1]["content"]
+    assert "Translation evaluation only. Do not repair or normalize the source." in messages[-1]["content"]
+
+
 def test_gemba_mqm_extract_error_spans_maps_quoted_text() -> None:
     mt = "나는 학교에 갔다."
     raw = _mqm_json_errors(
