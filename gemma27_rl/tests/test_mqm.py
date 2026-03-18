@@ -126,6 +126,90 @@ def test_gemba_mqm_parse_structured_errors_repairs_mixed_escaped_and_unescaped_q
     assert parsed[2]["source_span"] == "persons related to matters to be promoted"
 
 
+def test_gemba_mqm_parse_structured_errors_repairs_quote_after_comma_in_source_span() -> None:
+    raw = """{
+  "errors": [
+    {
+      "severity": "major",
+      "type": "accuracy/mistranslation",
+      "target_span": "개통되었다",
+      "source_span": "completely connected",
+      "confidence": 0.95
+    },
+    {
+      "severity": "minor",
+      "type": "fluency/grammar",
+      "target_span": null,
+      "source_span": "Gyeongchun Line Forest Park,"which runs from...",
+      "confidence": 0.88
+    }
+  ]
+}"""
+
+    parsed = gemba_mqm_parse_structured_errors(raw)
+
+    assert len(parsed) == 2
+    assert parsed[0]["target_span"] == "개통되었다"
+    assert parsed[0]["source_span"] == "completely connected"
+    assert parsed[1]["target_span"] is None
+    assert parsed[1]["source_span"] == 'Gyeongchun Line Forest Park,"which runs from...'
+    assert parsed[1]["confidence"] == pytest.approx(0.88)
+
+
+def test_gemba_mqm_parse_structured_errors_handles_all_logged_malformed_quote_patterns() -> None:
+    raw = """{
+  "errors": [
+    {
+      "severity": "major",
+      "type": "accuracy/mistranslation",
+      "target_span": "구민(이하"구민\\")",
+      "source_span": "Geumcheon-gu residents (hereinafter referred to as"Gu residents")",
+      "confidence": 0.95
+    },
+    {
+      "severity": "minor",
+      "type": "accuracy/omission",
+      "target_span": null,
+      "source_span": "highly regarded by",
+      "confidence": 0.88
+    },
+    {
+      "severity": "minor",
+      "type": "fluency/grammar",
+      "target_span": "추진하는 사항 관련자가",
+      "source_span": "persons related to matters to be promoted",
+      "confidence": 0.85
+    }
+  ]
+}"""
+
+    parsed = gemba_mqm_parse_structured_errors(raw)
+
+    assert parsed == [
+        {
+            "severity": "major",
+            "type": "accuracy/mistranslation",
+            "target_span": '구민(이하"구민")',
+            "source_span": 'Geumcheon-gu residents (hereinafter referred to as"Gu residents")',
+            "confidence": pytest.approx(0.95),
+        },
+        {
+            "severity": "minor",
+            "type": "accuracy/omission",
+            "target_span": None,
+            "source_span": "highly regarded by",
+            "confidence": pytest.approx(0.88),
+        },
+        {
+            "severity": "minor",
+            "type": "fluency/grammar",
+            "target_span": "추진하는 사항 관련자가",
+            "source_span": "persons related to matters to be promoted",
+            "confidence": pytest.approx(0.85),
+        },
+    ]
+
+
 def test_openai_mqm_predict_fn_path() -> None:
     captured: list[list[dict[str, str]]] = []
 
