@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT_DIR}"
+export PYTHONPATH="${ROOT_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
 
 # Usage:
 #   VENV_BIN=/abs/path/to/.venv_train/bin \
@@ -60,6 +61,7 @@ fi
 
 echo "[info] ROOT_DIR=${ROOT_DIR}"
 echo "[info] VENV_BIN=${VENV_BIN}"
+echo "[info] PYTHONPATH=${PYTHONPATH}"
 echo "[info] HOSTFILE=${HOSTFILE:-<none>}"
 echo "[info] INCLUDE=${INCLUDE}"
 echo "[info] EXCLUDE=${EXCLUDE:-<none>}"
@@ -71,9 +73,11 @@ echo "[step] verify runtime imports in same venv"
 import sys
 import torch
 import flash_attn_2_cuda
+import gemma27_rl
 print("python:", sys.executable)
 print("torch:", torch.__version__, "cuda:", torch.version.cuda)
 print("flash_attn_2_cuda import OK")
+print("gemma27_rl:", gemma27_rl.__file__)
 PY
 echo
 
