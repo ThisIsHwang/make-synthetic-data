@@ -423,3 +423,55 @@ def test_mqm_failure_seq_penalty_must_be_finite(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="reward.mqm.failure_seq_penalty must be finite"):
         _ = load_config(cfg_path)
+
+
+def test_mqm_token_type_weight_keys_must_be_non_empty(tmp_path: Path) -> None:
+    cfg_path = tmp_path / "train.yaml"
+    cfg_path.write_text(
+        "\n".join(
+            [
+                "data:",
+                "  hf_dataset_name: dummy/dataset",
+                "reward:",
+                "  mqm_token_type_weights:",
+                '    "": 1.5',
+                "  xcomet:",
+                "    enabled: false",
+                "  mqm:",
+                "    enabled: false",
+                "  esa:",
+                "    enabled: false",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="reward.mqm_token_type_weights keys must be non-empty strings"):
+        _ = load_config(cfg_path)
+
+
+def test_mqm_token_type_weight_values_must_be_non_negative(tmp_path: Path) -> None:
+    cfg_path = tmp_path / "train.yaml"
+    cfg_path.write_text(
+        "\n".join(
+            [
+                "data:",
+                "  hf_dataset_name: dummy/dataset",
+                "reward:",
+                "  mqm_token_type_weights:",
+                "    accuracy/omission: -1.0",
+                "  xcomet:",
+                "    enabled: false",
+                "  mqm:",
+                "    enabled: false",
+                "  esa:",
+                "    enabled: false",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=r"reward\.mqm_token_type_weights\['accuracy/omission'\] must be >= 0"):
+        _ = load_config(cfg_path)

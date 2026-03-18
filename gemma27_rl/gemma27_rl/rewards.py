@@ -700,6 +700,13 @@ def _split_gemba_error_line(line: str) -> tuple[str, str] | None:
     return error_type, detail
 
 
+def _extract_gemba_error_type(line: str) -> str | None:
+    parsed = _split_gemba_error_line(line)
+    if parsed is None:
+        return None
+    return parsed[0]
+
+
 def _normalize_optional_gemba_span(value: Any) -> str | None:
     if value is None:
         return None
@@ -1192,6 +1199,11 @@ def gemba_mqm_extract_error_spans(model_output: str | None, mt_text: str) -> lis
                 continue
             start, end = span
             used_spans.append(span)
+            error_type = (
+                _normalize_gemba_error_type(error.get("type"))
+                or _extract_gemba_error_type(label)
+                or None
+            )
             out.append(
                 {
                     "text": mt_text[start:end],
@@ -1202,6 +1214,7 @@ def gemba_mqm_extract_error_spans(model_output: str | None, mt_text: str) -> lis
                     "source": "mqm",
                     "label": label,
                     "type": _normalize_gemba_error_type(error.get("type")),
+                    "error_type": error_type,
                     "target_span": target_span,
                     "source_span": _normalize_optional_gemba_span(error.get("source_span")),
                 }
@@ -3041,11 +3054,26 @@ def extract_error_spans(
     return [[] for _ in range(expected)]
 
 
+def _resolve_mqm_token_type_weight(error_type: str | None, weights: dict[str, float]) -> float:
+    normalized = _normalize_gemba_error_type(error_type)
+    if not normalized or not weights:
+        return 1.0
+    if normalized in weights:
+        return float(weights[normalized])
+    candidate = normalized
+    while "/" in candidate:
+        candidate = candidate.rsplit("/", 1)[0].strip()
+        if candidate in weights:
+            return float(weights[candidate])
+    return 1.0
+
+
 def spans_to_token_rewards(
     mt_text: str,
     token_char_offsets: list[tuple[int, int]],
     error_spans: list[dict[str, Any]],
     severity_weights: dict[str, float],
+    mqm_token_type_weights: dict[str, float] | None = None,
     overlap_policy: str = "any_overlap",
     majority_threshold: float = 0.5,
     use_confidence: bool = False,
@@ -3057,6 +3085,13 @@ def spans_to_token_rewards(
         raise ValueError("overlap_policy must be any_overlap or majority_overlap")
     if combine_policy not in {"sum", "min", "max"}:
         raise ValueError("combine_policy must be sum|min|max")
+
+    normalized_mqm_type_weights: dict[str, float] = {}
+    if mqm_token_type_weights:
+        for raw_key, raw_value in mqm_token_type_weights.items():
+            key = _normalize_gemba_error_type(raw_key)
+            if key:
+                normalized_mqm_type_weights[key] = float(raw_value)
 
     rewards = [0.0 for _ in token_char_offsets]
     initialized = [False for _ in token_char_offsets]
@@ -3072,6 +3107,9 @@ def spans_to_token_rewards(
 
         severity = str(span.get("severity", "")).strip().upper()
         penalty = float(severity_weights.get(severity, 0.0))
+        if str(span.get("source", "")).strip().lower() == "mqm":
+            error_type = str(span.get("error_type") or span.get("type") or "").strip() or None
+            penalty *= _resolve_mqm_token_type_weight(error_type, normalized_mqm_type_weights)
         if use_confidence and "confidence" in span:
             try:
                 penalty *= float(span.get("confidence", 1.0))

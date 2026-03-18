@@ -122,6 +122,21 @@ def test_gemba_mqm_extract_error_spans_returns_all_detected_spans() -> None:
     spans = gemba_mqm_extract_error_spans(raw, mt)
 
     assert [span["text"] for span in spans] == ["a", "b", "c", "d", "e", "f"]
+
+
+def test_gemba_mqm_extract_error_spans_sets_error_type() -> None:
+    mt = "나는 학교에 갔다."
+    raw = _mqm_json_errors(
+        [
+            {"severity": "major", "type": "accuracy/mistranslation", "target_span": "학교", "source_span": None, "confidence": 0.92},
+        ]
+    )
+
+    spans = gemba_mqm_extract_error_spans(raw, mt)
+
+    assert len(spans) == 1
+    assert spans[0]["error_type"] == "accuracy/mistranslation"
+    assert spans[0]["type"] == "accuracy/mistranslation"
 def test_gemba_mqm_parse_errors_rejects_unstructured_output() -> None:
     with pytest.raises(ValueError, match="structured errors|unparseable"):
         gemba_mqm_parse_errors("The translation looks mostly fine to me.")

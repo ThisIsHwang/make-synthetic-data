@@ -3758,6 +3758,7 @@ def _prepare_rewards_and_advantages_from_scores(
             token_char_offsets=rollout.token_char_offsets,
             error_spans=span_row,
             severity_weights=cfg.reward.severity_weights,
+            mqm_token_type_weights=cfg.reward.mqm_token_type_weights,
             overlap_policy=cfg.reward.overlap_policy,
             majority_threshold=cfg.reward.majority_threshold,
             use_confidence=cfg.reward.use_confidence,

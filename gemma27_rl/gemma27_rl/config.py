@@ -237,6 +237,7 @@ class RewardConfig:
             "CRITICAL": -10.0,
         }
     )
+    mqm_token_type_weights: dict[str, float] = field(default_factory=dict)
     overlap_policy: str = "any_overlap"  # any_overlap|majority_overlap
     majority_threshold: float = 0.5
     use_confidence: bool = False
@@ -613,6 +614,26 @@ def _validate_config(cfg: RLPostTrainConfig) -> None:
         raise ValueError("reward.overlap_policy must be any_overlap or majority_overlap")
     if cfg.reward.span_combine_policy not in {"sum", "min", "max"}:
         raise ValueError("reward.span_combine_policy must be sum|min|max")
+    if not isinstance(cfg.reward.mqm_token_type_weights, dict):
+        raise ValueError("reward.mqm_token_type_weights must be a dict")
+    for raw_key, raw_value in cfg.reward.mqm_token_type_weights.items():
+        key = str(raw_key).strip()
+        if not key:
+            raise ValueError("reward.mqm_token_type_weights keys must be non-empty strings")
+        try:
+            value = float(raw_value)
+        except Exception as exc:
+            raise ValueError(
+                f"reward.mqm_token_type_weights[{key!r}] must be a float"
+            ) from exc
+        if not math.isfinite(value):
+            raise ValueError(
+                f"reward.mqm_token_type_weights[{key!r}] must be finite"
+            )
+        if value < 0.0:
+            raise ValueError(
+                f"reward.mqm_token_type_weights[{key!r}] must be >= 0"
+            )
     if float(cfg.reward.metricx.subprocess_timeout_sec) <= 0:
         raise ValueError("reward.metricx.subprocess_timeout_sec must be > 0.")
     if float(cfg.reward.xcomet.subprocess_timeout_sec) <= 0:

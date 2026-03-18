@@ -69,3 +69,69 @@ def test_spans_to_token_rewards_applies_confidence_scaling() -> None:
         combine_policy="sum",
     )
     assert rewards == [0.0, 0.0, -2.0]
+
+
+def test_spans_to_token_rewards_applies_mqm_type_weight_exact_match() -> None:
+    rewards = spans_to_token_rewards(
+        mt_text="hello world",
+        token_char_offsets=[(0, 5), (5, 6), (6, 11)],
+        error_spans=[
+            {
+                "start": 6,
+                "end": 11,
+                "severity": "MAJOR",
+                "source": "mqm",
+                "error_type": "accuracy/mistranslation",
+            }
+        ],
+        severity_weights={"MINOR": -1.0, "MAJOR": -5.0, "CRITICAL": -10.0},
+        mqm_token_type_weights={"accuracy/mistranslation": 1.5},
+        overlap_policy="any_overlap",
+        use_confidence=False,
+        combine_policy="sum",
+    )
+    assert rewards == [0.0, 0.0, -7.5]
+
+
+def test_spans_to_token_rewards_applies_mqm_type_weight_prefix_fallback() -> None:
+    rewards = spans_to_token_rewards(
+        mt_text="hello world",
+        token_char_offsets=[(0, 5), (5, 6), (6, 11)],
+        error_spans=[
+            {
+                "start": 6,
+                "end": 11,
+                "severity": "MAJOR",
+                "source": "mqm",
+                "error_type": "accuracy/omission",
+            }
+        ],
+        severity_weights={"MINOR": -1.0, "MAJOR": -5.0, "CRITICAL": -10.0},
+        mqm_token_type_weights={"accuracy": 2.0},
+        overlap_policy="any_overlap",
+        use_confidence=False,
+        combine_policy="sum",
+    )
+    assert rewards == [0.0, 0.0, -10.0]
+
+
+def test_spans_to_token_rewards_non_mqm_span_ignores_type_weight() -> None:
+    rewards = spans_to_token_rewards(
+        mt_text="hello world",
+        token_char_offsets=[(0, 5), (5, 6), (6, 11)],
+        error_spans=[
+            {
+                "start": 6,
+                "end": 11,
+                "severity": "MAJOR",
+                "source": "xcomet",
+                "error_type": "accuracy/mistranslation",
+            }
+        ],
+        severity_weights={"MINOR": -1.0, "MAJOR": -5.0, "CRITICAL": -10.0},
+        mqm_token_type_weights={"accuracy/mistranslation": 1.5},
+        overlap_policy="any_overlap",
+        use_confidence=False,
+        combine_policy="sum",
+    )
+    assert rewards == [0.0, 0.0, -5.0]
