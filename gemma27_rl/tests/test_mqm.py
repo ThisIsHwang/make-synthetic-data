@@ -63,6 +63,69 @@ def test_gemba_mqm_parse_structured_errors_repairs_unescaped_inner_quotes_in_jso
     assert parsed[0]["confidence"] == pytest.approx(0.85)
 
 
+def test_gemba_mqm_parse_structured_errors_repairs_mid_string_unescaped_quotes_in_source_span() -> None:
+    raw = """{
+  "errors": [
+    {
+      "severity": "major",
+      "type": "accuracy/mistranslation",
+      "target_span": "collaboration with relevant organizations, institutions, and experts, including Seongdong-gu residents",
+      "source_span": "성동구민(이하"구민"이라 한다) 을 포함한 관련 단체·기관 및 전문가가 참여하여 협력할 수 있는",
+      "confidence": 0.95
+    }
+  ]
+}"""
+
+    parsed = gemba_mqm_parse_structured_errors(raw)
+
+    assert len(parsed) == 1
+    assert parsed[0]["severity"] == "major"
+    assert parsed[0]["type"] == "accuracy/mistranslation"
+    assert parsed[0]["target_span"] == (
+        "collaboration with relevant organizations, institutions, and experts, including Seongdong-gu residents"
+    )
+    assert parsed[0]["source_span"] == '성동구민(이하"구민"이라 한다) 을 포함한 관련 단체·기관 및 전문가가 참여하여 협력할 수 있는'
+    assert parsed[0]["confidence"] == pytest.approx(0.95)
+
+
+def test_gemba_mqm_parse_structured_errors_repairs_mixed_escaped_and_unescaped_quotes_across_fields() -> None:
+    raw = """{
+  "errors": [
+    {
+      "severity": "major",
+      "type": "accuracy/mistranslation",
+      "target_span": "구민(이하\\"구민\\")",
+      "source_span": "Geumcheon-gu residents (hereinafter referred to as"Gu residents")",
+      "confidence": 0.95
+    },
+    {
+      "severity": "minor",
+      "type": "accuracy/omission",
+      "target_span": null,
+      "source_span": "highly regarded by",
+      "confidence": 0.88
+    },
+    {
+      "severity": "minor",
+      "type": "fluency/grammar",
+      "target_span": "추진하는 사항 관련자가",
+      "source_span": "persons related to matters to be promoted",
+      "confidence": 0.85
+    }
+  ]
+}"""
+
+    parsed = gemba_mqm_parse_structured_errors(raw)
+
+    assert len(parsed) == 3
+    assert parsed[0]["target_span"] == '구민(이하"구민")'
+    assert parsed[0]["source_span"] == 'Geumcheon-gu residents (hereinafter referred to as"Gu residents")'
+    assert parsed[1]["target_span"] is None
+    assert parsed[1]["source_span"] == "highly regarded by"
+    assert parsed[2]["target_span"] == "추진하는 사항 관련자가"
+    assert parsed[2]["source_span"] == "persons related to matters to be promoted"
+
+
 def test_openai_mqm_predict_fn_path() -> None:
     captured: list[list[dict[str, str]]] = []
 

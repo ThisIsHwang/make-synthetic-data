@@ -810,6 +810,175 @@ def _repair_unescaped_json_inner_quotes(text: str | None) -> str:
     return "".join(out)
 
 
+_LENIENT_GEMBA_JSON_FIELD_PATTERN = re.compile(
+    r'"(severity|type|target_span|source_span|confidence)"\s*:',
+    flags=re.IGNORECASE,
+)
+
+
+def _decode_lenient_json_string(text: str) -> str:
+    raw = str(text or "")
+    if not raw:
+        return ""
+
+    out: list[str] = []
+    idx = 0
+    length = len(raw)
+    escape_map = {
+        '"': '"',
+        "\\": "\\",
+        "/": "/",
+        "b": "\b",
+        "f": "\f",
+        "n": "\n",
+        "r": "\r",
+        "t": "\t",
+    }
+    while idx < length:
+        ch = raw[idx]
+        if ch != "\\":
+            out.append(ch)
+            idx += 1
+            continue
+        if idx + 1 >= length:
+            out.append("\\")
+            idx += 1
+            continue
+        nxt = raw[idx + 1]
+        if nxt == "u" and idx + 5 < length:
+            hex_part = raw[idx + 2 : idx + 6]
+            try:
+                out.append(chr(int(hex_part, 16)))
+                idx += 6
+                continue
+            except Exception:
+                pass
+        out.append(escape_map.get(nxt, nxt))
+        idx += 2
+    return "".join(out)
+
+
+def _extract_lenient_gemba_errors_array_body(text: str | None) -> str | None:
+    raw = str(text or "")
+    if not raw:
+        return None
+    match = re.search(r'"errors"\s*:\s*\[', raw, flags=re.IGNORECASE)
+    if match is None:
+        return None
+
+    start_idx = match.end() - 1
+    depth = 0
+    for idx in range(start_idx, len(raw)):
+        ch = raw[idx]
+        if ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+            if depth == 0:
+                return raw[start_idx + 1 : idx]
+    return None
+
+
+def _extract_lenient_json_object_fragments(text: str | None) -> list[str]:
+    raw = str(text or "")
+    if not raw:
+        return []
+
+    fragments: list[str] = []
+    depth = 0
+    start_idx: int | None = None
+    for idx, ch in enumerate(raw):
+        if ch == "{":
+            if depth == 0:
+                start_idx = idx
+            depth += 1
+        elif ch == "}":
+            if depth <= 0:
+                continue
+            depth -= 1
+            if depth == 0 and start_idx is not None:
+                fragments.append(raw[start_idx : idx + 1])
+                start_idx = None
+    return fragments
+
+
+def _parse_lenient_gemba_json_value(raw_value: str, *, field_name: str) -> Any:
+    text = str(raw_value or "").strip().rstrip(",").strip()
+    if field_name in {"target_span", "source_span"}:
+        if not text or text.lower() == "null":
+            return None
+    if field_name == "confidence":
+        match = re.search(r"-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?", text)
+        if match is None:
+            raise GembaParseError(f"GEMBA confidence must be numeric, got {raw_value!r}.")
+        return float(match.group(0))
+
+    if text.startswith('"'):
+        if len(text) >= 2 and text.endswith('"'):
+            text = text[1:-1]
+        else:
+            text = text[1:]
+    elif text.lower() == "null":
+        return None
+
+    return _decode_lenient_json_string(text)
+
+
+def _parse_lenient_gemba_error_object(fragment: str) -> dict[str, Any] | None:
+    matches = list(_LENIENT_GEMBA_JSON_FIELD_PATTERN.finditer(str(fragment or "")))
+    if not matches:
+        return None
+
+    parsed: dict[str, Any] = {}
+    for idx, match in enumerate(matches):
+        field_name = str(match.group(1)).strip().lower()
+        value_start = match.end()
+        value_end = matches[idx + 1].start() if idx + 1 < len(matches) else len(fragment)
+        raw_value = str(fragment[value_start:value_end]).strip()
+        if raw_value.endswith("}"):
+            raw_value = raw_value[:-1].rstrip()
+        parsed[field_name] = _parse_lenient_gemba_json_value(raw_value, field_name=field_name)
+
+    if "severity" not in parsed or "type" not in parsed or "confidence" not in parsed:
+        return None
+    if "target_span" not in parsed:
+        parsed["target_span"] = None
+    if "source_span" not in parsed:
+        parsed["source_span"] = None
+    return parsed
+
+
+def _parse_lenient_gemba_json_errors(
+    model_output: str | None,
+    *,
+    allowed_levels: tuple[str, ...],
+    scorer_name: str,
+) -> list[dict[str, Any]] | None:
+    errors_body = _extract_lenient_gemba_errors_array_body(model_output)
+    if errors_body is None:
+        return None
+    if not str(errors_body).strip():
+        return []
+
+    fragments = _extract_lenient_json_object_fragments(errors_body)
+    if not fragments:
+        return []
+
+    structured_errors: list[dict[str, Any]] = []
+    for fragment in fragments:
+        parsed_item = _parse_lenient_gemba_error_object(fragment)
+        if parsed_item is None:
+            return None
+        structured_errors.append(
+            _normalize_gemba_structured_error(
+                parsed_item,
+                allowed_levels=allowed_levels,
+                scorer_name=scorer_name,
+            )
+        )
+    return structured_errors
+
+
 def _try_parse_json_object(text: str | None) -> dict[str, Any] | None:
     candidates: list[str] = []
     stripped = str(text or "").strip()
@@ -875,17 +1044,28 @@ def _parse_gemba_json_errors(
     scorer_name: str,
 ) -> list[dict[str, Any]] | None:
     payload = _try_parse_json_object(model_output)
+    if isinstance(payload, dict) and "errors" in payload:
+        errors_value = payload.get("errors")
+        if not isinstance(errors_value, list):
+            raise GembaParseError(f"{scorer_name} JSON errors field must be a list.")
+        return [
+            _normalize_gemba_structured_error(item, allowed_levels=allowed_levels, scorer_name=scorer_name)
+            for item in errors_value
+        ]
+
+    lenient_errors = _parse_lenient_gemba_json_errors(
+        model_output,
+        allowed_levels=allowed_levels,
+        scorer_name=scorer_name,
+    )
+    if lenient_errors is not None:
+        return lenient_errors
+
     if payload is None:
         return None
     if "errors" not in payload:
         raise GembaParseError(f"{scorer_name} JSON output must contain an errors field.")
-    errors_value = payload.get("errors")
-    if not isinstance(errors_value, list):
-        raise GembaParseError(f"{scorer_name} JSON errors field must be a list.")
-    return [
-        _normalize_gemba_structured_error(item, allowed_levels=allowed_levels, scorer_name=scorer_name)
-        for item in errors_value
-    ]
+    raise GembaParseError(f"{scorer_name} JSON errors field must be a list.")
 
 
 def _has_unbalanced_gemba_quotes(text: str) -> bool:
