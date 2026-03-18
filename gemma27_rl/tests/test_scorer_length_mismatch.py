@@ -76,8 +76,23 @@ class _MQMFailureThenSuccessScorer:
             sequence_scores=[-25.0 if failure else -5.0],
             metadata={
                 "error_spans": [[]],
+                "unanchored_errors": [[]],
                 "skipped_rows": [False],
                 "failure_rows": [failure],
+            },
+        )
+
+
+class _MQMUnanchoredMismatchScorer:
+    cfg = SimpleNamespace(use_reference=False)
+
+    def score_batch(self, samples):  # type: ignore[no-untyped-def]
+        del samples
+        return RewardOutput(
+            sequence_scores=[-1.0, -2.0],
+            metadata={
+                "error_spans": [[], []],
+                "unanchored_errors": [[]],
             },
         )
 
@@ -173,16 +188,16 @@ def test_mqm_cache_helper_raises_on_sequence_length_mismatch() -> None:
 
 def test_mqm_cache_helper_does_not_cache_failure_rows() -> None:
     scorer = _MQMFailureThenSuccessScorer()
-    cache: dict[tuple[str, str, str, str, str], tuple[float, list[dict[str, object]]]] = {}
+    cache: dict[tuple[str, str, str, str, str], tuple[float, list[dict[str, object]], list[dict[str, object]]]] = {}
     sample = [SampleForScoring(src="s1", mt="m1", ref="r1")]
 
-    first_scores, _, _, first_failures = _score_with_cache_mqm(
+    first_scores, _, _, first_failures, first_unanchored = _score_with_cache_mqm(
         samples=sample,
         scorer=scorer,  # type: ignore[arg-type]
         cache=cache,
         use_cache=True,
     )
-    second_scores, _, _, second_failures = _score_with_cache_mqm(
+    second_scores, _, _, second_failures, second_unanchored = _score_with_cache_mqm(
         samples=sample,
         scorer=scorer,  # type: ignore[arg-type]
         cache=cache,
@@ -191,7 +206,19 @@ def test_mqm_cache_helper_does_not_cache_failure_rows() -> None:
 
     assert first_scores == [-25.0]
     assert first_failures == [True]
+    assert first_unanchored == [[]]
     assert second_scores == [-5.0]
     assert second_failures == [False]
+    assert second_unanchored == [[]]
     assert scorer.calls == 2
     assert len(cache) == 1
+
+
+def test_mqm_cache_helper_raises_on_unanchored_length_mismatch() -> None:
+    with pytest.raises(RuntimeError, match="MQM scorer returned mismatched unanchored_errors length"):
+        _ = _score_with_cache_mqm(
+            samples=_samples(),
+            scorer=_MQMUnanchoredMismatchScorer(),  # type: ignore[arg-type]
+            cache={},
+            use_cache=False,
+        )

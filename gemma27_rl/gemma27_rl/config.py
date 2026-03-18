@@ -238,6 +238,16 @@ class RewardConfig:
         }
     )
     mqm_token_type_weights: dict[str, float] = field(default_factory=dict)
+    mqm_unanchored_seq_enabled: bool = False
+    mqm_unanchored_seq_scale: float = 1.0
+    mqm_unanchored_allowed_types: list[str] = field(
+        default_factory=lambda: [
+            "accuracy/omission",
+            "accuracy/addition",
+            "accuracy/untranslated text",
+            "non-translation",
+        ]
+    )
     overlap_policy: str = "any_overlap"  # any_overlap|majority_overlap
     majority_threshold: float = 0.5
     use_confidence: bool = False
@@ -634,6 +644,19 @@ def _validate_config(cfg: RLPostTrainConfig) -> None:
             raise ValueError(
                 f"reward.mqm_token_type_weights[{key!r}] must be >= 0"
             )
+    if not isinstance(cfg.reward.mqm_unanchored_seq_enabled, bool):
+        raise ValueError("reward.mqm_unanchored_seq_enabled must be a bool")
+    try:
+        mqm_unanchored_seq_scale = float(cfg.reward.mqm_unanchored_seq_scale)
+    except Exception as exc:
+        raise ValueError("reward.mqm_unanchored_seq_scale must be a float") from exc
+    if not math.isfinite(mqm_unanchored_seq_scale):
+        raise ValueError("reward.mqm_unanchored_seq_scale must be finite")
+    if not isinstance(cfg.reward.mqm_unanchored_allowed_types, list):
+        raise ValueError("reward.mqm_unanchored_allowed_types must be a list")
+    for idx, raw_type in enumerate(cfg.reward.mqm_unanchored_allowed_types):
+        if not str(raw_type).strip():
+            raise ValueError(f"reward.mqm_unanchored_allowed_types[{idx}] must be a non-empty string")
     if float(cfg.reward.metricx.subprocess_timeout_sec) <= 0:
         raise ValueError("reward.metricx.subprocess_timeout_sec must be > 0.")
     if float(cfg.reward.xcomet.subprocess_timeout_sec) <= 0:

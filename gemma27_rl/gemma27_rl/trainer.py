@@ -53,6 +53,7 @@ from .prompting import (
     sanitize_text_for_scoring as _sanitize_text_for_scoring_shared,
 )
 from .rewards import (
+    _compute_mqm_unanchored_seq_penalty,
     OpenAICompatibleESAScorer,
     OpenAICompatibleMQMScorer,
     MetricXQEScorer,
@@ -1688,6 +1689,35 @@ def _validate_optional_bool_rows(
     return bool_rows
 
 
+def _validate_optional_dict_rows(
+    *,
+    scorer_name: str,
+    requested: int,
+    rows: Any | None,
+    field_name: str,
+) -> list[list[dict[str, Any]]]:
+    if rows is None:
+        return [[] for _ in range(int(requested))]
+    if not isinstance(rows, (list, tuple)):
+        raise RuntimeError(
+            f"{scorer_name} scorer returned non-list {field_name} "
+            f"(type={type(rows).__name__}, requested={requested})."
+        )
+    row_list = list(rows)
+    if len(row_list) != int(requested):
+        raise RuntimeError(
+            f"{scorer_name} scorer returned mismatched {field_name} length: "
+            f"requested={requested} returned={len(row_list)}"
+        )
+    normalized: list[list[dict[str, Any]]] = []
+    for row in row_list:
+        if isinstance(row, (list, tuple)):
+            normalized.append([item for item in row if isinstance(item, dict)])
+        else:
+            normalized.append([])
+    return normalized
+
+
 def _mqm_esa_cache_key(sample: SampleForScoring, *, use_reference: bool) -> tuple[str, str, str, str, str]:
     return (
         sample.src,
@@ -2937,7 +2967,7 @@ def _prepare_training_batch_rollouts_and_advantages(
     esa_scorer: OpenAICompatibleESAScorer | None,
     metricx_cache: dict[tuple[str, str, str], float],
     xcomet_cache: dict[tuple[str, str, str], tuple[float, list[dict[str, Any]]]],
-    mqm_cache: dict[tuple[str, str, str, str, str], tuple[float, list[dict[str, Any]]]],
+    mqm_cache: dict[tuple[str, str, str, str, str], tuple[float, list[dict[str, Any]], list[dict[str, Any]]]],
     esa_cache: dict[tuple[str, str, str, str, str], float],
 ) -> tuple[list[Rollout], list[list[float]], dict[str, float], dict[str, float]]:
     if not batch_examples:
@@ -3208,20 +3238,21 @@ def _score_with_cache_xcomet(
 def _score_with_cache_mqm(
     samples: list[SampleForScoring],
     scorer: OpenAICompatibleMQMScorer,
-    cache: dict[tuple[str, str, str, str, str], tuple[float, list[dict[str, Any]]]],
+    cache: dict[tuple[str, str, str, str, str], tuple[float, list[dict[str, Any]], list[dict[str, Any]]]],
     use_cache: bool,
-) -> tuple[list[float], list[list[dict[str, Any]]], list[bool], list[bool]]:
+) -> tuple[list[float], list[list[dict[str, Any]]], list[bool], list[bool], list[list[dict[str, Any]]]]:
     scores = [0.0 for _ in samples]
     spans = [[] for _ in samples]
     skipped = [False for _ in samples]
     failure_rows = [False for _ in samples]
+    unanchored_rows = [[] for _ in samples]
     uncached: list[SampleForScoring] = []
     uncached_idx: list[int] = []
 
     for idx, sample in enumerate(samples):
         key = _mqm_esa_cache_key(sample, use_reference=scorer.cfg.use_reference)
         if use_cache and key in cache:
-            scores[idx], spans[idx] = cache[key]
+            scores[idx], spans[idx], unanchored_rows[idx] = cache[key]
         else:
             uncached.append(sample)
             uncached_idx.append(idx)
@@ -3229,6 +3260,7 @@ def _score_with_cache_mqm(
     if uncached:
         out = scorer.score_batch(uncached)
         raw_span_rows = (out.metadata or {}).get("error_spans", [[] for _ in uncached])
+        raw_unanchored_rows = (out.metadata or {}).get("unanchored_errors", [[] for _ in uncached])
         raw_skipped_rows = (out.metadata or {}).get("skipped_rows", [False for _ in uncached])
         raw_failure_rows = (out.metadata or {}).get("failure_rows", [False for _ in uncached])
         sequence_scores, span_rows = _validate_scorer_batch_lengths(
@@ -3243,6 +3275,12 @@ def _score_with_cache_mqm(
             rows=raw_skipped_rows,
             field_name="skipped_rows",
         )
+        validated_unanchored_rows = _validate_optional_dict_rows(
+            scorer_name="MQM",
+            requested=len(uncached),
+            rows=raw_unanchored_rows,
+            field_name="unanchored_errors",
+        )
         validated_failure_rows = _validate_optional_bool_rows(
             scorer_name="MQM",
             requested=len(uncached),
@@ -3250,12 +3288,13 @@ def _score_with_cache_mqm(
             field_name="failure_rows",
         )
         assert span_rows is not None
-        for idx, score, span_row, sample, skipped_row, failure_row in zip(
+        for idx, score, span_row, sample, skipped_row, unanchored_row, failure_row in zip(
             uncached_idx,
             sequence_scores,
             span_rows,
             uncached,
             skipped_rows,
+            validated_unanchored_rows,
             validated_failure_rows,
         ):
             score_f = float(score)
@@ -3264,14 +3303,16 @@ def _score_with_cache_mqm(
             scores[idx] = score_f
             spans[idx] = span_list
             skipped[idx] = bool(skipped_row)
+            unanchored_rows[idx] = list(unanchored_row)
             failure_rows[idx] = bool(failure_row)
             if use_cache and (not skipped_row) and (not failure_row):
                 cache[_mqm_esa_cache_key(sample, use_reference=scorer.cfg.use_reference)] = (
                     score_f,
                     span_list,
+                    list(unanchored_row),
                 )
 
-    return scores, spans, skipped, failure_rows
+    return scores, spans, skipped, failure_rows, unanchored_rows
 
 
 def _score_with_cache_esa(
@@ -3329,6 +3370,7 @@ class _RewardScoringBatch:
     span_rows: list[list[dict[str, Any]]]
     mqm_skipped: list[bool]
     mqm_failure_rows: list[bool]
+    mqm_unanchored_rows: list[list[dict[str, Any]]]
     esa_skipped: list[bool]
     sanitized_target_rows: int
     sanitized_marker_total: int
@@ -3344,7 +3386,7 @@ def _score_reward_rollouts(
     esa_scorer: OpenAICompatibleESAScorer | None,
     metricx_cache: dict[tuple[str, str, str], float],
     xcomet_cache: dict[tuple[str, str, str], tuple[float, list[dict[str, Any]]]],
-    mqm_cache: dict[tuple[str, str, str, str, str], tuple[float, list[dict[str, Any]]]],
+    mqm_cache: dict[tuple[str, str, str, str, str], tuple[float, list[dict[str, Any]], list[dict[str, Any]]]],
     esa_cache: dict[tuple[str, str, str, str, str], float],
     tokenizer: Any | None = None,
 ) -> _RewardScoringBatch:
@@ -3405,6 +3447,7 @@ def _score_reward_rollouts(
     mqm_span_rows = [[] for _ in rollouts]
     mqm_skipped = [False for _ in rollouts]
     mqm_failure_rows = [False for _ in rollouts]
+    mqm_unanchored_rows = [[] for _ in rollouts]
     esa_skipped = [False for _ in rollouts]
 
     enabled_scorers = sum(int(flag) for flag in (metricx_enabled, xcomet_enabled, mqm_enabled, esa_enabled))
@@ -3456,7 +3499,7 @@ def _score_reward_rollouts(
             if "xcomet" in futures:
                 xcomet_scores, span_rows = futures["xcomet"].result()
             if "mqm" in futures:
-                mqm_scores, mqm_span_rows, mqm_skipped, mqm_failure_rows = futures["mqm"].result()
+                mqm_scores, mqm_span_rows, mqm_skipped, mqm_failure_rows, mqm_unanchored_rows = futures["mqm"].result()
             if "esa" in futures:
                 esa_scores, esa_skipped = futures["esa"].result()
     else:
@@ -3475,7 +3518,7 @@ def _score_reward_rollouts(
                 use_cache=cfg.reward.cache_enabled,
             )
         if mqm_enabled:
-            mqm_scores, mqm_span_rows, mqm_skipped, mqm_failure_rows = _score_with_cache_mqm(
+            mqm_scores, mqm_span_rows, mqm_skipped, mqm_failure_rows, mqm_unanchored_rows = _score_with_cache_mqm(
                 samples=mqm_esa_samples,
                 scorer=mqm_scorer,
                 cache=mqm_cache,
@@ -3557,6 +3600,7 @@ def _score_reward_rollouts(
         span_rows=merged_span_rows,
         mqm_skipped=mqm_skipped,
         mqm_failure_rows=mqm_failure_rows,
+        mqm_unanchored_rows=mqm_unanchored_rows,
         esa_skipped=esa_skipped,
         sanitized_target_rows=int(sanitized_target_rows),
         sanitized_marker_total=int(sanitized_marker_total),
@@ -3575,6 +3619,7 @@ def _merge_reward_scoring_batches(scored_batches: list[_RewardScoringBatch]) -> 
         span_rows=[],
         mqm_skipped=[],
         mqm_failure_rows=[],
+        mqm_unanchored_rows=[],
         esa_skipped=[],
         sanitized_target_rows=0,
         sanitized_marker_total=0,
@@ -3590,6 +3635,7 @@ def _merge_reward_scoring_batches(scored_batches: list[_RewardScoringBatch]) -> 
         merged.span_rows.extend(batch.span_rows)
         merged.mqm_skipped.extend(batch.mqm_skipped)
         merged.mqm_failure_rows.extend(batch.mqm_failure_rows)
+        merged.mqm_unanchored_rows.extend(batch.mqm_unanchored_rows)
         merged.esa_skipped.extend(batch.esa_skipped)
         merged.sanitized_target_rows += int(batch.sanitized_target_rows)
         merged.sanitized_marker_total += int(batch.sanitized_marker_total)
@@ -3616,6 +3662,7 @@ def _prepare_rewards_and_advantages_from_scores(
     span_rows = list(scored_batch.span_rows)
     mqm_skipped = list(scored_batch.mqm_skipped)
     mqm_failure_rows = list(scored_batch.mqm_failure_rows)
+    mqm_unanchored_rows = list(scored_batch.mqm_unanchored_rows)
     esa_skipped = list(scored_batch.esa_skipped)
     sanitized_target_rows = int(scored_batch.sanitized_target_rows)
     sanitized_marker_total = int(scored_batch.sanitized_marker_total)
@@ -3697,6 +3744,7 @@ def _prepare_rewards_and_advantages_from_scores(
         span_rows = _filter_rows_by_indices(span_rows, keep_indices)
         mqm_skipped = _filter_rows_by_indices(mqm_skipped, keep_indices)
         mqm_failure_rows = _filter_rows_by_indices(mqm_failure_rows, keep_indices)
+        mqm_unanchored_rows = _filter_rows_by_indices(mqm_unanchored_rows, keep_indices)
         esa_skipped = _filter_rows_by_indices(esa_skipped, keep_indices)
 
     seq_rewards = build_sequence_rewards(
@@ -3718,6 +3766,21 @@ def _prepare_rewards_and_advantages_from_scores(
         for idx, failed in enumerate(mqm_failure_rows):
             if failed and idx < len(seq_rewards):
                 seq_rewards[idx] += failure_seq_penalty
+    mqm_unanchored_penalties = [0.0 for _ in mqm_unanchored_rows]
+    if cfg.reward.mqm_unanchored_seq_enabled:
+        allowed_types = [str(item) for item in cfg.reward.mqm_unanchored_allowed_types]
+        unanchored_scale = float(cfg.reward.mqm_unanchored_seq_scale)
+        for idx, unanchored_errors in enumerate(mqm_unanchored_rows):
+            penalty = _compute_mqm_unanchored_seq_penalty(
+                unanchored_errors=unanchored_errors,
+                severity_weights=cfg.reward.severity_weights,
+                type_weights=cfg.reward.mqm_token_type_weights,
+                allowed_types=allowed_types,
+                scale=unanchored_scale,
+            )
+            mqm_unanchored_penalties[idx] = penalty
+            if idx < len(seq_rewards):
+                seq_rewards[idx] += penalty
 
     token_reward_rows: list[list[float]] = []
     raw_adv_rows: list[list[float]] = []
@@ -3739,6 +3802,7 @@ def _prepare_rewards_and_advantages_from_scores(
     span_special_masked_counts: list[float] = []
     group_scalar_rewards: list[float] = []
     mqm_failure_penalties: list[float] = [failure_seq_penalty if failed else 0.0 for failed in mqm_failure_rows]
+    mqm_unanchored_error_counts: list[float] = [float(len(row)) for row in mqm_unanchored_rows]
     special_token_id_occurrence_counts: dict[int, int] = {}
     special_token_text_occurrence_counts: dict[str, int] = {}
 
@@ -4022,6 +4086,12 @@ def _prepare_rewards_and_advantages_from_scores(
         "mqm_failure_count": float(mqm_failure_count),
         "mqm_failure_penalty_total": float(sum(mqm_failure_penalties)),
         "mqm_failure_penalty_mean": float(mean(mqm_failure_penalties) if mqm_failure_penalties else 0.0),
+        "mqm_unanchored_error_count_total": float(sum(mqm_unanchored_error_counts)),
+        "mqm_unanchored_error_count_mean": float(
+            mean(mqm_unanchored_error_counts) if mqm_unanchored_error_counts else 0.0
+        ),
+        "mqm_unanchored_penalty_total": float(sum(mqm_unanchored_penalties)),
+        "mqm_unanchored_penalty_mean": float(mean(mqm_unanchored_penalties) if mqm_unanchored_penalties else 0.0),
         "esa_score_mean": esa_m,
         "esa_score_std": esa_s,
         "esa_skipped_count": float(esa_skipped_count),
@@ -4083,7 +4153,7 @@ def _prepare_rewards_and_advantages(
     esa_scorer: OpenAICompatibleESAScorer | None,
     metricx_cache: dict[tuple[str, str, str], float],
     xcomet_cache: dict[tuple[str, str, str], tuple[float, list[dict[str, Any]]]],
-    mqm_cache: dict[tuple[str, str, str, str, str], tuple[float, list[dict[str, Any]]]],
+    mqm_cache: dict[tuple[str, str, str, str, str], tuple[float, list[dict[str, Any]], list[dict[str, Any]]]],
     esa_cache: dict[tuple[str, str, str, str, str], float],
     tokenizer: Any | None = None,
 ) -> tuple[list[Rollout], list[list[float]], dict[str, float], dict[str, float]]:
@@ -5175,7 +5245,7 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
 
     metricx_cache: dict[tuple[str, str, str], float] = {}
     xcomet_cache: dict[tuple[str, str, str], tuple[float, list[dict[str, Any]]]] = {}
-    mqm_cache: dict[tuple[str, str, str, str, str], tuple[float, list[dict[str, Any]]]] = {}
+    mqm_cache: dict[tuple[str, str, str, str, str], tuple[float, list[dict[str, Any]], list[dict[str, Any]]]] = {}
     esa_cache: dict[tuple[str, str, str, str, str], float] = {}
     rng = random.Random(cfg.misc.seed)
     per_rank_batch_size = max(1, int(cfg.rl.batch_size))

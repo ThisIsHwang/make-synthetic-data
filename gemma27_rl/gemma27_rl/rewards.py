@@ -1173,12 +1173,36 @@ def _find_text_span(
     return candidates[0]
 
 
-def gemba_mqm_extract_error_spans(model_output: str | None, mt_text: str) -> list[dict[str, Any]]:
-    if model_output is None or not mt_text:
-        return []
+def _extract_mqm_error_detail_text(error: dict[str, Any], label: str) -> str:
+    target_span = _normalize_optional_gemba_span(error.get("target_span"))
+    if target_span:
+        return target_span
+    source_span = _normalize_optional_gemba_span(error.get("source_span"))
+    if source_span:
+        return source_span
+    parsed = _split_gemba_error_line(label)
+    if parsed is not None:
+        _, detail = parsed
+        quoted = _extract_gemba_quoted_text(detail)
+        if quoted:
+            return quoted
+        detail = re.sub(r"(?i)^source:\s*", "", detail).strip()
+        detail = _strip_matching_quotes(detail)
+        if detail:
+            return detail
+    return label
+
+
+def gemba_mqm_extract_error_annotations(
+    model_output: str | None,
+    mt_text: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    if model_output is None:
+        return [], []
 
     parsed = gemba_mqm_parse_structured_errors(model_output)
-    out: list[dict[str, Any]] = []
+    anchored: list[dict[str, Any]] = []
+    unanchored: list[dict[str, Any]] = []
     used_spans: list[tuple[int, int]] = []
 
     for severity in ("critical", "major", "minor"):
@@ -1187,6 +1211,11 @@ def gemba_mqm_extract_error_spans(model_output: str | None, mt_text: str) -> lis
                 continue
             target_span = _normalize_optional_gemba_span(error.get("target_span"))
             label = str(error.get("label") or _structured_gemba_error_label(error)).strip()
+            error_type = (
+                _normalize_gemba_error_type(error.get("type"))
+                or _extract_gemba_error_type(label)
+                or None
+            )
             span = None
             if target_span:
                 span = _find_text_span(mt_text, target_span, used_spans)
@@ -1196,15 +1225,19 @@ def gemba_mqm_extract_error_spans(model_output: str | None, mt_text: str) -> lis
                     if span is not None:
                         break
             if span is None:
+                unanchored.append(
+                    {
+                        "severity": severity.upper(),
+                        "source": "mqm",
+                        "label": label,
+                        "error_type": error_type,
+                        "detail_text": _extract_mqm_error_detail_text(error, label),
+                    }
+                )
                 continue
             start, end = span
             used_spans.append(span)
-            error_type = (
-                _normalize_gemba_error_type(error.get("type"))
-                or _extract_gemba_error_type(label)
-                or None
-            )
-            out.append(
+            anchored.append(
                 {
                     "text": mt_text[start:end],
                     "start": int(start),
@@ -1220,7 +1253,12 @@ def gemba_mqm_extract_error_spans(model_output: str | None, mt_text: str) -> lis
                 }
             )
 
-    return out
+    return anchored, unanchored
+
+
+def gemba_mqm_extract_error_spans(model_output: str | None, mt_text: str) -> list[dict[str, Any]]:
+    spans, _ = gemba_mqm_extract_error_annotations(model_output, mt_text)
+    return spans
 
 
 def _gemba_eval_user_message(
@@ -2315,6 +2353,7 @@ class OpenAICompatibleMQMScorer:
                 metadata={
                     "raw_outputs": [],
                     "error_spans": [],
+                    "unanchored_errors": [],
                     "skipped_rows": [],
                     "skip_reasons": [],
                     "failure_rows": [],
@@ -2344,6 +2383,7 @@ class OpenAICompatibleMQMScorer:
                 metadata={
                     "raw_outputs": [],
                     "error_spans": [[] for _ in samples],
+                    "unanchored_errors": [[] for _ in samples],
                     "skipped_rows": [False for _ in samples],
                     "skip_reasons": [None for _ in samples],
                     "failure_rows": [False for _ in samples],
@@ -2356,6 +2396,7 @@ class OpenAICompatibleMQMScorer:
         sequence_scores: list[float] = []
         raw_outputs: list[str] = []
         error_spans: list[list[dict[str, Any]]] = []
+        unanchored_errors: list[list[dict[str, Any]]] = []
         skipped_rows: list[bool] = []
         skip_reasons: list[str | None] = []
         failure_rows: list[bool] = []
@@ -2363,10 +2404,11 @@ class OpenAICompatibleMQMScorer:
         if max_workers == 1:
             for sample, messages in zip(samples, message_rows):
                 try:
-                    score, raw_text, spans = self._score_one_sample(sample, messages)
+                    score, raw_text, spans, unanchored = self._score_one_sample(sample, messages)
                     sequence_scores.append(score)
                     raw_outputs.append(raw_text)
                     error_spans.append(spans)
+                    unanchored_errors.append(unanchored)
                     skipped_rows.append(False)
                     skip_reasons.append(None)
                     failure_rows.append(False)
@@ -2382,6 +2424,7 @@ class OpenAICompatibleMQMScorer:
                     sequence_scores.append(float(fallback_score))
                     raw_outputs.append("")
                     error_spans.append([])
+                    unanchored_errors.append([])
                     skipped_rows.append(False)
                     skip_reasons.append(str(exc))
                     failure_rows.append(True)
@@ -2406,14 +2449,16 @@ class OpenAICompatibleMQMScorer:
                         sequence_scores.append(float(fallback_score))
                         raw_outputs.append("")
                         error_spans.append([])
+                        unanchored_errors.append([])
                         skipped_rows.append(False)
                         skip_reasons.append(str(result))
                         failure_rows.append(True)
                         continue
-                    score, raw_text, spans = result
+                    score, raw_text, spans, unanchored = result
                     sequence_scores.append(score)
                     raw_outputs.append(raw_text)
                     error_spans.append(spans)
+                    unanchored_errors.append(unanchored)
                     skipped_rows.append(False)
                     skip_reasons.append(None)
                     failure_rows.append(False)
@@ -2423,6 +2468,7 @@ class OpenAICompatibleMQMScorer:
             metadata={
                 "raw_outputs": raw_outputs,
                 "error_spans": error_spans,
+                "unanchored_errors": unanchored_errors,
                 "skipped_rows": skipped_rows,
                 "skip_reasons": skip_reasons,
                 "failure_rows": failure_rows,
@@ -2433,7 +2479,7 @@ class OpenAICompatibleMQMScorer:
         self,
         sample: SampleForScoring,
         messages: list[dict[str, str]],
-    ) -> tuple[float, str, list[dict[str, Any]]]:
+    ) -> tuple[float, str, list[dict[str, Any]], list[dict[str, Any]]]:
         last_exc: Exception | None = None
         for enable_thinking, attempts in _mqm_parse_phase_specs(self.cfg.chat_template_kwargs):
             for _ in range(attempts):
@@ -2483,11 +2529,12 @@ class OpenAICompatibleMQMScorer:
                         )
                         raise GembaParseError("GEMBA-MQM score parse returned None.")
                     try:
-                        spans = gemba_mqm_extract_error_spans(parsed_text, sample.mt)
+                        spans, unanchored = gemba_mqm_extract_error_annotations(parsed_text, sample.mt)
                     except Exception:
                         spans = []
+                        unanchored = []
                     scaled = self._scale_score(float(raw_score))
-                    return float(scaled), parsed_text, spans
+                    return float(scaled), parsed_text, spans, unanchored
                 except Exception as exc:
                     last_exc = exc
                     continue
@@ -3066,6 +3113,44 @@ def _resolve_mqm_token_type_weight(error_type: str | None, weights: dict[str, fl
         if candidate in weights:
             return float(weights[candidate])
     return 1.0
+
+
+def _mqm_error_type_matches_allowed(error_type: str | None, allowed_types: list[str]) -> bool:
+    normalized = _normalize_gemba_error_type(error_type)
+    if not normalized:
+        return False
+    for allowed in allowed_types:
+        allowed_normalized = _normalize_gemba_error_type(allowed)
+        if not allowed_normalized:
+            continue
+        if normalized == allowed_normalized or normalized.startswith(f"{allowed_normalized}/"):
+            return True
+    return False
+
+
+def _compute_mqm_unanchored_seq_penalty(
+    *,
+    unanchored_errors: list[dict[str, Any]],
+    severity_weights: dict[str, float],
+    type_weights: dict[str, float],
+    allowed_types: list[str],
+    scale: float,
+) -> float:
+    scale_f = float(scale)
+    if scale_f == 0.0:
+        return 0.0
+    penalty_total = 0.0
+    for error in unanchored_errors:
+        if not isinstance(error, dict):
+            continue
+        error_type = str(error.get("error_type") or "").strip() or None
+        if not _mqm_error_type_matches_allowed(error_type, allowed_types):
+            continue
+        severity = str(error.get("severity", "")).strip().upper()
+        severity_weight = float(severity_weights.get(severity, 0.0))
+        type_weight = _resolve_mqm_token_type_weight(error_type, type_weights)
+        penalty_total += severity_weight * type_weight * scale_f
+    return float(penalty_total)
 
 
 def spans_to_token_rewards(

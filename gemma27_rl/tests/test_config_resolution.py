@@ -475,3 +475,54 @@ def test_mqm_token_type_weight_values_must_be_non_negative(tmp_path: Path) -> No
 
     with pytest.raises(ValueError, match=r"reward\.mqm_token_type_weights\['accuracy/omission'\] must be >= 0"):
         _ = load_config(cfg_path)
+
+
+def test_mqm_unanchored_seq_scale_must_be_finite(tmp_path: Path) -> None:
+    cfg_path = tmp_path / "train.yaml"
+    cfg_path.write_text(
+        "\n".join(
+            [
+                "data:",
+                "  hf_dataset_name: dummy/dataset",
+                "reward:",
+                "  mqm_unanchored_seq_scale: .inf",
+                "  xcomet:",
+                "    enabled: false",
+                "  mqm:",
+                "    enabled: false",
+                "  esa:",
+                "    enabled: false",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="reward.mqm_unanchored_seq_scale must be finite"):
+        _ = load_config(cfg_path)
+
+
+def test_mqm_unanchored_allowed_types_must_not_be_empty(tmp_path: Path) -> None:
+    cfg_path = tmp_path / "train.yaml"
+    cfg_path.write_text(
+        "\n".join(
+            [
+                "data:",
+                "  hf_dataset_name: dummy/dataset",
+                "reward:",
+                "  mqm_unanchored_allowed_types:",
+                '    - ""',
+                "  xcomet:",
+                "    enabled: false",
+                "  mqm:",
+                "    enabled: false",
+                "  esa:",
+                "    enabled: false",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="reward.mqm_unanchored_allowed_types\\[0\\] must be a non-empty string"):
+        _ = load_config(cfg_path)

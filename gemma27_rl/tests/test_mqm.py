@@ -8,9 +8,11 @@ import pytest
 from gemma27_rl.config import MQMConfig
 import gemma27_rl.rewards as rewards_mod
 from gemma27_rl.rewards import (
+    _compute_mqm_unanchored_seq_penalty,
     GembaParseError,
     OpenAICompatibleMQMScorer,
     build_gemba_mqm_messages,
+    gemba_mqm_extract_error_annotations,
     gemba_mqm_extract_error_spans,
     gemba_mqm_parse_errors,
     gemba_mqm_score,
@@ -49,6 +51,7 @@ def test_openai_mqm_predict_fn_path() -> None:
 
     assert out.sequence_scores == [-5.0]
     assert out.metadata["error_spans"] == [[]]
+    assert out.metadata["unanchored_errors"] == [[]]
     assert out.metadata["failure_rows"] == [False]
     assert len(captured) == 1
     assert captured[0][-1]["role"] == "user"
@@ -106,6 +109,7 @@ def test_gemba_mqm_extract_error_spans_maps_quoted_text() -> None:
     assert spans[0]["confidence"] == pytest.approx(0.92)
     assert spans[1]["severity"] == "MAJOR"
 
+
 def test_gemba_mqm_extract_error_spans_returns_all_detected_spans() -> None:
     mt = "a b c d e f"
     raw = _mqm_json_errors(
@@ -137,6 +141,79 @@ def test_gemba_mqm_extract_error_spans_sets_error_type() -> None:
     assert len(spans) == 1
     assert spans[0]["error_type"] == "accuracy/mistranslation"
     assert spans[0]["type"] == "accuracy/mistranslation"
+
+
+def test_gemba_mqm_extract_error_annotations_returns_unanchored_omission() -> None:
+    raw = _mqm_json_errors(
+        [
+            {
+                "severity": "major",
+                "type": "accuracy/omission",
+                "target_span": None,
+                "source_span": "행안부 검증",
+                "confidence": 0.92,
+            }
+        ]
+    )
+
+    anchored_spans, unanchored_errors = gemba_mqm_extract_error_annotations(raw, "정부 발표")
+
+    assert anchored_spans == []
+    assert unanchored_errors == [
+        {
+            "severity": "MAJOR",
+            "source": "mqm",
+            "label": 'accuracy/omission - source: "행안부 검증"',
+            "error_type": "accuracy/omission",
+            "detail_text": "행안부 검증",
+        }
+    ]
+
+
+def test_gemba_mqm_extract_error_spans_preserves_old_behavior() -> None:
+    raw = _mqm_json_errors(
+        [
+            {
+                "severity": "major",
+                "type": "accuracy/omission",
+                "target_span": None,
+                "source_span": "행안부 검증",
+                "confidence": 0.92,
+            },
+            {
+                "severity": "minor",
+                "type": "fluency/grammar",
+                "target_span": "정부",
+                "source_span": None,
+                "confidence": 0.76,
+            },
+        ]
+    )
+
+    anchored_spans, unanchored_errors = gemba_mqm_extract_error_annotations(raw, "정부 발표")
+    spans = gemba_mqm_extract_error_spans(raw, "정부 발표")
+
+    assert len(anchored_spans) == 1
+    assert anchored_spans == spans
+    assert len(unanchored_errors) == 1
+    assert unanchored_errors[0]["error_type"] == "accuracy/omission"
+
+
+def test_compute_mqm_unanchored_seq_penalty_filters_allowed_types_and_applies_scale() -> None:
+    penalty = _compute_mqm_unanchored_seq_penalty(
+        unanchored_errors=[
+            {"severity": "MAJOR", "error_type": "accuracy/omission"},
+            {"severity": "MINOR", "error_type": "style/awkward"},
+        ],
+        severity_weights={"MINOR": -1.0, "MAJOR": -5.0, "CRITICAL": -10.0},
+        type_weights={"accuracy/omission": 2.0, "style/awkward": 0.5},
+        allowed_types=["accuracy"],
+        scale=0.75,
+    )
+
+    assert penalty == pytest.approx(-7.5)
+
+
 def test_gemba_mqm_parse_errors_rejects_unstructured_output() -> None:
     with pytest.raises(ValueError, match="structured errors|unparseable"):
         gemba_mqm_parse_errors("The translation looks mostly fine to me.")
@@ -233,7 +310,7 @@ def test_openai_mqm_retries_until_output_is_parseable(monkeypatch: pytest.Monkey
 
     monkeypatch.setattr(scorer, "_call_openai_compatible_api", _fake_call)
 
-    score, raw_text, spans = scorer._score_one_sample(
+    score, raw_text, spans, unanchored = scorer._score_one_sample(
         sample,
         [{"role": "user", "content": "test"}],
     )
@@ -253,6 +330,7 @@ def test_openai_mqm_retries_until_output_is_parseable(monkeypatch: pytest.Monkey
     )
     assert len(spans) == 1
     assert spans[0]["text"] == "안녕"
+    assert unanchored == []
 
 
 def test_openai_mqm_parse_failures_raise_when_score_never_parses(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -309,7 +387,7 @@ def test_openai_mqm_parse_failures_are_recorded_to_jsonl(tmp_path, monkeypatch: 
         lambda messages, max_tokens=None, chat_template_kwargs_override=None: next(calls),
     )
 
-    score, raw_text, spans = scorer._score_one_sample(
+    score, raw_text, spans, unanchored = scorer._score_one_sample(
         SampleForScoring(src="hello", mt="안녕", ref=None),
         [{"role": "user", "content": "test"}],
     )
@@ -327,6 +405,7 @@ def test_openai_mqm_parse_failures_are_recorded_to_jsonl(tmp_path, monkeypatch: 
         ]
     )
     assert len(spans) == 1
+    assert unanchored == []
     rows = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
     assert len(rows) == 1
     assert rows[0]["scorer"] == "mqm"
@@ -359,17 +438,17 @@ def test_openai_mqm_score_batch_refills_inflight_window(monkeypatch: pytest.Monk
     def _fake_score_one_sample(
         sample: SampleForScoring,
         messages: list[dict[str, str]],
-    ) -> tuple[float, str, list[dict[str, object]]]:
+    ) -> tuple[float, str, list[dict[str, object]], list[dict[str, object]]]:
         assert messages[-1]["role"] == "user"
         if sample.src == "slow":
             slow_started.set()
             assert slow_release.wait(timeout=5.0)
-            return (-1.0, "slow", [])
+            return (-1.0, "slow", [], [])
         if sample.src == "fast":
-            return (-2.0, "fast", [])
+            return (-2.0, "fast", [], [])
         third_started_while_slow_blocked["value"] = not slow_release.is_set()
         third_started.set()
-        return (-3.0, "third", [])
+        return (-3.0, "third", [], [])
 
     monkeypatch.setattr(scorer, "_score_one_sample", _fake_score_one_sample)
 
@@ -428,7 +507,7 @@ def test_openai_mqm_enables_thinking_after_first_failed_attempt(monkeypatch: pyt
 
     monkeypatch.setattr(scorer, "_call_openai_compatible_api", _fake_call)
 
-    score, _, _ = scorer._score_one_sample(sample, [{"role": "user", "content": "test"}])
+    score, _, _, _ = scorer._score_one_sample(sample, [{"role": "user", "content": "test"}])
 
     assert score == -5.0
     assert seen_thinking == [False, False, True]
@@ -463,7 +542,7 @@ def test_openai_mqm_starts_with_thinking_when_configured(monkeypatch: pytest.Mon
 
     monkeypatch.setattr(scorer, "_call_openai_compatible_api", _fake_call)
 
-    score, _, _ = scorer._score_one_sample(sample, [{"role": "user", "content": "test"}])
+    score, _, _, _ = scorer._score_one_sample(sample, [{"role": "user", "content": "test"}])
 
     assert score == -5.0
     assert seen_thinking == [True]
@@ -493,7 +572,7 @@ def test_openai_mqm_allows_empty_spans_when_score_parses(monkeypatch: pytest.Mon
         ),
     )
 
-    score, raw_text, spans = scorer._score_one_sample(
+    score, raw_text, spans, unanchored = scorer._score_one_sample(
         SampleForScoring(src="hello", mt="안녕", ref=None),
         [{"role": "user", "content": "test"}],
     )
@@ -511,6 +590,42 @@ def test_openai_mqm_allows_empty_spans_when_score_parses(monkeypatch: pytest.Mon
         ]
     )
     assert spans == []
+    assert len(unanchored) == 1
+    assert unanchored[0]["error_type"] == "accuracy/mistranslation"
+    assert unanchored[0]["detail_text"] == "hello"
+
+
+def test_openai_mqm_score_batch_returns_unanchored_errors_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scorer = OpenAICompatibleMQMScorer(
+        cfg=MQMConfig(
+            enabled=True,
+            base_url="http://localhost:8000/v1",
+            max_retries=0,
+        )
+    )
+    monkeypatch.setattr(
+        scorer,
+        "_call_openai_compatible_api",
+        lambda messages, max_tokens=None, chat_template_kwargs_override=None: _mqm_json_errors(
+            [
+                {
+                    "severity": "major",
+                    "type": "accuracy/omission",
+                    "target_span": None,
+                    "source_span": "행안부 검증",
+                    "confidence": 0.95,
+                }
+            ]
+        ),
+    )
+
+    out = scorer.score_batch([SampleForScoring(src="hello", mt="안녕", ref=None)])
+
+    assert len(out.metadata["unanchored_errors"]) == 1
+    assert out.metadata["error_spans"] == [[]]
+    assert out.metadata["unanchored_errors"][0][0]["error_type"] == "accuracy/omission"
 
 
 def test_openai_mqm_score_batch_failure_policy_neutral_zero_sets_failure_row(
