@@ -16,6 +16,7 @@ from gemma27_rl.rewards import (
     build_gemba_esa_error_messages,
     gemba_esa_format_error_spans,
     gemba_esa_parse_errors,
+    gemba_esa_parse_structured_errors,
     gemba_esa_parse_score,
 )
 from gemma27_rl.rl_types import SampleForScoring
@@ -47,6 +48,68 @@ def test_gemba_esa_parse_and_score() -> None:
     assert gemba_esa_parse_score("[79]") == 79.0
     assert gemba_esa_parse_score("1. Check adequacy 2. Check fluency 7. Final note") is None
     assert gemba_esa_parse_score("The answer mentions 5 issues but gives no score.") is None
+
+
+def test_gemba_esa_parse_structured_errors_repairs_unescaped_inner_quotes_in_json_spans() -> None:
+    raw = """{
+  "errors": [
+    {
+      "severity": "minor",
+      "type": "accuracy/mistranslation",
+      "target_span": "Revealing",
+      "source_span": "밝힌",
+      "confidence": 0.85
+    },
+    {
+      "severity": "minor",
+      "type": "style/awkward",
+      "target_span": "asserting that the European Wine Association is focused on presenting policymakers with information that is"relevant and appropriate"to the industry",
+      "source_span": "유럽 와인 기업 협회는 정책 입안자들에게 해당 업계와 \\"관련성이 있으며 적절한\\" 정보를 제시하는데 중점을 두고 있다고 주장했습니다",
+      "confidence": 0.75
+    }
+  ]
+}"""
+
+    parsed = gemba_esa_parse_structured_errors(raw)
+
+    assert len(parsed) == 2
+    assert parsed[1]["severity"] == "minor"
+    assert parsed[1]["type"] == "style/awkward"
+    assert parsed[1]["target_span"] == (
+        'asserting that the European Wine Association is focused on presenting policymakers '
+        'with information that is"relevant and appropriate"to the industry'
+    )
+    assert parsed[1]["source_span"] == (
+        '유럽 와인 기업 협회는 정책 입안자들에게 해당 업계와 "관련성이 있으며 적절한" 정보를 '
+        "제시하는데 중점을 두고 있다고 주장했습니다"
+    )
+    assert parsed[1]["confidence"] == pytest.approx(0.75)
+
+
+def test_gemba_esa_format_error_spans_repairs_doubled_quotes_in_json_spans() -> None:
+    raw = """{
+  "errors": [
+    {
+      "severity": "major",
+      "type": "accuracy/mistranslation",
+      "target_span": ""Appendix Forms 1 and 2"",
+      "source_span": ""별지 제1호 내지 제2호 서식"",
+      "confidence": 0.95
+    }
+  ]
+}"""
+
+    formatted = json.loads(gemba_esa_format_error_spans(raw))
+
+    assert formatted["errors"] == [
+        {
+            "severity": "major",
+            "type": "accuracy/mistranslation",
+            "target_span": '"Appendix Forms 1 and 2"',
+            "source_span": '"별지 제1호 내지 제2호 서식"',
+            "confidence": pytest.approx(0.95),
+        }
+    ]
 
 
 def test_gemba_esa_parse_errors_rejects_unstructured_output() -> None:
