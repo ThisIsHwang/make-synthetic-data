@@ -62,6 +62,26 @@ class _MQMScoreMismatchScorer:
         )
 
 
+class _MQMFailureThenSuccessScorer:
+    cfg = SimpleNamespace(use_reference=False)
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def score_batch(self, samples):  # type: ignore[no-untyped-def]
+        assert len(samples) == 1
+        self.calls += 1
+        failure = self.calls == 1
+        return RewardOutput(
+            sequence_scores=[-25.0 if failure else -5.0],
+            metadata={
+                "error_spans": [[]],
+                "skipped_rows": [False],
+                "failure_rows": [failure],
+            },
+        )
+
+
 def test_metricx_cache_helper_raises_on_sequence_length_mismatch() -> None:
     with pytest.raises(RuntimeError, match="MetricX scorer returned mismatched sequence_scores length"):
         _ = _score_with_cache_metricx(
@@ -149,3 +169,29 @@ def test_mqm_cache_helper_raises_on_sequence_length_mismatch() -> None:
             cache={},
             use_cache=False,
         )
+
+
+def test_mqm_cache_helper_does_not_cache_failure_rows() -> None:
+    scorer = _MQMFailureThenSuccessScorer()
+    cache: dict[tuple[str, str, str, str, str], tuple[float, list[dict[str, object]]]] = {}
+    sample = [SampleForScoring(src="s1", mt="m1", ref="r1")]
+
+    first_scores, _, _, first_failures = _score_with_cache_mqm(
+        samples=sample,
+        scorer=scorer,  # type: ignore[arg-type]
+        cache=cache,
+        use_cache=True,
+    )
+    second_scores, _, _, second_failures = _score_with_cache_mqm(
+        samples=sample,
+        scorer=scorer,  # type: ignore[arg-type]
+        cache=cache,
+        use_cache=True,
+    )
+
+    assert first_scores == [-25.0]
+    assert first_failures == [True]
+    assert second_scores == [-5.0]
+    assert second_failures == [False]
+    assert scorer.calls == 2
+    assert len(cache) == 1

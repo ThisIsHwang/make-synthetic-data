@@ -10,6 +10,7 @@ import gemma27_rl.rewards as rewards_mod
 from gemma27_rl.rewards import (
     GembaParseError,
     OpenAICompatibleMQMScorer,
+    build_gemba_mqm_messages,
     gemba_mqm_extract_error_spans,
     gemba_mqm_parse_errors,
     gemba_mqm_score,
@@ -17,14 +18,18 @@ from gemma27_rl.rewards import (
 from gemma27_rl.rl_types import SampleForScoring
 
 
+def _mqm_json_errors(errors: list[dict[str, object]]) -> str:
+    return json.dumps({"errors": errors}, ensure_ascii=False, indent=2)
+
+
 def test_gemba_mqm_parse_and_score() -> None:
-    raw = """Critical:
-accuracy/mistranslation - "x"
-Major:
-fluency/grammar - "y"
-Minor:
-style/awkward - "z"
-"""
+    raw = _mqm_json_errors(
+        [
+            {"severity": "critical", "type": "accuracy/mistranslation", "target_span": "x", "source_span": None, "confidence": 0.97},
+            {"severity": "major", "type": "fluency/grammar", "target_span": "y", "source_span": None, "confidence": 0.91},
+            {"severity": "minor", "type": "style/awkward", "target_span": "z", "source_span": None, "confidence": 0.83},
+        ]
+    )
     parsed = gemba_mqm_parse_errors(raw)
     assert len(parsed["critical"]) == 1
     assert len(parsed["major"]) == 1
@@ -44,10 +49,13 @@ def test_openai_mqm_predict_fn_path() -> None:
 
     assert out.sequence_scores == [-5.0]
     assert out.metadata["error_spans"] == [[]]
+    assert out.metadata["failure_rows"] == [False]
     assert len(captured) == 1
     assert captured[0][-1]["role"] == "user"
     assert "hello" in captured[0][-1]["content"]
     assert "안녕" in captured[0][-1]["content"]
+    assert '"errors"' in captured[0][-1]["content"]
+    assert "confidence" in captured[0][-1]["content"]
 
 
 def test_openai_mqm_predict_fn_uses_sample_language_pair() -> None:
@@ -67,20 +75,35 @@ def test_openai_mqm_predict_fn_uses_sample_language_pair() -> None:
     assert "English translation:" in captured[0][-1]["content"]
 
 
+def test_build_gemba_mqm_messages_fewshot_outputs_json() -> None:
+    messages = build_gemba_mqm_messages(
+        source_lang="English",
+        target_lang="Korean",
+        source_seg="hello",
+        target_seg="안녕",
+    )
+
+    assistant_contents = [message["content"] for message in messages if message["role"] == "assistant"]
+    assert assistant_contents
+    assert assistant_contents[0].lstrip().startswith("{")
+    assert '"errors"' in assistant_contents[0]
+    assert "confidence" in assistant_contents[0]
+
+
 def test_gemba_mqm_extract_error_spans_maps_quoted_text() -> None:
     mt = "나는 학교에 갔다."
-    raw = """Critical:
-accuracy/mistranslation - "학교"
-Major:
-fluency/grammar - "갔다"
-Minor:
-no-error
-"""
+    raw = _mqm_json_errors(
+        [
+            {"severity": "critical", "type": "accuracy/mistranslation", "target_span": "학교", "source_span": None, "confidence": 0.92},
+            {"severity": "major", "type": "fluency/grammar", "target_span": "갔다", "source_span": None, "confidence": 0.76},
+        ]
+    )
     spans = gemba_mqm_extract_error_spans(raw, mt)
     assert len(spans) == 2
     assert spans[0]["severity"] == "CRITICAL"
     assert spans[0]["text"] == "학교"
     assert spans[0]["start"] < spans[0]["end"]
+    assert spans[0]["confidence"] == pytest.approx(0.92)
     assert spans[1]["severity"] == "MAJOR"
 
 
@@ -159,7 +182,17 @@ def test_openai_mqm_retries_until_output_is_parseable(monkeypatch: pytest.Monkey
     calls = iter(
         [
             "Looks fine overall.",
-            'Major:\naccuracy/mistranslation - "안녕"',
+            _mqm_json_errors(
+                [
+                    {
+                        "severity": "major",
+                        "type": "accuracy/mistranslation",
+                        "target_span": "안녕",
+                        "source_span": None,
+                        "confidence": 0.95,
+                    }
+                ]
+            ),
         ]
     )
     call_count = {"n": 0}
@@ -177,7 +210,17 @@ def test_openai_mqm_retries_until_output_is_parseable(monkeypatch: pytest.Monkey
 
     assert call_count["n"] == 2
     assert score == -5.0
-    assert raw_text == 'Major:\naccuracy/mistranslation - "안녕"'
+    assert raw_text == _mqm_json_errors(
+        [
+            {
+                "severity": "major",
+                "type": "accuracy/mistranslation",
+                "target_span": "안녕",
+                "source_span": None,
+                "confidence": 0.95,
+            }
+        ]
+    )
     assert len(spans) == 1
     assert spans[0]["text"] == "안녕"
 
@@ -216,7 +259,17 @@ def test_openai_mqm_parse_failures_are_recorded_to_jsonl(tmp_path, monkeypatch: 
     calls = iter(
         [
             "Looks fine overall.",
-            'Major:\naccuracy/mistranslation - "안녕"',
+            _mqm_json_errors(
+                [
+                    {
+                        "severity": "major",
+                        "type": "accuracy/mistranslation",
+                        "target_span": "안녕",
+                        "source_span": None,
+                        "confidence": 0.95,
+                    }
+                ]
+            ),
         ]
     )
 
@@ -232,7 +285,17 @@ def test_openai_mqm_parse_failures_are_recorded_to_jsonl(tmp_path, monkeypatch: 
     )
 
     assert score == -5.0
-    assert raw_text == 'Major:\naccuracy/mistranslation - "안녕"'
+    assert raw_text == _mqm_json_errors(
+        [
+            {
+                "severity": "major",
+                "type": "accuracy/mistranslation",
+                "target_span": "안녕",
+                "source_span": None,
+                "confidence": 0.95,
+            }
+        ]
+    )
     assert len(spans) == 1
     rows = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
     assert len(rows) == 1
@@ -321,7 +384,17 @@ def test_openai_mqm_enables_thinking_after_first_failed_attempt(monkeypatch: pyt
         seen_thinking.append(bool((chat_template_kwargs_override or {}).get("enable_thinking")))
         if calls["n"] <= 2:
             return "bad"
-        return 'Major:\naccuracy/mistranslation - "안녕"'
+        return _mqm_json_errors(
+            [
+                {
+                    "severity": "major",
+                    "type": "accuracy/mistranslation",
+                    "target_span": "안녕",
+                    "source_span": None,
+                    "confidence": 0.95,
+                }
+            ]
+        )
 
     monkeypatch.setattr(scorer, "_call_openai_compatible_api", _fake_call)
 
@@ -346,7 +419,17 @@ def test_openai_mqm_starts_with_thinking_when_configured(monkeypatch: pytest.Mon
 
     def _fake_call(messages, max_tokens=None, chat_template_kwargs_override=None):
         seen_thinking.append(bool((chat_template_kwargs_override or {}).get("enable_thinking")))
-        return 'Major:\naccuracy/mistranslation - "안녕"'
+        return _mqm_json_errors(
+            [
+                {
+                    "severity": "major",
+                    "type": "accuracy/mistranslation",
+                    "target_span": "안녕",
+                    "source_span": None,
+                    "confidence": 0.95,
+                }
+            ]
+        )
 
     monkeypatch.setattr(scorer, "_call_openai_compatible_api", _fake_call)
 
@@ -367,7 +450,17 @@ def test_openai_mqm_allows_empty_spans_when_score_parses(monkeypatch: pytest.Mon
     monkeypatch.setattr(
         scorer,
         "_call_openai_compatible_api",
-        lambda messages, max_tokens=None, chat_template_kwargs_override=None: 'Major:\naccuracy/mistranslation - "hello"',
+        lambda messages, max_tokens=None, chat_template_kwargs_override=None: _mqm_json_errors(
+            [
+                {
+                    "severity": "major",
+                    "type": "accuracy/mistranslation",
+                    "target_span": "hello",
+                    "source_span": None,
+                    "confidence": 0.82,
+                }
+            ]
+        ),
     )
 
     score, raw_text, spans = scorer._score_one_sample(
@@ -376,11 +469,21 @@ def test_openai_mqm_allows_empty_spans_when_score_parses(monkeypatch: pytest.Mon
     )
 
     assert score == -5.0
-    assert raw_text == 'Major:\naccuracy/mistranslation - "hello"'
+    assert raw_text == _mqm_json_errors(
+        [
+            {
+                "severity": "major",
+                "type": "accuracy/mistranslation",
+                "target_span": "hello",
+                "source_span": None,
+                "confidence": 0.82,
+            }
+        ]
+    )
     assert spans == []
 
 
-def test_openai_mqm_score_batch_falls_back_without_skip_when_score_parse_fails(
+def test_openai_mqm_score_batch_failure_policy_neutral_zero_sets_failure_row(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     scorer = OpenAICompatibleMQMScorer(
@@ -388,6 +491,7 @@ def test_openai_mqm_score_batch_falls_back_without_skip_when_score_parse_fails(
             enabled=True,
             base_url="http://localhost:8000/v1",
             max_retries=0,
+            failure_policy="neutral_zero",
         )
     )
     monkeypatch.setattr(
@@ -401,6 +505,50 @@ def test_openai_mqm_score_batch_falls_back_without_skip_when_score_parse_fails(
     assert out.sequence_scores == [0.0]
     assert out.metadata["skipped_rows"] == [False]
     assert out.metadata["error_spans"] == [[]]
+    assert out.metadata["failure_rows"] == [True]
+
+
+def test_openai_mqm_score_batch_failure_policy_worst_score_uses_score_min(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scorer = OpenAICompatibleMQMScorer(
+        cfg=MQMConfig(
+            enabled=True,
+            base_url="http://localhost:8000/v1",
+            max_retries=0,
+            failure_policy="worst_score",
+            score_min=-25.0,
+        )
+    )
+    monkeypatch.setattr(
+        scorer,
+        "_call_openai_compatible_api",
+        lambda messages, max_tokens=None, chat_template_kwargs_override=None: "bad",
+    )
+
+    out = scorer.score_batch([SampleForScoring(src="hello", mt="안녕", ref=None)])
+
+    assert out.sequence_scores == [-25.0]
+    assert out.metadata["failure_rows"] == [True]
+
+
+def test_openai_mqm_score_batch_failure_policy_raise_propagates(monkeypatch: pytest.MonkeyPatch) -> None:
+    scorer = OpenAICompatibleMQMScorer(
+        cfg=MQMConfig(
+            enabled=True,
+            base_url="http://localhost:8000/v1",
+            max_retries=0,
+            failure_policy="raise",
+        )
+    )
+    monkeypatch.setattr(
+        scorer,
+        "_call_openai_compatible_api",
+        lambda messages, max_tokens=None, chat_template_kwargs_override=None: "bad",
+    )
+
+    with pytest.raises(GembaParseError, match="unparseable lines"):
+        _ = scorer.score_batch([SampleForScoring(src="hello", mt="안녕", ref=None)])
 
 
 def test_openai_mqm_request_omits_reasoning_parser(monkeypatch) -> None:

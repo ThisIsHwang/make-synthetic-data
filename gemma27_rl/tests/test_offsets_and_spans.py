@@ -56,3 +56,16 @@ def test_spans_to_token_rewards_max_prefers_stronger_penalty_by_magnitude() -> N
         combine_policy="max",
     )
     assert rewards == [0.0, 0.0, -10.0]
+
+
+def test_spans_to_token_rewards_applies_confidence_scaling() -> None:
+    rewards = spans_to_token_rewards(
+        mt_text="hello world",
+        token_char_offsets=[(0, 5), (5, 6), (6, 11)],
+        error_spans=[{"start": 6, "end": 11, "severity": "MAJOR", "confidence": 0.4}],
+        severity_weights={"MINOR": -1.0, "MAJOR": -5.0, "CRITICAL": -10.0},
+        overlap_policy="any_overlap",
+        use_confidence=True,
+        combine_policy="sum",
+    )
+    assert rewards == [0.0, 0.0, -2.0]

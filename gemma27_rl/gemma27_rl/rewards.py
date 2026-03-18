@@ -431,24 +431,31 @@ GEMBA_USER_TASK_PROMPT = (
 )
 
 GEMBA_MQM_REPAIR_SYSTEM_PROMPT = (
-    "You normalize machine translation MQM annotations into a strict canonical format."
+    "You normalize machine translation MQM annotations into a strict JSON format."
 )
 
 GEMBA_MQM_REPAIR_PROMPT_TEMPLATE = (
-    "Rewrite the evaluator output below into the exact canonical MQM format.\n\n"
-    "Return only:\n"
-    "Critical:\n"
-    "<error lines or no-error>\n"
-    "Major:\n"
-    "<error lines or no-error>\n"
-    "Minor:\n"
-    "<error lines or no-error>\n\n"
+    "Rewrite the evaluator output below into the exact MQM JSON format.\n\n"
+    "Return only valid JSON with this schema:\n"
+    '{{\n'
+    '  "errors": [\n'
+    '    {{\n'
+    '      "severity": "critical",\n'
+    '      "type": "accuracy/mistranslation",\n'
+    '      "target_span": "exact target text or null",\n'
+    '      "source_span": "exact source text or null",\n'
+    '      "confidence": 0.92\n'
+    '    }}\n'
+    '  ]\n'
+    '}}\n\n'
     "Rules:\n"
-    '- Each error line must look like category/subcategory - "exact target span"\n'
-    "- Copy quoted target spans exactly from the translation when possible.\n"
-    "- If a severity has no errors, output no-error under that severity.\n"
-    "- If there are no errors at all, output no-error under all three severities.\n"
-    "- Do not include explanations or any text outside the canonical format.\n\n"
+    '- severity must be one of "critical", "major", or "minor".\n'
+    '- type must be category/subcategory in lowercase.\n'
+    "- Copy target_span exactly from the translation when possible.\n"
+    "- For omissions or anchorless errors, use target_span=null and source_span when possible.\n"
+    "- confidence must be a number between 0 and 1.\n"
+    '- If there are no errors, return {{"errors": []}}.\n'
+    "- Do not include explanations or any text outside the JSON object.\n\n"
     "Source:\n"
     "```{source_seg}```\n"
     "Translation:\n"
@@ -471,14 +478,14 @@ GEMBA_FEWSHOT_USER_1 = dedent(
 
 GEMBA_FEWSHOT_ASSISTANT_1 = dedent(
     """\
-    Critical:
-    no-error
-    Major:
-    accuracy/mistranslation - "involvement"
-    accuracy/omission - "the account holder"
-    Minor:
-    fluency/grammar - "wäre"
-    fluency/register - "dir"
+    {
+      "errors": [
+        {"severity": "major", "type": "accuracy/mistranslation", "target_span": "involvement", "source_span": null, "confidence": 0.98},
+        {"severity": "major", "type": "accuracy/omission", "target_span": "the account holder", "source_span": null, "confidence": 0.95},
+        {"severity": "minor", "type": "fluency/grammar", "target_span": "wäre", "source_span": null, "confidence": 0.93},
+        {"severity": "minor", "type": "fluency/register", "target_span": "dir", "source_span": null, "confidence": 0.91}
+      ]
+    }
     """
 ).strip()
 
@@ -496,13 +503,13 @@ GEMBA_FEWSHOT_USER_2 = dedent(
 
 GEMBA_FEWSHOT_ASSISTANT_2 = dedent(
     """\
-    Critical:
-    no-error
-    Major:
-    accuracy/addition - "ve Vídni"
-    accuracy/omission - "the stop-start"
-    Minor:
-    terminology/inappropriate for context - "partaje"
+    {
+      "errors": [
+        {"severity": "major", "type": "accuracy/addition", "target_span": "ve Vídni", "source_span": null, "confidence": 0.97},
+        {"severity": "major", "type": "accuracy/omission", "target_span": null, "source_span": "the stop-start", "confidence": 0.94},
+        {"severity": "minor", "type": "terminology/inappropriate for context", "target_span": "partaje", "source_span": null, "confidence": 0.9}
+      ]
+    }
     """
 ).strip()
 
@@ -520,19 +527,20 @@ GEMBA_FEWSHOT_USER_3 = dedent(
 
 GEMBA_FEWSHOT_ASSISTANT_3 = dedent(
     """\
-    Critical:
-    accuracy/addition - "of high-speed rail"
-    Major:
-    accuracy/mistranslation - "go to the reviews"
-    Minor:
-    style/awkward - "etc.,"
+    {
+      "errors": [
+        {"severity": "critical", "type": "accuracy/addition", "target_span": "of high-speed rail", "source_span": null, "confidence": 0.98},
+        {"severity": "major", "type": "accuracy/mistranslation", "target_span": "go to the reviews", "source_span": null, "confidence": 0.96},
+        {"severity": "minor", "type": "style/awkward", "target_span": "etc.,", "source_span": null, "confidence": 0.88}
+      ]
+    }
     """
 ).strip()
 
 
 _GEMBA_ERROR_LINE_PATTERN = re.compile(
-    r"^(accuracy|fluency|style|terminology|non-translation|other)"
-    r"(?:\s*/\s*[^:]+?)?\s*(?:-|:|–|—)\s*(.+)$",
+    r"^((?:accuracy|fluency|style|terminology|non-translation|other)"
+    r"(?:\s*/\s*[^:]+?)?)\s*(?:-|:|–|—)\s*(.+)$",
     flags=re.IGNORECASE,
 )
 _MQM_PARSE_ATTEMPTS_WITHOUT_THINKING = 1
@@ -588,6 +596,32 @@ def _resolve_sample_lang_pair(
     return source_lang, target_lang
 
 
+def _gemba_json_output_instructions(*, allowed_levels: tuple[str, ...]) -> str:
+    level_text = ", ".join(f'"{level}"' for level in allowed_levels)
+    return (
+        "\n\nReturn only valid JSON with this schema:\n"
+        '{\n'
+        '  "errors": [\n'
+        '    {\n'
+        '      "severity": "major",\n'
+        '      "type": "accuracy/mistranslation",\n'
+        '      "target_span": "exact target text or null",\n'
+        '      "source_span": "exact source text or null",\n'
+        '      "confidence": 0.92\n'
+        '    }\n'
+        '  ]\n'
+        '}\n'
+        "Rules:\n"
+        f"- severity must be lowercase and one of: {level_text}.\n"
+        "- type must be category/subcategory in lowercase.\n"
+        "- Use target_span when you can anchor the error to exact translated text.\n"
+        "- For omissions or anchorless errors, use target_span=null and source_span when possible.\n"
+        "- confidence must be a number between 0 and 1.\n"
+        '- If there are no errors, return {"errors": []}.\n'
+        "- Do not include explanations or text outside the JSON object."
+    )
+
+
 def _normalize_gemba_response_line(raw_line: str) -> str:
     line = str(raw_line).strip()
     if not line:
@@ -611,6 +645,187 @@ def _looks_like_gemba_level_header(line: str, *, allowed_levels: tuple[str, ...]
         if line_l == header or line_l.startswith(header):
             return True
     return False
+
+
+def _strip_matching_quotes(text: str) -> str:
+    out = str(text or "").strip()
+    if not out:
+        return ""
+    pairs = (('"', '"'), ("“", "”"), ("'", "'"), ("`", "`"))
+    changed = True
+    while changed:
+        changed = False
+        for open_quote, close_quote in pairs:
+            if out.startswith(open_quote) and out.endswith(close_quote) and len(out) > (len(open_quote) + len(close_quote)):
+                out = out[len(open_quote): len(out) - len(close_quote)].strip()
+                changed = True
+                break
+    return out
+
+
+def _extract_gemba_quoted_text(line: str) -> str | None:
+    candidates: list[str] = []
+    text = str(line or "")
+    for open_quote, close_quote in (('"', '"'), ("“", "”"), ("'", "'"), ("`", "`")):
+        start = text.find(open_quote)
+        end = text.rfind(close_quote)
+        if start < 0 or end <= start:
+            continue
+        value = text[start + len(open_quote):end].strip()
+        if not value:
+            continue
+        if value.lower() in {"no-error", "no error"}:
+            continue
+        candidates.append(value)
+    if not candidates:
+        return None
+    return max(candidates, key=len)
+
+
+def _normalize_gemba_error_type(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    text = re.sub(r"\s*/\s*", "/", text)
+    text = re.sub(r"\s+", " ", text)
+    return text
+
+
+def _split_gemba_error_line(line: str) -> tuple[str, str] | None:
+    match = _GEMBA_ERROR_LINE_PATTERN.match(str(line).strip())
+    if match is None:
+        return None
+    error_type = _normalize_gemba_error_type(match.group(1))
+    detail = str(match.group(2)).strip()
+    if not error_type or not detail:
+        return None
+    return error_type, detail
+
+
+def _normalize_optional_gemba_span(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    return text
+
+
+def _normalize_gemba_confidence(value: Any) -> float:
+    if value is None:
+        return 1.0
+    try:
+        parsed = float(value)
+    except Exception as exc:
+        raise GembaParseError(f"GEMBA confidence must be numeric, got {value!r}.") from exc
+    if not math.isfinite(parsed):
+        raise GembaParseError("GEMBA confidence must be finite.")
+    return min(1.0, max(0.0, parsed))
+
+
+def _strip_json_code_fence(text: str) -> str:
+    stripped = str(text or "").strip()
+    if not stripped.startswith("```"):
+        return stripped
+    lines = stripped.splitlines()
+    if len(lines) >= 2 and lines[-1].strip() == "```":
+        return "\n".join(lines[1:-1]).strip()
+    return stripped
+
+
+def _extract_balanced_json_object(text: str) -> str | None:
+    raw = str(text or "")
+    for start in [idx for idx, ch in enumerate(raw) if ch == "{"]:
+        depth = 0
+        in_string = False
+        escape = False
+        for idx in range(start, len(raw)):
+            ch = raw[idx]
+            if in_string:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_string = False
+                continue
+            if ch == '"':
+                in_string = True
+                continue
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return raw[start : idx + 1]
+    return None
+
+
+def _try_parse_json_object(text: str | None) -> dict[str, Any] | None:
+    candidates: list[str] = []
+    stripped = str(text or "").strip()
+    if stripped:
+        candidates.append(stripped)
+        fenced = _strip_json_code_fence(stripped)
+        if fenced and fenced not in candidates:
+            candidates.append(fenced)
+        balanced = _extract_balanced_json_object(fenced)
+        if balanced and balanced not in candidates:
+            candidates.append(balanced)
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+        except Exception:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return None
+
+
+def _normalize_gemba_structured_error(
+    item: Any,
+    *,
+    allowed_levels: tuple[str, ...],
+    scorer_name: str,
+) -> dict[str, Any]:
+    if not isinstance(item, dict):
+        raise GembaParseError(f"{scorer_name} JSON error item must be an object.")
+    severity = str(item.get("severity", "")).strip().lower()
+    if severity not in allowed_levels:
+        raise GembaParseError(
+            f"{scorer_name} JSON error severity must be one of {allowed_levels}, got {severity!r}."
+        )
+    error_type = _normalize_gemba_error_type(item.get("type"))
+    if not error_type or error_type == "no-error":
+        raise GembaParseError(f"{scorer_name} JSON error type must be non-empty.")
+    target_span = _normalize_optional_gemba_span(item.get("target_span"))
+    source_span = _normalize_optional_gemba_span(item.get("source_span"))
+    confidence = _normalize_gemba_confidence(item.get("confidence", 1.0))
+    return {
+        "severity": severity,
+        "type": error_type,
+        "target_span": target_span,
+        "source_span": source_span,
+        "confidence": confidence,
+    }
+
+
+def _parse_gemba_json_errors(
+    model_output: str | None,
+    *,
+    allowed_levels: tuple[str, ...],
+    scorer_name: str,
+) -> list[dict[str, Any]] | None:
+    payload = _try_parse_json_object(model_output)
+    if payload is None:
+        return None
+    if "errors" not in payload:
+        raise GembaParseError(f"{scorer_name} JSON output must contain an errors field.")
+    errors_value = payload.get("errors")
+    if not isinstance(errors_value, list):
+        raise GembaParseError(f"{scorer_name} JSON errors field must be a list.")
+    return [
+        _normalize_gemba_structured_error(item, allowed_levels=allowed_levels, scorer_name=scorer_name)
+        for item in errors_value
+    ]
 
 
 def _has_unbalanced_gemba_quotes(text: str) -> bool:
@@ -659,13 +874,7 @@ def _coalesce_gemba_response_lines(
 
 
 def _is_structured_gemba_error_line(line: str) -> bool:
-    match = _GEMBA_ERROR_LINE_PATTERN.match(str(line).strip())
-    if match is None:
-        return False
-    detail = str(match.group(2)).strip()
-    if not detail:
-        return False
-    return True
+    return _split_gemba_error_line(line) is not None
 
 
 def _parse_gemba_error_output(
@@ -727,23 +936,117 @@ def _parse_gemba_error_output(
     return errors
 
 
-def gemba_mqm_parse_errors(model_output: str) -> dict[str, list[str]]:
-    return _parse_gemba_error_output(
+def _legacy_gemba_error_to_structured(severity: str, line: str) -> dict[str, Any]:
+    parsed = _split_gemba_error_line(line)
+    if parsed is None:
+        raise GembaParseError(f"GEMBA response has unparseable line: {line}")
+    error_type, detail = parsed
+    target_span = _normalize_optional_gemba_span(_strip_matching_quotes(_extract_gemba_quoted_text(detail) or detail))
+    if target_span is not None and target_span.lower() in {"no-error", "no error"}:
+        target_span = None
+    if target_span == detail:
+        detail_candidate = _strip_matching_quotes(detail)
+        target_span = detail_candidate or None
+    return {
+        "severity": str(severity).strip().lower(),
+        "type": error_type,
+        "target_span": target_span,
+        "source_span": None,
+        "confidence": 1.0,
+        "label": line,
+    }
+
+
+def _legacy_gemba_errors_to_structured(
+    model_output: str | None,
+    *,
+    allowed_levels: tuple[str, ...],
+    scorer_name: str,
+) -> list[dict[str, Any]]:
+    parsed = _parse_gemba_error_output(
+        model_output,
+        allowed_levels=allowed_levels,
+        scorer_name=scorer_name,
+    )
+    out: list[dict[str, Any]] = []
+    for level in allowed_levels:
+        for line in parsed.get(level, []):
+            out.append(_legacy_gemba_error_to_structured(level, line))
+    return out
+
+
+def _structured_gemba_error_label(error: dict[str, Any]) -> str:
+    error_type = str(error.get("type", "")).strip()
+    target_span = _normalize_optional_gemba_span(error.get("target_span"))
+    source_span = _normalize_optional_gemba_span(error.get("source_span"))
+    if target_span:
+        return f'{error_type} - "{target_span}"'
+    if source_span:
+        return f'{error_type} - source: "{source_span}"'
+    return error_type
+
+
+def _structured_gemba_errors_to_legacy_dict(
+    errors: list[dict[str, Any]],
+    *,
+    allowed_levels: tuple[str, ...],
+) -> dict[str, list[str]]:
+    out: dict[str, list[str]] = {level: [] for level in allowed_levels}
+    for error in errors:
+        severity = str(error.get("severity", "")).strip().lower()
+        if severity in out:
+            label = str(error.get("label") or _structured_gemba_error_label(error)).strip()
+            out[severity].append(label)
+    return out
+
+
+def _format_gemba_structured_errors(errors: list[dict[str, Any]]) -> str:
+    normalized = [
+        {
+            "severity": str(error.get("severity", "")).strip().lower(),
+            "type": _normalize_gemba_error_type(error.get("type")),
+            "target_span": _normalize_optional_gemba_span(error.get("target_span")),
+            "source_span": _normalize_optional_gemba_span(error.get("source_span")),
+            "confidence": _normalize_gemba_confidence(error.get("confidence", 1.0)),
+        }
+        for error in errors
+    ]
+    return json.dumps({"errors": normalized}, ensure_ascii=False, indent=2)
+
+
+def gemba_mqm_parse_structured_errors(model_output: str) -> list[dict[str, Any]]:
+    structured = _parse_gemba_json_errors(
+        model_output,
+        allowed_levels=("critical", "major", "minor"),
+        scorer_name="MQM",
+    )
+    if structured is not None:
+        return structured
+    return _legacy_gemba_errors_to_structured(
         model_output,
         allowed_levels=("critical", "major", "minor"),
         scorer_name="MQM",
     )
 
 
+def gemba_mqm_parse_errors(model_output: str) -> dict[str, list[str]]:
+    return _structured_gemba_errors_to_legacy_dict(
+        gemba_mqm_parse_structured_errors(model_output),
+        allowed_levels=("critical", "major", "minor"),
+    )
+
+
 def gemba_mqm_score(model_output: str | None) -> int | None:
     if model_output is None:
         return None
-    errors = gemba_mqm_parse_errors(model_output)
+    errors = gemba_mqm_parse_structured_errors(model_output)
 
     penalty = 0
     count = 0
     for lvl in ["critical", "major", "minor"]:
-        for _err in errors.get(lvl, []):
+        for error in errors:
+            if str(error.get("severity", "")).strip().lower() != lvl:
+                continue
             if count >= 5:
                 break
             penalty += 25 if lvl == "critical" else 5 if lvl == "major" else 1
@@ -754,46 +1057,14 @@ def gemba_mqm_score(model_output: str | None) -> int | None:
 
 
 def _extract_mqm_quoted_text(line: str) -> str | None:
-    candidates: list[str] = []
-    text = str(line or "")
-    for open_quote, close_quote in (('"', '"'), ("“", "”"), ("'", "'"), ("`", "`")):
-        start = text.find(open_quote)
-        end = text.rfind(close_quote)
-        if start < 0 or end <= start:
-            continue
-        value = text[start + len(open_quote):end].strip()
-        if not value:
-            continue
-        if value.lower() in {"no-error", "no error"}:
-            continue
-        candidates.append(value)
-    if not candidates:
-        return None
-    return max(candidates, key=len)
+    return _extract_gemba_quoted_text(line)
 
 
 def _extract_mqm_error_detail(line: str) -> str | None:
-    match = _GEMBA_ERROR_LINE_PATTERN.match(str(line).strip())
-    if match is None:
+    parsed = _split_gemba_error_line(line)
+    if parsed is None:
         return None
-    detail = str(match.group(2)).strip()
-    return detail or None
-
-
-def _strip_matching_quotes(text: str) -> str:
-    out = str(text or "").strip()
-    if not out:
-        return ""
-    pairs = (('"', '"'), ("“", "”"), ("'", "'"), ("`", "`"))
-    changed = True
-    while changed:
-        changed = False
-        for open_quote, close_quote in pairs:
-            if out.startswith(open_quote) and out.endswith(close_quote) and len(out) > (len(open_quote) + len(close_quote)):
-                out = out[len(open_quote): len(out) - len(close_quote)].strip()
-                changed = True
-                break
-    return out
+    return parsed[1] or None
 
 
 def _normalize_mqm_error_text_candidate(text: str) -> str:
@@ -899,20 +1170,27 @@ def gemba_mqm_extract_error_spans(model_output: str | None, mt_text: str) -> lis
     if model_output is None or not mt_text:
         return []
 
-    parsed = gemba_mqm_parse_errors(model_output)
+    parsed = gemba_mqm_parse_structured_errors(model_output)
     out: list[dict[str, Any]] = []
     used_spans: list[tuple[int, int]] = []
     max_items = 5
 
     for severity in ("critical", "major", "minor"):
-        for line in parsed.get(severity, []):
+        for error in parsed:
+            if str(error.get("severity", "")).strip().lower() != severity:
+                continue
             if len(out) >= max_items:
                 return out
+            target_span = _normalize_optional_gemba_span(error.get("target_span"))
+            label = str(error.get("label") or _structured_gemba_error_label(error)).strip()
             span = None
-            for candidate in _mqm_error_text_candidates(line):
-                span = _find_text_span(mt_text, candidate, used_spans)
-                if span is not None:
-                    break
+            if target_span:
+                span = _find_text_span(mt_text, target_span, used_spans)
+            if span is None:
+                for candidate in _mqm_error_text_candidates(label):
+                    span = _find_text_span(mt_text, candidate, used_spans)
+                    if span is not None:
+                        break
             if span is None:
                 continue
             start, end = span
@@ -923,9 +1201,12 @@ def gemba_mqm_extract_error_spans(model_output: str | None, mt_text: str) -> lis
                     "start": int(start),
                     "end": int(end),
                     "severity": severity.upper(),
-                    "confidence": 1.0,
+                    "confidence": _normalize_gemba_confidence(error.get("confidence", 1.0)),
                     "source": "mqm",
-                    "label": line,
+                    "label": label,
+                    "type": _normalize_gemba_error_type(error.get("type")),
+                    "target_span": target_span,
+                    "source_span": _normalize_optional_gemba_span(error.get("source_span")),
                 }
             )
 
@@ -945,6 +1226,7 @@ def _gemba_eval_user_message(
         f"{target_lang} translation:\n"
         f"```{target_seg}```\n\n"
         f"{GEMBA_USER_TASK_PROMPT}"
+        f"{_gemba_json_output_instructions(allowed_levels=('critical', 'major', 'minor'))}"
     )
 
 
@@ -1010,22 +1292,31 @@ GEMBA_ESA_USER_TASK_PROMPT = (
 )
 
 GEMBA_ESA_REPAIR_SYSTEM_PROMPT = (
-    "You normalize machine translation ESA annotations into a strict canonical format."
+    "You normalize machine translation ESA annotations into a strict JSON format."
 )
 
 GEMBA_ESA_REPAIR_PROMPT_TEMPLATE = (
-    "Rewrite the evaluator output below into the exact canonical ESA error format.\n\n"
-    "Return only:\n"
-    "Major:\n"
-    "<error lines or no-error>\n"
-    "Minor:\n"
-    "<error lines or no-error>\n\n"
+    "Rewrite the evaluator output below into the exact ESA JSON format.\n\n"
+    "Return only valid JSON with this schema:\n"
+    '{{\n'
+    '  "errors": [\n'
+    '    {{\n'
+    '      "severity": "major",\n'
+    '      "type": "accuracy/mistranslation",\n'
+    '      "target_span": "exact target text or null",\n'
+    '      "source_span": "exact source text or null",\n'
+    '      "confidence": 0.92\n'
+    '    }}\n'
+    '  ]\n'
+    '}}\n\n'
     "Rules:\n"
-    '- Each error line must look like category/subcategory - "exact target span"\n'
-    "- Copy quoted target spans exactly from the translation when possible.\n"
-    "- If a severity has no errors, output no-error under that severity.\n"
-    "- If there are no errors at all, output no-error under both severities.\n"
-    "- Do not include explanations or any text outside the canonical format.\n\n"
+    '- severity must be one of "major" or "minor".\n'
+    '- type must be category/subcategory in lowercase.\n'
+    "- Copy target_span exactly from the translation when possible.\n"
+    "- For omissions or anchorless errors, use target_span=null and source_span when possible.\n"
+    "- confidence must be a number between 0 and 1.\n"
+    '- If there are no errors, return {{"errors": []}}.\n'
+    "- Do not include explanations or any text outside the JSON object.\n\n"
     "Source:\n"
     "```{source_seg}```\n"
     "Translation:\n"
@@ -1036,37 +1327,43 @@ GEMBA_ESA_REPAIR_PROMPT_TEMPLATE = (
 
 GEMBA_ESA_FEWSHOT_ASSISTANT_1 = dedent(
     """\
-    Major:
-    accuracy/mistranslation - "involvement"
-    accuracy/omission - "the account holder"
-    Minor:
-    fluency/grammar - "wäre"
-    fluency/register - "dir"
+    {
+      "errors": [
+        {"severity": "major", "type": "accuracy/mistranslation", "target_span": "involvement", "source_span": null, "confidence": 0.98},
+        {"severity": "major", "type": "accuracy/omission", "target_span": "the account holder", "source_span": null, "confidence": 0.95},
+        {"severity": "minor", "type": "fluency/grammar", "target_span": "wäre", "source_span": null, "confidence": 0.93},
+        {"severity": "minor", "type": "fluency/register", "target_span": "dir", "source_span": null, "confidence": 0.91}
+      ]
+    }
     """
 ).strip()
 
 GEMBA_ESA_FEWSHOT_ASSISTANT_2 = dedent(
     """\
-    Major:
-    accuracy/addition - "ve Vídni"
-    accuracy/omission - "the stop-start"
-    Minor:
-    terminology/inappropriate for context - "partaje"
+    {
+      "errors": [
+        {"severity": "major", "type": "accuracy/addition", "target_span": "ve Vídni", "source_span": null, "confidence": 0.97},
+        {"severity": "major", "type": "accuracy/omission", "target_span": null, "source_span": "the stop-start", "confidence": 0.94},
+        {"severity": "minor", "type": "terminology/inappropriate for context", "target_span": "partaje", "source_span": null, "confidence": 0.9}
+      ]
+    }
     """
 ).strip()
 
 GEMBA_ESA_FEWSHOT_ASSISTANT_3 = dedent(
     """\
-    Major:
-    accuracy/addition - "of high-speed rail"
-    accuracy/mistranslation - "go to the reviews"
-    Minor:
-    style/awkward - "etc.,"
+    {
+      "errors": [
+        {"severity": "major", "type": "accuracy/addition", "target_span": "of high-speed rail", "source_span": null, "confidence": 0.98},
+        {"severity": "major", "type": "accuracy/mistranslation", "target_span": "go to the reviews", "source_span": null, "confidence": 0.96},
+        {"severity": "minor", "type": "style/awkward", "target_span": "etc.,", "source_span": null, "confidence": 0.88}
+      ]
+    }
     """
 ).strip()
 
 GEMBA_ESA_RANKING_PROMPT_TEMPLATE = (
-    "Given the translation from {source_lang} to {target_lang} and the annotated error spans, "
+    "Given the translation from {source_lang} to {target_lang} and the annotated errors JSON, "
     "assign a score on a continuous scale from 0 to 100. The scale has following reference points: "
     '0="No meaning preserved", 33="Some meaning preserved", '
     '66="Most meaning preserved and few grammar mistakes", '
@@ -1075,10 +1372,9 @@ GEMBA_ESA_RANKING_PROMPT_TEMPLATE = (
     "```{source_seg}```\n"
     "{target_lang} translation:\n"
     "```{target_seg}```\n"
-    "Annotated error spans:\n"
+    "Annotated errors JSON:\n"
     "```{error_spans}```\n"
-    "Respond with only one integer from 0 to 100. Do not include any explanation or extra text.\n"
-    "Score (0-100):"
+    'Respond with only valid JSON like {{"score": 83}}. Do not include any explanation or extra text.'
 )
 
 _ESA_SCORE_PATTERNS: tuple[str, ...] = (
@@ -1105,6 +1401,7 @@ def _gemba_esa_error_user_message(
         f"{target_lang} translation:\n"
         f"```{target_seg}```\n\n"
         f"{GEMBA_ESA_USER_TASK_PROMPT}"
+        f"{_gemba_json_output_instructions(allowed_levels=('major', 'minor'))}"
     )
 
 
@@ -1178,28 +1475,32 @@ def build_gemba_esa_error_messages(
     return messages
 
 
-def gemba_esa_parse_errors(model_output: str) -> dict[str, list[str]]:
-    return _parse_gemba_error_output(
+def gemba_esa_parse_structured_errors(model_output: str) -> list[dict[str, Any]]:
+    structured = _parse_gemba_json_errors(
+        model_output,
+        allowed_levels=("major", "minor"),
+        scorer_name="ESA",
+    )
+    if structured is not None:
+        return structured
+    return _legacy_gemba_errors_to_structured(
         model_output,
         allowed_levels=("major", "minor"),
         scorer_name="ESA",
     )
 
 
+def gemba_esa_parse_errors(model_output: str) -> dict[str, list[str]]:
+    return _structured_gemba_errors_to_legacy_dict(
+        gemba_esa_parse_structured_errors(model_output),
+        allowed_levels=("major", "minor"),
+    )
+
+
 def gemba_esa_format_error_spans(model_output: str | None) -> str:
     if model_output is None:
-        return "no-error"
-    parsed = gemba_esa_parse_errors(model_output)
-    lines: list[str] = []
-    if parsed["major"]:
-        lines.append("Major:")
-        lines.extend(parsed["major"])
-    if parsed["minor"]:
-        lines.append("Minor:")
-        lines.extend(parsed["minor"])
-    if not lines:
-        return "no-error"
-    return "\n".join(lines)
+        return '{"errors": []}'
+    return _format_gemba_structured_errors(gemba_esa_parse_structured_errors(model_output))
 
 
 def gemba_esa_parse_score(model_output: str | None) -> float | None:
@@ -1208,6 +1509,14 @@ def gemba_esa_parse_score(model_output: str | None) -> float | None:
     text = str(model_output).strip()
     if not text:
         return None
+
+    json_payload = _try_parse_json_object(text)
+    if isinstance(json_payload, dict) and "score" in json_payload:
+        try:
+            value = float(json_payload.get("score"))
+        except Exception:
+            value = math.nan
+        return value if math.isfinite(value) and 0.0 <= value <= 100.0 else None
 
     if re.match(r"^\[['\"]?-?\d+(?:\.\d+)?['\"]?\]$", text):
         inner = re.sub(r"[^\d\.\-]", "", text)
@@ -1942,6 +2251,15 @@ class XCometXLScorer:
             pass
 
 
+def _mqm_failure_fallback_score(cfg: MQMConfig) -> float:
+    failure_policy = str(cfg.failure_policy).strip().lower()
+    if failure_policy == "neutral_zero":
+        return 0.0
+    if failure_policy == "worst_score":
+        return float(cfg.score_min)
+    raise RuntimeError("failure_policy=raise should not request fallback")
+
+
 @dataclass
 class OpenAICompatibleMQMScorer:
     cfg: MQMConfig
@@ -1984,7 +2302,13 @@ class OpenAICompatibleMQMScorer:
         if not samples:
             return RewardOutput(
                 sequence_scores=[],
-                metadata={"raw_outputs": [], "error_spans": [], "skipped_rows": [], "skip_reasons": []},
+                metadata={
+                    "raw_outputs": [],
+                    "error_spans": [],
+                    "skipped_rows": [],
+                    "skip_reasons": [],
+                    "failure_rows": [],
+                },
             )
 
         message_rows = [
@@ -2012,6 +2336,7 @@ class OpenAICompatibleMQMScorer:
                     "error_spans": [[] for _ in samples],
                     "skipped_rows": [False for _ in samples],
                     "skip_reasons": [None for _ in samples],
+                    "failure_rows": [False for _ in samples],
                 },
             )
 
@@ -2023,6 +2348,7 @@ class OpenAICompatibleMQMScorer:
         error_spans: list[list[dict[str, Any]]] = []
         skipped_rows: list[bool] = []
         skip_reasons: list[str | None] = []
+        failure_rows: list[bool] = []
         max_workers = max(1, int(self.cfg.batch_size))
         if max_workers == 1:
             for sample, messages in zip(samples, message_rows):
@@ -2033,16 +2359,22 @@ class OpenAICompatibleMQMScorer:
                     error_spans.append(spans)
                     skipped_rows.append(False)
                     skip_reasons.append(None)
+                    failure_rows.append(False)
                 except Exception as exc:
+                    if str(self.cfg.failure_policy).strip().lower() == "raise":
+                        raise
+                    fallback_score = _mqm_failure_fallback_score(self.cfg)
                     logger.warning(
-                        "MQM scoring failed after repeated failures; using fallback score=0.0 and empty spans: error=%s",
+                        "MQM scoring failed after repeated failures; using fallback score=%s and empty spans: error=%s",
+                        fallback_score,
                         exc,
                     )
-                    sequence_scores.append(0.0)
+                    sequence_scores.append(float(fallback_score))
                     raw_outputs.append("")
                     error_spans.append([])
                     skipped_rows.append(False)
-                    skip_reasons.append(None)
+                    skip_reasons.append(str(exc))
+                    failure_rows.append(True)
         else:
             with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="mqm-scorer") as executor:
                 batch_results = _run_jobs_with_bounded_concurrency(
@@ -2053,15 +2385,20 @@ class OpenAICompatibleMQMScorer:
                 )
                 for result in batch_results:
                     if isinstance(result, Exception):
+                        if str(self.cfg.failure_policy).strip().lower() == "raise":
+                            raise result
+                        fallback_score = _mqm_failure_fallback_score(self.cfg)
                         logger.warning(
-                            "MQM scoring failed after repeated failures; using fallback score=0.0 and empty spans: error=%s",
+                            "MQM scoring failed after repeated failures; using fallback score=%s and empty spans: error=%s",
+                            fallback_score,
                             result,
                         )
-                        sequence_scores.append(0.0)
+                        sequence_scores.append(float(fallback_score))
                         raw_outputs.append("")
                         error_spans.append([])
                         skipped_rows.append(False)
-                        skip_reasons.append(None)
+                        skip_reasons.append(str(result))
+                        failure_rows.append(True)
                         continue
                     score, raw_text, spans = result
                     sequence_scores.append(score)
@@ -2069,6 +2406,7 @@ class OpenAICompatibleMQMScorer:
                     error_spans.append(spans)
                     skipped_rows.append(False)
                     skip_reasons.append(None)
+                    failure_rows.append(False)
 
         return RewardOutput(
             sequence_scores=sequence_scores,
@@ -2077,6 +2415,7 @@ class OpenAICompatibleMQMScorer:
                 "error_spans": error_spans,
                 "skipped_rows": skipped_rows,
                 "skip_reasons": skip_reasons,
+                "failure_rows": failure_rows,
             },
         )
 
@@ -2149,14 +2488,12 @@ class OpenAICompatibleMQMScorer:
 
     def _repair_mqm_output_if_needed(self, *, sample: SampleForScoring, raw_text: str, enable_thinking: bool) -> str:
         try:
-            raw_score = gemba_mqm_score(raw_text)
+            structured_errors = gemba_mqm_parse_structured_errors(raw_text)
         except Exception as exc:
-            raw_score = None
+            structured_errors = None
             error_text = str(exc)
         else:
-            error_text = "GEMBA-MQM score parse returned None."
-        if raw_score is not None:
-            return raw_text
+            return _format_gemba_structured_errors(structured_errors)
         _record_scorer_parse_failure(
             log_path=self._parse_failure_log_path,
             scorer_name="mqm",
@@ -2167,7 +2504,7 @@ class OpenAICompatibleMQMScorer:
             error=error_text,
             details={"raw_text": raw_text},
         )
-        return self._call_openai_compatible_api(
+        repaired_text = self._call_openai_compatible_api(
             build_gemba_mqm_repair_messages(
                 source_seg=sample.src,
                 target_seg=sample.mt,
@@ -2179,6 +2516,24 @@ class OpenAICompatibleMQMScorer:
                 enable_thinking=enable_thinking,
             ),
         )
+        try:
+            structured_errors = gemba_mqm_parse_structured_errors(repaired_text)
+        except Exception as exc:
+            _record_scorer_parse_failure(
+                log_path=self._parse_failure_log_path,
+                scorer_name="mqm",
+                model_name=self.cfg.model_name,
+                sample=sample,
+                enable_thinking=enable_thinking,
+                stage="repair_output_parse_failed",
+                error=str(exc),
+                details={
+                    "raw_text": raw_text,
+                    "parsed_text": repaired_text,
+                },
+            )
+            raise
+        return _format_gemba_structured_errors(structured_errors)
 
     def _call_openai_compatible_api(
         self,
@@ -2424,13 +2779,18 @@ class OpenAICompatibleESAScorer:
                             enable_thinking=enable_thinking,
                         ),
                     )
+                    parsed_error_text = self._repair_esa_output_if_needed(
+                        sample=sample,
+                        raw_text=raw_error_text,
+                        enable_thinking=enable_thinking,
+                    )
                     raw_score_text = self._call_openai_compatible_api(
                         build_gemba_esa_ranking_messages(
                             source_lang=source_lang,
                             target_lang=target_lang,
                             source_seg=sample.src,
                             target_seg=sample.mt,
-                            error_spans=raw_error_text,
+                            error_spans=parsed_error_text,
                         ),
                         max_tokens=int(self.cfg.max_tokens_score),
                         chat_template_kwargs_override=_override_enable_thinking(
@@ -2449,13 +2809,13 @@ class OpenAICompatibleESAScorer:
                             stage="score_parse_failed",
                             error="GEMBA-ESA score parse returned None.",
                             details={
-                                "raw_error_text": raw_error_text,
+                                "raw_error_text": parsed_error_text,
                                 "raw_score_text": raw_score_text,
                             },
                         )
                         raise GembaParseError("GEMBA-ESA score parse returned None.")
                     scaled = self._scale_score(float(raw_score))
-                    return float(scaled), raw_error_text, raw_score_text
+                    return float(scaled), parsed_error_text, raw_score_text
                 except Exception as exc:
                     last_exc = exc
                     continue
@@ -2463,6 +2823,55 @@ class OpenAICompatibleESAScorer:
         if last_exc is None:
             raise RuntimeError("ESA API scoring failed without an exception.")
         raise last_exc
+
+    def _repair_esa_output_if_needed(self, *, sample: SampleForScoring, raw_text: str, enable_thinking: bool) -> str:
+        try:
+            structured_errors = gemba_esa_parse_structured_errors(raw_text)
+        except Exception as exc:
+            structured_errors = None
+            error_text = str(exc)
+        else:
+            return _format_gemba_structured_errors(structured_errors)
+        _record_scorer_parse_failure(
+            log_path=self._parse_failure_log_path,
+            scorer_name="esa",
+            model_name=self.cfg.model_name,
+            sample=sample,
+            enable_thinking=enable_thinking,
+            stage="raw_error_output_parse_failed",
+            error=error_text,
+            details={"raw_error_text": raw_text},
+        )
+        repaired_text = self._call_openai_compatible_api(
+            build_gemba_esa_repair_messages(
+                source_seg=sample.src,
+                target_seg=sample.mt,
+                raw_output=raw_text,
+            ),
+            max_tokens=min(1024, max(256, int(self.cfg.max_tokens_error_spans))),
+            chat_template_kwargs_override=_override_enable_thinking(
+                self.cfg.chat_template_kwargs,
+                enable_thinking=enable_thinking,
+            ),
+        )
+        try:
+            structured_errors = gemba_esa_parse_structured_errors(repaired_text)
+        except Exception as exc:
+            _record_scorer_parse_failure(
+                log_path=self._parse_failure_log_path,
+                scorer_name="esa",
+                model_name=self.cfg.model_name,
+                sample=sample,
+                enable_thinking=enable_thinking,
+                stage="repair_output_parse_failed",
+                error=str(exc),
+                details={
+                    "raw_error_text": raw_text,
+                    "parsed_error_text": repaired_text,
+                },
+            )
+            raise
+        return _format_gemba_structured_errors(structured_errors)
 
     def _call_openai_compatible_api(
         self,

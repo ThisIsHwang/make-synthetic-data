@@ -373,3 +373,53 @@ def test_colocated_reference_requires_lora(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="model.reference_runtime=colocate requires model.lora.enabled=true"):
         _ = load_config(cfg_path)
+
+
+def test_mqm_failure_policy_must_be_supported(tmp_path: Path) -> None:
+    cfg_path = tmp_path / "train.yaml"
+    cfg_path.write_text(
+        "\n".join(
+            [
+                "data:",
+                "  hf_dataset_name: dummy/dataset",
+                "reward:",
+                "  xcomet:",
+                "    enabled: false",
+                "  mqm:",
+                "    enabled: false",
+                "    failure_policy: nope",
+                "  esa:",
+                "    enabled: false",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="reward.mqm.failure_policy must be neutral_zero\\|worst_score\\|raise"):
+        _ = load_config(cfg_path)
+
+
+def test_mqm_failure_seq_penalty_must_be_finite(tmp_path: Path) -> None:
+    cfg_path = tmp_path / "train.yaml"
+    cfg_path.write_text(
+        "\n".join(
+            [
+                "data:",
+                "  hf_dataset_name: dummy/dataset",
+                "reward:",
+                "  xcomet:",
+                "    enabled: false",
+                "  mqm:",
+                "    enabled: false",
+                "    failure_seq_penalty: .inf",
+                "  esa:",
+                "    enabled: false",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="reward.mqm.failure_seq_penalty must be finite"):
+        _ = load_config(cfg_path)

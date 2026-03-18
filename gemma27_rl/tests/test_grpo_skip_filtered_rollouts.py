@@ -68,6 +68,21 @@ class _MQMSkipAllScorer:
         )
 
 
+class _MQMFailureSecondScorer:
+    cfg = SimpleNamespace(use_reference=False)
+
+    def score_batch(self, samples):  # type: ignore[no-untyped-def]
+        assert len(samples) == 2
+        return RewardOutput(
+            sequence_scores=[0.0, 0.0],
+            metadata={
+                "error_spans": [[], []],
+                "skipped_rows": [False, False],
+                "failure_rows": [False, True],
+            },
+        )
+
+
 class _ESASkipSecondScorer:
     cfg = SimpleNamespace(use_reference=False)
 
@@ -146,6 +161,35 @@ def test_prepare_rewards_and_advantages_keeps_rollouts_when_all_mqm_rows_report_
     assert reward_stats["mqm_skipped_count"] == 2.0
     assert reward_stats["grpo_dropped_rollouts_count"] == 0.0
     assert adv_stats["raw_mean"] == pytest.approx(0.0)
+
+
+def test_prepare_rewards_and_advantages_applies_mqm_failure_seq_penalty() -> None:
+    cfg = _base_cfg()
+    cfg.reward.w_mqm_seq = 1.0
+    cfg.reward.mqm.failure_seq_penalty = -2.0
+    cfg.rl.group_normalize = False
+    cfg.rl.normalize_advantage = False
+
+    filtered_rollouts, advantages, reward_stats, adv_stats = _prepare_rewards_and_advantages(
+        rollouts=_make_rollouts(),
+        cfg=cfg,
+        metricx_scorer=None,
+        xcomet_scorer=None,
+        mqm_scorer=_MQMFailureSecondScorer(),  # type: ignore[arg-type]
+        esa_scorer=None,
+        metricx_cache={},
+        xcomet_cache={},
+        mqm_cache={},
+        esa_cache={},
+        tokenizer=None,
+    )
+
+    assert [rollout.example_id for rollout in filtered_rollouts] == ["ex-0", "ex-1"]
+    assert advantages == [[0.0, 0.0], [-2.0, -2.0]]
+    assert reward_stats["mqm_failure_count"] == 1.0
+    assert reward_stats["mqm_failure_penalty_total"] == -2.0
+    assert reward_stats["mqm_failure_penalty_mean"] == -1.0
+    assert adv_stats["raw_mean"] == pytest.approx(-1.0)
 
 
 def test_prepare_rewards_and_advantages_drops_skipped_esa_rollouts() -> None:

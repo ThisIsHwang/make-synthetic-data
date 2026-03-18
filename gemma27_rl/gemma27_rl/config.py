@@ -184,6 +184,8 @@ class MQMConfig:
     score_max: float = 0.0
     scale_to_unit_interval: bool = False
     error_policy: str = "raise"  # raise|zero
+    failure_policy: str = "neutral_zero"  # neutral_zero|worst_score|raise
+    failure_seq_penalty: float = 0.0
 
 
 @dataclass
@@ -648,6 +650,14 @@ def _validate_config(cfg: RLPostTrainConfig) -> None:
         raise ValueError("At least one reward model must be enabled.")
     if cfg.reward.mqm.error_policy not in {"raise", "zero"}:
         raise ValueError("reward.mqm.error_policy must be raise|zero")
+    if cfg.reward.mqm.failure_policy not in {"neutral_zero", "worst_score", "raise"}:
+        raise ValueError("reward.mqm.failure_policy must be neutral_zero|worst_score|raise")
+    try:
+        mqm_failure_seq_penalty = float(cfg.reward.mqm.failure_seq_penalty)
+    except Exception as exc:
+        raise ValueError("reward.mqm.failure_seq_penalty must be a float.") from exc
+    if not math.isfinite(mqm_failure_seq_penalty):
+        raise ValueError("reward.mqm.failure_seq_penalty must be finite.")
     if cfg.reward.esa.error_policy not in {"raise", "zero"}:
         raise ValueError("reward.esa.error_policy must be raise|zero")
     if cfg.reward.mqm.enabled:

@@ -21,16 +21,26 @@ from gemma27_rl.rewards import (
 from gemma27_rl.rl_types import SampleForScoring
 
 
+def _esa_json_errors(errors: list[dict[str, object]]) -> str:
+    return json.dumps({"errors": errors}, ensure_ascii=False, indent=2)
+
+
+def _esa_json_score(score: float) -> str:
+    return json.dumps({"score": score}, ensure_ascii=False)
+
+
 def test_gemba_esa_parse_and_score() -> None:
-    raw = """Major:
-accuracy/mistranslation - \"x\"
-Minor:
-fluency/grammar - \"y\"
-"""
+    raw = _esa_json_errors(
+        [
+            {"severity": "major", "type": "accuracy/mistranslation", "target_span": "x", "source_span": None, "confidence": 0.96},
+            {"severity": "minor", "type": "fluency/grammar", "target_span": "y", "source_span": None, "confidence": 0.84},
+        ]
+    )
     parsed = gemba_esa_parse_errors(raw)
     assert len(parsed["major"]) == 1
     assert len(parsed["minor"]) == 1
-    assert "Major:" in gemba_esa_format_error_spans(raw)
+    assert json.loads(gemba_esa_format_error_spans(raw))["errors"][0]["type"] == "accuracy/mistranslation"
+    assert gemba_esa_parse_score(_esa_json_score(83)) == 83.0
     assert gemba_esa_parse_score("Score (0-100): 83") == 83.0
     assert gemba_esa_parse_score("The quality is 82/100 overall.") == 82.0
     assert gemba_esa_parse_score("**Score: 81 out of 100**") == 81.0
@@ -57,6 +67,24 @@ def test_gemba_esa_build_messages_without_fewshot() -> None:
     assert messages[-1]["role"] == "user"
     assert "hello" in messages[-1]["content"]
     assert "안녕" in messages[-1]["content"]
+    assert '"errors"' in messages[-1]["content"]
+    assert "confidence" in messages[-1]["content"]
+
+
+def test_gemba_esa_build_messages_fewshot_outputs_json() -> None:
+    messages = build_gemba_esa_error_messages(
+        source_lang="English",
+        target_lang="Korean",
+        source_seg="hello",
+        target_seg="안녕",
+        use_fewshot=True,
+    )
+
+    assistant_contents = [message["content"] for message in messages if message["role"] == "assistant"]
+    assert assistant_contents
+    assert assistant_contents[0].lstrip().startswith("{")
+    assert '"errors"' in assistant_contents[0]
+    assert "confidence" in assistant_contents[0]
 
 
 def test_openai_esa_predict_fn_path() -> None:
@@ -88,8 +116,18 @@ def test_openai_esa_uses_sample_language_pair(monkeypatch: pytest.MonkeyPatch) -
     def _fake_call(messages, max_tokens, chat_template_kwargs_override=None):
         captured.append(messages[-1]["content"])
         if len(captured) == 1:
-            return 'Major:\naccuracy/mistranslation - "hello"'
-        return "81"
+            return _esa_json_errors(
+                [
+                    {
+                        "severity": "major",
+                        "type": "accuracy/mistranslation",
+                        "target_span": "hello",
+                        "source_span": None,
+                        "confidence": 0.95,
+                    }
+                ]
+            )
+        return _esa_json_score(81)
 
     monkeypatch.setattr(scorer, "_call_openai_compatible_api", _fake_call)
 
@@ -143,7 +181,7 @@ def test_openai_esa_request_omits_reasoning_parser(monkeypatch: pytest.MonkeyPat
             return None
 
         def read(self) -> bytes:
-            return json.dumps({"choices": [{"message": {"content": "Score (0-100): 83"}}]}).encode("utf-8")
+            return json.dumps({"choices": [{"message": {"content": _esa_json_score(83)}}]}).encode("utf-8")
 
     class _FakeOpener:
         def open(self, req, timeout=None):
@@ -167,7 +205,7 @@ def test_openai_esa_request_omits_reasoning_parser(monkeypatch: pytest.MonkeyPat
         chat_template_kwargs_override={"enable_thinking": True},
     )
 
-    assert raw == "Score (0-100): 83"
+    assert raw == _esa_json_score(83)
     assert captured["timeout"] == 120.0
     assert "reasoning_parser" not in captured["payload"]
     assert captured["payload"]["chat_template_kwargs"] == {"enable_thinking": True}
@@ -188,7 +226,7 @@ def test_openai_esa_accepts_message_content_text_parts(monkeypatch: pytest.Monke
                         {
                             "message": {
                                 "content": [
-                                    {"type": "text", "text": "Score (0-100): 83"},
+                                    {"type": "text", "text": _esa_json_score(83)},
                                 ]
                             }
                         }
@@ -215,7 +253,7 @@ def test_openai_esa_accepts_message_content_text_parts(monkeypatch: pytest.Monke
         chat_template_kwargs_override={"enable_thinking": True},
     )
 
-    assert raw == "Score (0-100): 83"
+    assert raw == _esa_json_score(83)
 
 
 def test_openai_esa_score_batch_refills_inflight_window(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -319,7 +357,8 @@ def test_openai_esa_retries_until_score_is_parseable(monkeypatch: pytest.MonkeyP
         )
     )
     sample = SampleForScoring(src="hello", mt="안녕", ref=None)
-    calls = iter(["Looks okay overall.", "still bad", "Looks okay overall.", "Score (0-100): 83"])
+    normalized_empty_errors = _esa_json_errors([])
+    calls = iter([normalized_empty_errors, "still bad", normalized_empty_errors, _esa_json_score(83)])
     call_count = {"n": 0}
 
     def _fake_call(messages, max_tokens, chat_template_kwargs_override=None):
@@ -332,11 +371,11 @@ def test_openai_esa_retries_until_score_is_parseable(monkeypatch: pytest.MonkeyP
 
     assert call_count["n"] == 4
     assert score == 83.0
-    assert raw_error_text == "Looks okay overall."
-    assert raw_score_text == "Score (0-100): 83"
+    assert raw_error_text == normalized_empty_errors
+    assert raw_score_text == _esa_json_score(83)
 
 
-def test_openai_esa_parse_failures_do_not_fallback_to_zero(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_openai_esa_error_output_failures_do_not_fallback_to_zero(monkeypatch: pytest.MonkeyPatch) -> None:
     scorer = OpenAICompatibleESAScorer(
         cfg=ESAConfig(
             enabled=True,
@@ -351,7 +390,7 @@ def test_openai_esa_parse_failures_do_not_fallback_to_zero(monkeypatch: pytest.M
         lambda messages, max_tokens, chat_template_kwargs_override=None: "Looks okay overall.",
     )
 
-    with pytest.raises(GembaParseError, match="score parse returned None"):
+    with pytest.raises(GembaParseError, match="errors field|unparseable"):
         scorer._score_one_sample(SampleForScoring(src="hello", mt="안녕", ref=None))
 
 
@@ -369,7 +408,17 @@ def test_openai_esa_parse_failures_are_recorded_to_jsonl(tmp_path: Path, monkeyp
 
     calls = iter(
         [
-            'Major:\naccuracy/mistranslation - "안녕"',
+            _esa_json_errors(
+                [
+                    {
+                        "severity": "major",
+                        "type": "accuracy/mistranslation",
+                        "target_span": "안녕",
+                        "source_span": None,
+                        "confidence": 0.95,
+                    }
+                ]
+            ),
             "안녕하세요, 이건 점수 형식이 아닙니다.",
         ]
     )
@@ -386,7 +435,17 @@ def test_openai_esa_parse_failures_are_recorded_to_jsonl(tmp_path: Path, monkeyp
     assert len(rows) == 1
     assert rows[0]["scorer"] == "esa"
     assert rows[0]["stage"] == "score_parse_failed"
-    assert rows[0]["raw_error_text"] == 'Major:\naccuracy/mistranslation - "안녕"'
+    assert rows[0]["raw_error_text"] == _esa_json_errors(
+        [
+            {
+                "severity": "major",
+                "type": "accuracy/mistranslation",
+                "target_span": "안녕",
+                "source_span": None,
+                "confidence": 0.95,
+            }
+        ]
+    )
     assert rows[0]["raw_score_text"] == "안녕하세요, 이건 점수 형식이 아닙니다."
     assert rows[0]["mt"] == "안녕"
 
@@ -400,12 +459,13 @@ def test_openai_esa_ignores_unparseable_error_annotations_and_retries_score(monk
         )
     )
     sample = SampleForScoring(src="hello", mt="안녕", ref=None)
+    normalized_empty_errors = _esa_json_errors([])
     responses = iter(
         [
-            "There seems to be one major issue around 안녕.",
+            normalized_empty_errors,
             "I would give this translation a fairly strong result overall.",
-            "There seems to be one major issue around 안녕.",
-            "81",
+            normalized_empty_errors,
+            _esa_json_score(81),
         ]
     )
     captured: list[str] = []
@@ -420,8 +480,8 @@ def test_openai_esa_ignores_unparseable_error_annotations_and_retries_score(monk
 
     assert len(captured) == 4
     assert score == 81.0
-    assert raw_error_text == "There seems to be one major issue around 안녕."
-    assert raw_score_text == "81"
+    assert raw_error_text == normalized_empty_errors
+    assert raw_score_text == _esa_json_score(81)
 
 
 def test_openai_esa_enables_thinking_after_first_failed_attempt(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -439,13 +499,13 @@ def test_openai_esa_enables_thinking_after_first_failed_attempt(monkeypatch: pyt
         call_count["n"] += 1
         seen_thinking.append(bool((chat_template_kwargs_override or {}).get("enable_thinking")))
         if call_count["n"] == 1:
-            return "annotation"
+            return _esa_json_errors([])
         if call_count["n"] == 2:
             return "bad"
         if call_count["n"] == 3:
-            return "annotation"
+            return _esa_json_errors([])
         if call_count["n"] == 4:
-            return "81"
+            return _esa_json_score(81)
         raise AssertionError(f"unexpected call count: {call_count['n']}")
 
     monkeypatch.setattr(scorer, "_call_openai_compatible_api", _fake_call)
@@ -469,7 +529,7 @@ def test_openai_esa_starts_with_thinking_when_configured(monkeypatch: pytest.Mon
 
     def _fake_call(messages, max_tokens, chat_template_kwargs_override=None):
         seen_thinking.append(bool((chat_template_kwargs_override or {}).get("enable_thinking")))
-        return "annotation" if len(seen_thinking) == 1 else "81"
+        return _esa_json_errors([]) if len(seen_thinking) == 1 else _esa_json_score(81)
 
     monkeypatch.setattr(scorer, "_call_openai_compatible_api", _fake_call)
 
