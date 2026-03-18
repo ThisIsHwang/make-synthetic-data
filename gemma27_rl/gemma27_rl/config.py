@@ -4,6 +4,7 @@ from dataclasses import asdict, dataclass, field
 import math
 import os
 from pathlib import Path
+import re
 from typing import Any
 
 from .prompting import DEFAULT_TRANSLATION_PROMPT_TEMPLATE
@@ -253,6 +254,22 @@ class RewardConfig:
     use_confidence: bool = False
     span_combine_policy: str = "sum"  # sum|min|max
     cache_enabled: bool = True
+    assistant_fallback_guard_enabled: bool = False
+    assistant_fallback_patterns: list[str] = field(
+        default_factory=lambda: [
+            r"(?i)^please provide .*translated",
+            r"(?i)^please provide the .* text",
+            r"(?i)^i need more context",
+            r"(?i)^could you provide",
+            r"(?i)^as an ai",
+        ]
+    )
+    assistant_fallback_seq_penalty: float = 0.0
+    assistant_fallback_token_penalty: float = 0.0
+    script_mismatch_guard_enabled: bool = False
+    script_mismatch_seq_penalty: float = 0.0
+    script_mismatch_min_letters: int = 6
+    script_mismatch_ratio_threshold: float = 0.35
 
     metricx: MetricXConfig = field(default_factory=MetricXConfig)
     xcomet: XCometConfig = field(default_factory=XCometConfig)
@@ -624,6 +641,37 @@ def _validate_config(cfg: RLPostTrainConfig) -> None:
         raise ValueError("reward.overlap_policy must be any_overlap or majority_overlap")
     if cfg.reward.span_combine_policy not in {"sum", "min", "max"}:
         raise ValueError("reward.span_combine_policy must be sum|min|max")
+    if not isinstance(cfg.reward.assistant_fallback_guard_enabled, bool):
+        raise ValueError("reward.assistant_fallback_guard_enabled must be a bool")
+    if not isinstance(cfg.reward.assistant_fallback_patterns, list):
+        raise ValueError("reward.assistant_fallback_patterns must be a list[str]")
+    for idx, pattern in enumerate(cfg.reward.assistant_fallback_patterns):
+        if not isinstance(pattern, str):
+            raise ValueError(f"reward.assistant_fallback_patterns[{idx}] must be a string")
+        try:
+            re.compile(pattern)
+        except re.error as exc:
+            raise ValueError(
+                f"reward.assistant_fallback_patterns[{idx}] is not a valid regex: {pattern!r}"
+            ) from exc
+    if not isinstance(cfg.reward.script_mismatch_guard_enabled, bool):
+        raise ValueError("reward.script_mismatch_guard_enabled must be a bool")
+    for field_name, raw in (
+        ("reward.assistant_fallback_seq_penalty", cfg.reward.assistant_fallback_seq_penalty),
+        ("reward.assistant_fallback_token_penalty", cfg.reward.assistant_fallback_token_penalty),
+        ("reward.script_mismatch_seq_penalty", cfg.reward.script_mismatch_seq_penalty),
+    ):
+        try:
+            value = float(raw)
+        except Exception as exc:
+            raise ValueError(f"{field_name} must be a float.") from exc
+        if not math.isfinite(value):
+            raise ValueError(f"{field_name} must be finite.")
+    if int(cfg.reward.script_mismatch_min_letters) < 1:
+        raise ValueError("reward.script_mismatch_min_letters must be >= 1")
+    ratio_threshold = float(cfg.reward.script_mismatch_ratio_threshold)
+    if not (0.0 < ratio_threshold < 1.0):
+        raise ValueError("reward.script_mismatch_ratio_threshold must be in (0, 1)")
     if not isinstance(cfg.reward.mqm_token_type_weights, dict):
         raise ValueError("reward.mqm_token_type_weights must be a dict")
     for raw_key, raw_value in cfg.reward.mqm_token_type_weights.items():

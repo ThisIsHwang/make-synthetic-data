@@ -10,6 +10,7 @@ import math
 import os
 from pathlib import Path
 import random
+import re
 import select
 import shutil
 import socket
@@ -248,6 +249,156 @@ def _apply_forbidden_think_tag_penalty(
 
     adjusted_seq_reward = float(seq_reward) + (float(seq_penalty_per_match) * float(len(matches)))
     return token_rewards, adjusted_seq_reward, len(matches), len(token_hits)
+
+
+def _find_assistant_fallback_spans(text: str, patterns: list[str]) -> list[tuple[int, int, str]]:
+    if not text or not patterns:
+        return []
+
+    matches: list[tuple[int, int, str]] = []
+    for pattern in patterns:
+        pattern_text = str(pattern or "")
+        if not pattern_text:
+            continue
+        try:
+            iterator = re.finditer(pattern_text, text)
+        except re.error:
+            continue
+        for match in iterator:
+            start, end = match.span()
+            if end <= start:
+                continue
+            matches.append((int(start), int(end), pattern_text))
+
+    if not matches:
+        return []
+
+    matches.sort(key=lambda row: (row[0], -(row[1] - row[0]), row[2]))
+    deduped: list[tuple[int, int, str]] = []
+    last_end = -1
+    seen_spans: set[tuple[int, int]] = set()
+    for start, end, pattern in matches:
+        span_key = (int(start), int(end))
+        if span_key in seen_spans:
+            continue
+        if start < last_end:
+            continue
+        deduped.append((int(start), int(end), pattern))
+        seen_spans.add(span_key)
+        last_end = int(end)
+    return deduped
+
+
+def _apply_assistant_fallback_penalty(
+    *,
+    completion_text: str,
+    token_char_offsets: list[tuple[int, int]],
+    token_rewards: list[float],
+    seq_reward: float,
+    patterns: list[str],
+    token_penalty: float,
+    seq_penalty_per_match: float,
+) -> tuple[list[float], float, int, int]:
+    matches = _find_assistant_fallback_spans(completion_text, patterns)
+    if not matches:
+        return token_rewards, float(seq_reward), 0, 0
+
+    token_hits: set[int] = set()
+    max_tokens = min(len(token_rewards), len(token_char_offsets))
+    for start, end, _ in matches:
+        for tok_idx in range(max_tokens):
+            tok_s, tok_e = token_char_offsets[tok_idx]
+            if _span_overlap_chars(start, end, tok_s, tok_e) <= 0:
+                continue
+            token_rewards[tok_idx] += float(token_penalty)
+            token_hits.add(tok_idx)
+
+    adjusted_seq_reward = float(seq_reward) + (float(seq_penalty_per_match) * float(len(matches)))
+    return token_rewards, adjusted_seq_reward, len(matches), len(token_hits)
+
+
+def _is_hangul_letter(char: str) -> bool:
+    if not char:
+        return False
+    codepoint = ord(char)
+    return (
+        0x1100 <= codepoint <= 0x11FF
+        or 0x3130 <= codepoint <= 0x318F
+        or 0xA960 <= codepoint <= 0xA97F
+        or 0xAC00 <= codepoint <= 0xD7A3
+        or 0xD7B0 <= codepoint <= 0xD7FF
+    )
+
+
+def _normalize_target_language_key(target_lang: str | None, target_lang_code: str | None) -> str | None:
+    code_text = str(target_lang_code or "").strip().lower()
+    if code_text:
+        primary_code = code_text.replace("_", "-").split("-", 1)[0]
+        if primary_code == "en":
+            return "english"
+        if primary_code == "ko":
+            return "korean"
+
+    lang_text = str(target_lang or "").strip().lower()
+    if lang_text in {"english", "en"}:
+        return "english"
+    if lang_text in {"korean", "ko"}:
+        return "korean"
+    return None
+
+
+def _detect_script_mismatch(
+    *,
+    text: str,
+    target_lang: str | None,
+    target_lang_code: str | None,
+    min_letters: int,
+    ratio_threshold: float,
+) -> bool:
+    target_key = _normalize_target_language_key(target_lang, target_lang_code)
+    if target_key is None or not text:
+        return False
+
+    total_letters = 0
+    hangul_letters = 0
+    for char in text:
+        if not char.isalpha():
+            continue
+        total_letters += 1
+        if _is_hangul_letter(char):
+            hangul_letters += 1
+
+    if total_letters < max(1, int(min_letters)):
+        return False
+
+    hangul_ratio = float(hangul_letters) / float(total_letters)
+    if target_key == "english":
+        return hangul_ratio >= float(ratio_threshold)
+    if target_key == "korean":
+        return hangul_ratio < (1.0 - float(ratio_threshold))
+    return False
+
+
+def _apply_script_mismatch_penalty(
+    *,
+    text: str,
+    target_lang: str | None,
+    target_lang_code: str | None,
+    seq_reward: float,
+    seq_penalty: float,
+    min_letters: int,
+    ratio_threshold: float,
+) -> tuple[float, bool]:
+    mismatch = _detect_script_mismatch(
+        text=text,
+        target_lang=target_lang,
+        target_lang_code=target_lang_code,
+        min_letters=min_letters,
+        ratio_threshold=ratio_threshold,
+    )
+    if not mismatch:
+        return float(seq_reward), False
+    return float(seq_reward) + float(seq_penalty), True
 
 
 def _find_repeated_token_positions(
@@ -3710,6 +3861,16 @@ def _prepare_rewards_and_advantages_from_scores(
     special_seq_penalty = -abs(
         _env_float("GEMMA27_RL_SPECIAL_SEQ_PENALTY", default=_DEFAULT_SPECIAL_SEQUENCE_PENALTY)
     )
+    assistant_fallback_enabled = bool(cfg.reward.assistant_fallback_guard_enabled)
+    assistant_fallback_patterns = (
+        list(cfg.reward.assistant_fallback_patterns) if assistant_fallback_enabled else []
+    )
+    assistant_fallback_token_penalty = float(cfg.reward.assistant_fallback_token_penalty)
+    assistant_fallback_seq_penalty = float(cfg.reward.assistant_fallback_seq_penalty)
+    script_mismatch_enabled = bool(cfg.reward.script_mismatch_guard_enabled)
+    script_mismatch_seq_penalty = float(cfg.reward.script_mismatch_seq_penalty)
+    script_mismatch_min_letters = int(cfg.reward.script_mismatch_min_letters)
+    script_mismatch_ratio_threshold = float(cfg.reward.script_mismatch_ratio_threshold)
     debug_span_records: list[tuple[int, Rollout, list[dict[str, Any]], list[float], list[float], float]] = []
 
     metricx_rewards = [metricx_score_to_reward(v, offset=cfg.reward.metricx.offset) for v in metricx_scores]
@@ -3799,6 +3960,11 @@ def _prepare_rewards_and_advantages_from_scores(
     special_token_penalties: list[float] = []
     special_token_id_occurrence_totals: list[float] = []
     special_token_text_occurrence_totals: list[float] = []
+    assistant_fallback_counts: list[float] = []
+    assistant_fallback_token_hits: list[float] = []
+    assistant_fallback_penalties: list[float] = []
+    script_mismatch_counts: list[float] = []
+    script_mismatch_penalties: list[float] = []
     span_special_masked_counts: list[float] = []
     group_scalar_rewards: list[float] = []
     mqm_failure_penalties: list[float] = [failure_seq_penalty if failed else 0.0 for failed in mqm_failure_rows]
@@ -3908,6 +4074,39 @@ def _prepare_rewards_and_advantages_from_scores(
             min_occurrences=ngram_min_occurrences,
         )
         ngram_penalty_delta = (float(sum(token_rewards)) - ngram_sum_before) + (float(seq_reward) - ngram_seq_before)
+        assistant_fallback_sum_before = float(sum(token_rewards))
+        assistant_fallback_seq_before = float(seq_reward)
+        assistant_fallback_count = 0
+        assistant_fallback_token_hit_count = 0
+        if assistant_fallback_enabled and assistant_fallback_patterns:
+            token_rewards, seq_reward, assistant_fallback_count, assistant_fallback_token_hit_count = (
+                _apply_assistant_fallback_penalty(
+                    completion_text=raw_completion_text,
+                    token_char_offsets=rollout.token_char_offsets,
+                    token_rewards=token_rewards,
+                    seq_reward=float(seq_reward),
+                    patterns=assistant_fallback_patterns,
+                    token_penalty=assistant_fallback_token_penalty,
+                    seq_penalty_per_match=assistant_fallback_seq_penalty,
+                )
+            )
+        assistant_fallback_penalty_delta = (
+            (float(sum(token_rewards)) - assistant_fallback_sum_before)
+            + (float(seq_reward) - assistant_fallback_seq_before)
+        )
+        script_mismatch_seq_before = float(seq_reward)
+        script_mismatch_hit = False
+        if script_mismatch_enabled:
+            seq_reward, script_mismatch_hit = _apply_script_mismatch_penalty(
+                text=span_reward_text or raw_completion_text,
+                target_lang=rollout.tgt_lang,
+                target_lang_code=rollout.tgt_lang_code,
+                seq_reward=float(seq_reward),
+                seq_penalty=script_mismatch_seq_penalty,
+                min_letters=script_mismatch_min_letters,
+                ratio_threshold=script_mismatch_ratio_threshold,
+            )
+        script_mismatch_penalty_delta = float(seq_reward) - script_mismatch_seq_before
         group_scalar_rewards.append(float(seq_reward))
         seq_row = broadcast_sequence_reward(seq_reward, token_count=len(token_rewards))
         raw_adv = combine_advantages(seq_row, token_rewards)
@@ -3928,6 +4127,11 @@ def _prepare_rewards_and_advantages_from_scores(
         special_token_penalties.append(float(special_penalty_delta))
         special_token_id_occurrence_totals.append(float(special_id_occurrences))
         special_token_text_occurrence_totals.append(float(special_text_occurrences))
+        assistant_fallback_counts.append(float(assistant_fallback_count))
+        assistant_fallback_token_hits.append(float(assistant_fallback_token_hit_count))
+        assistant_fallback_penalties.append(float(assistant_fallback_penalty_delta))
+        script_mismatch_counts.append(1.0 if script_mismatch_hit else 0.0)
+        script_mismatch_penalties.append(float(script_mismatch_penalty_delta))
         span_special_masked_counts.append(float(span_special_masked))
         if debug_span_loss and len(debug_span_records) < debug_span_max_rollouts:
             debug_span_records.append(
@@ -3998,6 +4202,25 @@ def _prepare_rewards_and_advantages_from_scores(
                 limit=12,
             ),
             _format_top_special_text_counts(special_token_text_occurrence_counts, limit=12),
+        )
+    total_assistant_fallback_matches = int(sum(assistant_fallback_counts))
+    if total_assistant_fallback_matches > 0:
+        logger.info(
+            "assistant fallback penalty applied: matches=%s token_hits=%s token_penalty=%.2f seq_penalty=%.2f patterns=%s",
+            total_assistant_fallback_matches,
+            int(sum(assistant_fallback_token_hits)),
+            float(assistant_fallback_token_penalty),
+            float(assistant_fallback_seq_penalty),
+            len(assistant_fallback_patterns),
+        )
+    total_script_mismatches = int(sum(script_mismatch_counts))
+    if total_script_mismatches > 0:
+        logger.info(
+            "script mismatch penalty applied: mismatches=%s seq_penalty=%.2f min_letters=%s ratio_threshold=%.2f",
+            total_script_mismatches,
+            float(script_mismatch_seq_penalty),
+            int(script_mismatch_min_letters),
+            float(script_mismatch_ratio_threshold),
         )
     if sanitized_target_rows > 0:
         logger.info(
@@ -4133,6 +4356,24 @@ def _prepare_rewards_and_advantages_from_scores(
             mean(special_token_text_occurrence_totals) if special_token_text_occurrence_totals else 0.0
         ),
         "special_token_text_occurrence_count_total": float(sum(special_token_text_occurrence_totals)),
+        "assistant_fallback_count_mean": float(
+            mean(assistant_fallback_counts) if assistant_fallback_counts else 0.0
+        ),
+        "assistant_fallback_count_total": float(sum(assistant_fallback_counts)),
+        "assistant_fallback_token_hit_mean": float(
+            mean(assistant_fallback_token_hits) if assistant_fallback_token_hits else 0.0
+        ),
+        "assistant_fallback_token_hit_total": float(sum(assistant_fallback_token_hits)),
+        "assistant_fallback_penalty_mean": float(
+            mean(assistant_fallback_penalties) if assistant_fallback_penalties else 0.0
+        ),
+        "assistant_fallback_penalty_total": float(sum(assistant_fallback_penalties)),
+        "script_mismatch_count_mean": float(mean(script_mismatch_counts) if script_mismatch_counts else 0.0),
+        "script_mismatch_count_total": float(sum(script_mismatch_counts)),
+        "script_mismatch_penalty_mean": float(
+            mean(script_mismatch_penalties) if script_mismatch_penalties else 0.0
+        ),
+        "script_mismatch_penalty_total": float(sum(script_mismatch_penalties)),
         "span_special_masked_token_count_mean": float(
             mean(span_special_masked_counts) if span_special_masked_counts else 0.0
         ),
