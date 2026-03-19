@@ -526,3 +526,65 @@ def test_mqm_unanchored_allowed_types_must_not_be_empty(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="reward.mqm_unanchored_allowed_types\\[0\\] must be a non-empty string"):
         _ = load_config(cfg_path)
+
+
+def test_load_config_allows_group_rank_only_reward(tmp_path: Path) -> None:
+    cfg_path = tmp_path / "group_rank_only.yaml"
+    cfg_path.write_text(
+        "\n".join(
+            [
+                "data:",
+                "  hf_dataset_name: dummy/dataset",
+                "reward:",
+                "  metricx:",
+                "    enabled: false",
+                "  xcomet:",
+                "    enabled: false",
+                "  mqm:",
+                "    enabled: false",
+                "  esa:",
+                "    enabled: false",
+                "  group_rank:",
+                "    enabled: true",
+                "    base_url: http://localhost:8000",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    cfg = load_config(cfg_path)
+    assert cfg.reward.group_rank.enabled is True
+    assert cfg.reward.group_rank.base_url == "http://localhost:8000"
+
+
+def test_group_rank_candidate_max_must_cover_num_samples_per_prompt(tmp_path: Path) -> None:
+    cfg_path = tmp_path / "group_rank_invalid.yaml"
+    cfg_path.write_text(
+        "\n".join(
+            [
+                "data:",
+                "  hf_dataset_name: dummy/dataset",
+                "generation:",
+                "  num_samples_per_prompt: 5",
+                "reward:",
+                "  metricx:",
+                "    enabled: false",
+                "  xcomet:",
+                "    enabled: false",
+                "  mqm:",
+                "    enabled: false",
+                "  esa:",
+                "    enabled: false",
+                "  group_rank:",
+                "    enabled: true",
+                "    base_url: http://localhost:8000",
+                "    candidate_max: 4",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="generation.num_samples_per_prompt must be <= reward.group_rank.candidate_max"):
+        _ = load_config(cfg_path)

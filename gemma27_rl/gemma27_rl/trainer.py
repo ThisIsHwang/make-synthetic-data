@@ -55,6 +55,7 @@ from .prompting import (
 )
 from .rewards import (
     _compute_mqm_unanchored_seq_penalty,
+    OpenAICompatibleGroupRankScorer,
     OpenAICompatibleESAScorer,
     OpenAICompatibleMQMScorer,
     MetricXQEScorer,
@@ -63,7 +64,7 @@ from .rewards import (
     spans_to_token_rewards,
 )
 from .rollout import compute_completion_logprobs, compute_completion_logprobs_batch, generate_rollouts
-from .rl_types import Example, Rollout, SampleForScoring
+from .rl_types import Example, GroupRankSample, Rollout, SampleForScoring
 from .utils import (
     build_worker_launch_command,
     collect_huggingface_worker_env,
@@ -3116,6 +3117,7 @@ def _prepare_training_batch_rollouts_and_advantages(
     xcomet_scorer: XCometXLScorer | None,
     mqm_scorer: OpenAICompatibleMQMScorer | None,
     esa_scorer: OpenAICompatibleESAScorer | None,
+    group_rank_scorer: OpenAICompatibleGroupRankScorer | None,
     metricx_cache: dict[tuple[str, str, str], float],
     xcomet_cache: dict[tuple[str, str, str], tuple[float, list[dict[str, Any]]]],
     mqm_cache: dict[tuple[str, str, str, str, str], tuple[float, list[dict[str, Any]], list[dict[str, Any]]]],
@@ -3162,6 +3164,7 @@ def _prepare_training_batch_rollouts_and_advantages(
             xcomet_scorer=xcomet_scorer,
             mqm_scorer=mqm_scorer,
             esa_scorer=esa_scorer,
+            group_rank_scorer=group_rank_scorer,
             metricx_cache=metricx_cache,
             xcomet_cache=xcomet_cache,
             mqm_cache=mqm_cache,
@@ -3238,6 +3241,7 @@ def _prepare_training_batch_rollouts_and_advantages(
     return _prepare_rewards_and_advantages_from_scores(
         scored_batch=_merge_reward_scoring_batches(scored_batches),
         cfg=cfg,
+        group_rank_scorer=group_rank_scorer,
         tokenizer=tokenizer,
     )
 
@@ -3274,6 +3278,109 @@ def _resolve_group_ids_for_rollouts(
     # prompt_instance_id yet: infer prompt-instance groups by rollout ordering.
     group_size = max(1, int(num_samples_per_prompt))
     return [f"fallback_prompt_instance:{idx // group_size}" for idx in range(len(rollouts))]
+
+
+def _score_group_rank_rollouts(
+    *,
+    rollouts: list[Rollout],
+    span_reward_texts: list[str],
+    cfg: RLPostTrainConfig,
+    group_rank_scorer: OpenAICompatibleGroupRankScorer | None,
+) -> tuple[list[float], dict[str, float]]:
+    if not rollouts or not cfg.reward.group_rank.enabled or group_rank_scorer is None:
+        return [0.0 for _ in rollouts], {}
+
+    group_ids = _resolve_group_ids_for_rollouts(
+        rollouts,
+        num_samples_per_prompt=int(getattr(cfg.generation, "num_samples_per_prompt", 1) or 1),
+    )
+    group_order: list[str] = []
+    group_indices: dict[str, list[int]] = {}
+    for idx, group_id in enumerate(group_ids):
+        if group_id not in group_indices:
+            group_indices[group_id] = []
+            group_order.append(group_id)
+        group_indices[group_id].append(idx)
+
+    group_samples: list[GroupRankSample] = []
+    for group_id in group_order:
+        indices = group_indices[group_id]
+        first_rollout = rollouts[indices[0]]
+        group_samples.append(
+            GroupRankSample(
+                group_id=group_id,
+                src=first_rollout.src_text,
+                candidates=[
+                    span_reward_texts[idx] if idx < len(span_reward_texts) else str(rollouts[idx].completion_text or "")
+                    for idx in indices
+                ],
+                ref=first_rollout.ref_text if cfg.reward.group_rank.use_reference else None,
+                source_lang=first_rollout.src_lang,
+                target_lang=first_rollout.tgt_lang,
+            )
+        )
+
+    result = group_rank_scorer.score_groups(group_samples)
+    reward_rows = list(result.get("candidate_reward_rows", []))
+    meta_rows = list(result.get("meta_rows", []))
+    skipped_rows = [bool(v) for v in list(result.get("skipped_rows", []))]
+    critical_candidate_rows = list(result.get("critical_candidate_rows", []))
+    if len(reward_rows) != len(group_samples):
+        raise RuntimeError(
+            "group rank scorer returned mismatched candidate_reward_rows length: "
+            f"requested={len(group_samples)} returned={len(reward_rows)}"
+        )
+
+    flat_scores = [0.0 for _ in rollouts]
+    for group_idx, group_id in enumerate(group_order):
+        indices = group_indices[group_id]
+        reward_row = list(reward_rows[group_idx])
+        if len(reward_row) != len(indices):
+            raise RuntimeError(
+                "group rank scorer returned mismatched candidate_reward_rows width: "
+                f"group_id={group_id} requested={len(indices)} returned={len(reward_row)}"
+            )
+        for rollout_idx, reward in zip(indices, reward_row):
+            flat_scores[rollout_idx] = float(reward)
+
+    reward_mean, reward_std = _mean_std(flat_scores)
+    unique_candidate_counts = [
+        float(meta.get("unique_candidate_count", 0.0)) for meta in meta_rows if isinstance(meta, dict)
+    ]
+    duplicate_group_count = sum(
+        1 for meta in meta_rows if isinstance(meta, dict) and bool(meta.get("had_duplicates"))
+    )
+    duplicate_candidate_count_total = sum(
+        float(meta.get("duplicate_candidate_count", 0.0))
+        for meta in meta_rows
+        if isinstance(meta, dict)
+    )
+    all_duplicate_group_count = sum(
+        1
+        for meta in meta_rows
+        if isinstance(meta, dict) and bool(meta.get("all_candidates_identical_after_dedup"))
+    )
+    parse_failure_count = sum(
+        1 for meta in meta_rows if isinstance(meta, dict) and bool(meta.get("parse_failed"))
+    )
+    stats = {
+        "group_rank_score_mean": float(reward_mean),
+        "group_rank_score_std": float(reward_std),
+        "group_rank_group_count": float(len(group_samples)),
+        "group_rank_scored_group_count": float(sum(1 for skipped in skipped_rows if not skipped)),
+        "group_rank_skipped_group_count": float(sum(1 for skipped in skipped_rows if skipped)),
+        "group_rank_parse_failure_count": float(parse_failure_count),
+        "group_rank_critical_candidate_count_total": float(
+            sum(len(row) for row in critical_candidate_rows if isinstance(row, list))
+        ),
+        "group_rank_duplicate_group_count": float(duplicate_group_count),
+        "group_rank_duplicate_candidate_count_total": float(duplicate_candidate_count_total),
+        "group_rank_all_duplicate_group_count": float(all_duplicate_group_count),
+        "group_rank_unique_candidate_count_mean": float(mean(unique_candidate_counts) if unique_candidate_counts else 0.0),
+        "group_rank_unique_candidate_count_min": float(min(unique_candidate_counts) if unique_candidate_counts else 0.0),
+        "group_rank_unique_candidate_count_max": float(max(unique_candidate_counts) if unique_candidate_counts else 0.0),
+    }
+    return flat_scores, stats
 
 
 def _validate_scorer_batch_lengths(
@@ -3797,6 +3904,7 @@ def _prepare_rewards_and_advantages_from_scores(
     *,
     scored_batch: _RewardScoringBatch,
     cfg: RLPostTrainConfig,
+    group_rank_scorer: OpenAICompatibleGroupRankScorer | None = None,
     tokenizer: Any | None = None,
 ) -> tuple[list[Rollout], list[list[float]], dict[str, float], dict[str, float]]:
     def _filter_rows_by_indices(rows: list[Any], keep_indices: list[int]) -> list[Any]:
@@ -3922,6 +4030,20 @@ def _prepare_rewards_and_advantages_from_scores(
         w_esa_seq=cfg.reward.w_esa_seq,
         esa_seq_scale=cfg.reward.esa_seq_scale,
     )
+    if cfg.reward.group_rank.enabled and group_rank_scorer is not None:
+        group_rank_scores, group_rank_stats = _score_group_rank_rollouts(
+            rollouts=rollouts,
+            span_reward_texts=span_reward_texts,
+            cfg=cfg,
+            group_rank_scorer=group_rank_scorer,
+        )
+        seq_rewards = [
+            float(base + (cfg.reward.w_group_rank_seq * (rank_score * cfg.reward.group_rank_seq_scale)))
+            for base, rank_score in zip(seq_rewards, group_rank_scores)
+        ]
+    else:
+        group_rank_scores = [0.0 for _ in rollouts]
+        group_rank_stats = {}
     failure_seq_penalty = float(cfg.reward.mqm.failure_seq_penalty)
     if failure_seq_penalty != 0.0:
         for idx, failed in enumerate(mqm_failure_rows):
@@ -4381,6 +4503,37 @@ def _prepare_rewards_and_advantages_from_scores(
         "judge_sanitized_target_count": float(sanitized_target_rows),
         "judge_sanitized_marker_total": float(sanitized_marker_total),
     }
+    reward_stats.update(
+        {
+            "group_rank_score_mean": float(group_rank_stats.get("group_rank_score_mean", 0.0)),
+            "group_rank_score_std": float(group_rank_stats.get("group_rank_score_std", 0.0)),
+            "group_rank_group_count": float(group_rank_stats.get("group_rank_group_count", 0.0)),
+            "group_rank_scored_group_count": float(group_rank_stats.get("group_rank_scored_group_count", 0.0)),
+            "group_rank_skipped_group_count": float(group_rank_stats.get("group_rank_skipped_group_count", 0.0)),
+            "group_rank_parse_failure_count": float(group_rank_stats.get("group_rank_parse_failure_count", 0.0)),
+            "group_rank_critical_candidate_count_total": float(
+                group_rank_stats.get("group_rank_critical_candidate_count_total", 0.0)
+            ),
+            "group_rank_duplicate_group_count": float(
+                group_rank_stats.get("group_rank_duplicate_group_count", 0.0)
+            ),
+            "group_rank_duplicate_candidate_count_total": float(
+                group_rank_stats.get("group_rank_duplicate_candidate_count_total", 0.0)
+            ),
+            "group_rank_all_duplicate_group_count": float(
+                group_rank_stats.get("group_rank_all_duplicate_group_count", 0.0)
+            ),
+            "group_rank_unique_candidate_count_mean": float(
+                group_rank_stats.get("group_rank_unique_candidate_count_mean", 0.0)
+            ),
+            "group_rank_unique_candidate_count_min": float(
+                group_rank_stats.get("group_rank_unique_candidate_count_min", 0.0)
+            ),
+            "group_rank_unique_candidate_count_max": float(
+                group_rank_stats.get("group_rank_unique_candidate_count_max", 0.0)
+            ),
+        }
+    )
 
     return rollouts, norm_adv_rows, reward_stats, norm_stats
 
@@ -4392,6 +4545,7 @@ def _prepare_rewards_and_advantages(
     xcomet_scorer: XCometXLScorer | None,
     mqm_scorer: OpenAICompatibleMQMScorer | None,
     esa_scorer: OpenAICompatibleESAScorer | None,
+    group_rank_scorer: OpenAICompatibleGroupRankScorer | None,
     metricx_cache: dict[tuple[str, str, str], float],
     xcomet_cache: dict[tuple[str, str, str], tuple[float, list[dict[str, Any]]]],
     mqm_cache: dict[tuple[str, str, str, str, str], tuple[float, list[dict[str, Any]], list[dict[str, Any]]]],
@@ -4414,6 +4568,7 @@ def _prepare_rewards_and_advantages(
     return _prepare_rewards_and_advantages_from_scores(
         scored_batch=scored_batch,
         cfg=cfg,
+        group_rank_scorer=group_rank_scorer,
         tokenizer=tokenizer,
     )
 
@@ -5033,8 +5188,17 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
         if cfg.reward.esa.enabled and ((not use_deepspeed) or rank0)
         else None
     )
+    group_rank_scorer = (
+        OpenAICompatibleGroupRankScorer(
+            cfg.reward.group_rank,
+            parse_failure_log_path=output_dir / cfg.logging.group_rank_parse_failure_jsonl_name,
+        )
+        if cfg.reward.group_rank.enabled and ((not use_deepspeed) or rank0)
+        else None
+    )
     if rank0:
         effective_esa_weight = float(cfg.reward.w_esa_seq) * float(cfg.reward.esa_seq_scale)
+        effective_group_rank_weight = float(cfg.reward.w_group_rank_seq) * float(cfg.reward.group_rank_seq_scale)
         logger.info(
             "reward config: esa_enabled=%s esa_runtime=%s w_esa_seq=%.6f esa_seq_scale=%.6f "
             "effective_esa_weight=%.6f score_range=[%.3f, %.3f] scale_to_unit_interval=%s error_policy=%s",
@@ -5061,6 +5225,26 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
         if cfg.reward.esa.enabled and str(cfg.reward.esa.error_policy).strip().lower() == "zero":
             logger.warning(
                 "reward.esa.error_policy=zero: ESA API/parsing failures are converted to 0.0."
+            )
+        logger.info(
+            "reward config: group_rank_enabled=%s group_rank_runtime=%s w_group_rank_seq=%.6f "
+            "group_rank_seq_scale=%.6f effective_group_rank_weight=%.6f candidate_range=[%s, %s] "
+            "deduplicate_exact_candidates=%s duplicate_text_normalization=%s failure_policy=%s",
+            bool(cfg.reward.group_rank.enabled),
+            bool(group_rank_scorer is not None),
+            float(cfg.reward.w_group_rank_seq),
+            float(cfg.reward.group_rank_seq_scale),
+            effective_group_rank_weight,
+            int(cfg.reward.group_rank.candidate_min),
+            int(cfg.reward.group_rank.candidate_max),
+            bool(cfg.reward.group_rank.deduplicate_exact_candidates),
+            str(cfg.reward.group_rank.duplicate_text_normalization),
+            str(cfg.reward.group_rank.failure_policy),
+        )
+        if cfg.reward.group_rank.enabled and abs(effective_group_rank_weight) <= 0.0:
+            logger.warning(
+                "group rank is enabled but effective sequence weight is 0.0 "
+                "(w_group_rank_seq * group_rank_seq_scale == 0)."
             )
 
     if not use_deepspeed:
@@ -5604,6 +5788,7 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
                                 xcomet_scorer=xcomet_scorer,
                                 mqm_scorer=mqm_scorer,
                                 esa_scorer=esa_scorer,
+                                group_rank_scorer=group_rank_scorer,
                                 metricx_cache=metricx_cache,
                                 xcomet_cache=xcomet_cache,
                                 mqm_cache=mqm_cache,
@@ -5631,6 +5816,7 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
                             xcomet_scorer=xcomet_scorer,
                             mqm_scorer=mqm_scorer,
                             esa_scorer=esa_scorer,
+                            group_rank_scorer=group_rank_scorer,
                             metricx_cache=metricx_cache,
                             xcomet_cache=xcomet_cache,
                             mqm_cache=mqm_cache,
@@ -5746,6 +5932,7 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
                 xcomet_scorer=xcomet_scorer,
                 mqm_scorer=mqm_scorer,
                 esa_scorer=esa_scorer,
+                group_rank_scorer=group_rank_scorer,
                 metricx_cache=metricx_cache,
                 xcomet_cache=xcomet_cache,
                 mqm_cache=mqm_cache,

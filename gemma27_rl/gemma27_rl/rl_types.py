@@ -47,6 +47,23 @@ class SampleForScoring:
 
 
 @dataclass
+class GroupRankSample:
+    group_id: str
+    src: str
+    candidates: list[str]
+    ref: str | None = None
+    source_lang: str | None = None
+    target_lang: str | None = None
+
+
+@dataclass
+class GroupRankResult:
+    ranking_ids: list[int]
+    critical_candidate_ids: list[int]
+    reasons: dict[int, str]
+
+
+@dataclass
 class RewardOutput:
     sequence_scores: list[float]
     metadata: Any = None

@@ -14,6 +14,7 @@ import threading
 import time
 from textwrap import dedent
 from typing import Any, Callable
+import unicodedata
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 
@@ -31,8 +32,8 @@ except Exception as exc:  # pragma: no cover - optional during lightweight tests
     _TRANSFORMERS_IMPORT_ERROR = exc
     AutoTokenizer = None  # type: ignore[assignment]
 
-from .config import ESAConfig, MQMConfig, MetricXConfig, XCometConfig
-from .rl_types import RewardOutput, SampleForScoring
+from .config import ESAConfig, GroupRankConfig, MQMConfig, MetricXConfig, XCometConfig
+from .rl_types import GroupRankSample, RewardOutput, SampleForScoring
 from .utils import (
     build_worker_launch_command,
     collect_huggingface_worker_env,
@@ -2215,6 +2216,855 @@ def build_gemba_esa_repair_messages(
             ),
         },
     ]
+
+
+GROUP_RANK_SYSTEM_PROMPT_KO_EN_ENTERPRISE_V1 = """You are a ranking judge for machine translation candidate comparison.
+
+You will receive:
+- one source segment
+- optionally one reference translation
+- 2 to 4 candidate translations of the SAME source segment
+
+Your job is to rank all candidates from best to worst.
+
+Priority order:
+1. Faithfulness to the source meaning
+   - mistranslation
+   - omission
+   - unjustified addition
+   - untranslated text
+2. Terminology and context fit
+   - enterprise / product / policy / workflow terminology
+   - register and address terms appropriate to the context
+3. Bad failure modes that must be ranked very low
+   - assistant-like fallback responses
+   - wrong-language output
+   - non-translation
+   - source-unrelated content
+4. Fluency and style
+   - awkwardness, punctuation, grammar, polish
+
+Important rules:
+- Judge against the PROVIDED SOURCE, not against world knowledge.
+- Do NOT silently reward a candidate for correcting source facts, dates, numbers, names, or roles.
+- If the source is noisy, fragmented, typo-ridden, or malformed, prefer the candidate that remains faithful to the source over a candidate that invents, normalizes too aggressively, or turns into a generic assistant reply.
+- A candidate that says things like "Please provide the text" or otherwise refuses / asks for input is a severe failure and should be ranked last unless every candidate is equally bad.
+- Be strict about untranslated source-language fragments left in the target when they hurt usability.
+- Use the reference only as auxiliary context if it is provided. Never let the reference override the source.
+
+You must return STRICT JSON only.
+No markdown. No code fences. No explanation outside JSON.
+
+Return exactly this schema:
+{
+  "ranking": [<candidate ids in best-to-worst order>],
+  "critical_candidate_ids": [<subset of candidate ids with severe failures>],
+  "reasons": {
+    "1": "short reason",
+    "2": "short reason"
+  }
+}
+
+Rules for the JSON:
+- candidate ids are 1-based integers
+- ranking must be a strict permutation of all candidate ids exactly once
+- no ties are allowed in the JSON output
+- critical_candidate_ids may be empty
+- keep each reason short (one sentence or short clause)
+"""
+
+GROUP_RANK_USER_TEMPLATE_KO_EN_ENTERPRISE_V1 = """Rank the following candidate translations.
+
+Source language: {source_lang}
+Target language: {target_lang}
+
+Source:
+```text
+{source_seg}
+```
+
+{reference_block}Candidates:
+{candidate_blocks}
+
+Return strict JSON only with keys:
+- ranking
+- critical_candidate_ids
+- reasons
+"""
+
+GROUP_RANK_FEWSHOT_USER_1 = """Rank the following candidate translations.
+
+Source language: Korean
+Target language: English
+
+Source:
+```text
+@김삼성 프로님, 예시 템플릿이 안보이거나 파일명처럼 보이는 경우가 있는데, 확인 요청 드립니다.
+```
+
+Candidates:
+Candidate 1:
+```text
+Mr. Kim Samsung, there are cases where the sample template is not visible or appears as a file name. Please check.
+```
+
+Candidate 2:
+```text
+Hello Pro Kim, the example template may be hidden or shown as a filename. Please take a look.
+```
+
+Candidate 3:
+```text
+Please provide the Korean text you would like me to translate.
+```
+
+Candidate 4:
+```text
+Hi Mr. Kim, some users report that the example template is missing or displayed like a filename. Could you please check?
+```
+
+Return strict JSON only with keys:
+- ranking
+- critical_candidate_ids
+- reasons
+"""
+
+GROUP_RANK_FEWSHOT_ASSISTANT_1 = """{
+  "ranking": [1, 4, 2, 3],
+  "critical_candidate_ids": [3],
+  "reasons": {
+    "1": "Most faithful overall; only slightly stiff naming.",
+    "4": "Natural but adds 'some users report', which is not in the source.",
+    "2": "Meaning mostly preserved but 'Pro Kim' is awkward and less context-fit.",
+    "3": "Assistant fallback; not a translation of the source."
+  }
+}"""
+
+GROUP_RANK_FEWSHOT_USER_2 = """Rank the following candidate translations.
+
+Source language: Korean
+Target language: English
+
+Source:
+```text
+2000년 AI 알파고의 승리로 주목받기 시작
+```
+
+Candidates:
+Candidate 1:
+```text
+It began to draw attention with AI AlphaGo's victory in 2000.
+```
+
+Candidate 2:
+```text
+It began to draw attention with AI AlphaGo's victory in 2016.
+```
+
+Candidate 3:
+```text
+People started paying attention after AlphaGo won.
+```
+
+Candidate 4:
+```text
+AlphaGo's 2000 victory made it famous and revolutionized global AI history.
+```
+
+Return strict JSON only with keys:
+- ranking
+- critical_candidate_ids
+- reasons
+"""
+
+GROUP_RANK_FEWSHOT_ASSISTANT_2 = """{
+  "ranking": [1, 3, 4, 2],
+  "critical_candidate_ids": [2],
+  "reasons": {
+    "1": "Best source fidelity; keeps the explicit year from the source.",
+    "3": "Meaning mostly preserved but drops the explicit year and 'AI'.",
+    "4": "Keeps the year but adds unsupported claims.",
+    "2": "Changes an explicit source fact (2000 -> 2016)."
+  }
+}"""
+
+GROUP_RANK_FEWSHOT_USER_3 = """Rank the following candidate translations.
+
+Source language: English
+Target language: Korean
+
+Source:
+```text
+I'm just about finished, sir.
+```
+
+Candidates:
+Candidate 1:
+```text
+예, 거의 다 끝났습니다.
+```
+
+Candidate 2:
+```text
+거의 다 끝났습니다, 대 sir.
+```
+
+Candidate 3:
+```text
+거의 다 끝냈습니다, 각하.
+```
+
+Candidate 4:
+```text
+거의 끝났습니다.
+```
+
+Return strict JSON only with keys:
+- ranking
+- critical_candidate_ids
+- reasons
+"""
+
+GROUP_RANK_FEWSHOT_ASSISTANT_3 = """{
+  "ranking": [1, 4, 3, 2],
+  "critical_candidate_ids": [2],
+  "reasons": {
+    "1": "Best overall and context-appropriate Korean.",
+    "4": "Acceptable but loses some politeness nuance.",
+    "3": "Fluent but register is too strong and context-shifted.",
+    "2": "Leaves English in the Korean output and is grammatically broken."
+  }
+}"""
+
+GROUP_RANK_FEWSHOT_USER_4 = """Rank the following candidate translations.
+
+Source language: English
+Target language: Korean
+
+Source:
+```text
+This email is for outgoing messages only.
+```
+
+Candidates:
+Candidate 1:
+```text
+이 메일은 발신전용 메일입니다.
+```
+
+Candidate 2:
+```text
+이 이메일은 발신자의 눈 전용입니다.
+```
+
+Candidate 3:
+```text
+이 메일은 외부 발송용으로만 사용됩니다.
+```
+
+Candidate 4:
+```text
+도와드릴까요? 번역할 텍스트를 보내주세요.
+```
+
+Return strict JSON only with keys:
+- ranking
+- critical_candidate_ids
+- reasons
+"""
+
+GROUP_RANK_FEWSHOT_ASSISTANT_4 = """{
+  "ranking": [1, 3, 2, 4],
+  "critical_candidate_ids": [4],
+  "reasons": {
+    "1": "Best context fit for an outgoing-only / no-reply style message.",
+    "3": "Partially related but shifts the operational meaning.",
+    "2": "Mistranslates the meaning into a confidentiality statement.",
+    "4": "Assistant fallback; not a translation."
+  }
+}"""
+
+GROUP_RANK_FEWSHOT_PACKS = {
+    "ko_en_enterprise_group_rank_v1": [
+        (GROUP_RANK_FEWSHOT_USER_1, GROUP_RANK_FEWSHOT_ASSISTANT_1),
+        (GROUP_RANK_FEWSHOT_USER_2, GROUP_RANK_FEWSHOT_ASSISTANT_2),
+        (GROUP_RANK_FEWSHOT_USER_3, GROUP_RANK_FEWSHOT_ASSISTANT_3),
+        (GROUP_RANK_FEWSHOT_USER_4, GROUP_RANK_FEWSHOT_ASSISTANT_4),
+    ],
+}
+
+_VALID_GROUP_RANK_PROMPT_PACKS = frozenset(GROUP_RANK_FEWSHOT_PACKS.keys())
+
+
+def _format_group_rank_candidate_blocks(candidates: list[str]) -> str:
+    lines: list[str] = []
+    for idx, cand in enumerate(candidates, start=1):
+        lines.append(f"Candidate {idx}:\n```text\n{cand}\n```")
+    return "\n\n".join(lines)
+
+
+def _format_group_rank_reference_block(ref: str | None) -> str:
+    if not ref:
+        return ""
+    return f"Reference (auxiliary only):\n```text\n{ref}\n```\n\n"
+
+
+def build_group_rank_messages(
+    *,
+    source_lang: str,
+    target_lang: str,
+    source_seg: str,
+    candidates: list[str],
+    ref: str | None = None,
+    prompt_pack: str = "ko_en_enterprise_group_rank_v1",
+    use_fewshot: bool = True,
+) -> list[dict[str, str]]:
+    pack_key = str(prompt_pack or "ko_en_enterprise_group_rank_v1").strip() or "ko_en_enterprise_group_rank_v1"
+    if pack_key not in _VALID_GROUP_RANK_PROMPT_PACKS:
+        supported = ", ".join(sorted(_VALID_GROUP_RANK_PROMPT_PACKS))
+        raise ValueError(f"Unsupported group rank prompt_pack={pack_key!r}. Supported: {supported}")
+
+    messages: list[dict[str, str]] = [
+        {"role": "system", "content": GROUP_RANK_SYSTEM_PROMPT_KO_EN_ENTERPRISE_V1},
+    ]
+    if use_fewshot:
+        for user_msg, assistant_msg in GROUP_RANK_FEWSHOT_PACKS[pack_key]:
+            messages.append({"role": "user", "content": user_msg})
+            messages.append({"role": "assistant", "content": assistant_msg})
+
+    user_content = GROUP_RANK_USER_TEMPLATE_KO_EN_ENTERPRISE_V1.format(
+        source_lang=source_lang,
+        target_lang=target_lang,
+        source_seg=source_seg,
+        reference_block=_format_group_rank_reference_block(ref),
+        candidate_blocks=_format_group_rank_candidate_blocks(candidates),
+    )
+    messages.append({"role": "user", "content": user_content})
+    return messages
+
+
+def normalize_group_rank_candidate_text(text: str, *, mode: str) -> str:
+    out = str(text).replace("\r\n", "\n")
+    if mode == "none":
+        return out
+    if mode == "strip":
+        return out.strip()
+    if mode == "strip_nfkc":
+        return unicodedata.normalize("NFKC", out).strip()
+    raise ValueError(f"Unsupported duplicate_text_normalization: {mode}")
+
+
+def deduplicate_group_rank_candidates(
+    candidates: list[str],
+    *,
+    normalization_mode: str,
+) -> tuple[list[str], list[int], list[list[int]], list[str]]:
+    normalized_candidates = [
+        normalize_group_rank_candidate_text(candidate, mode=normalization_mode)
+        for candidate in candidates
+    ]
+
+    unique_candidates: list[str] = []
+    original_to_unique_idx: list[int] = []
+    unique_to_original_indices: list[list[int]] = []
+    seen: dict[str, int] = {}
+
+    for orig_idx, (raw_candidate, normalized_candidate) in enumerate(zip(candidates, normalized_candidates)):
+        if normalized_candidate in seen:
+            unique_idx = seen[normalized_candidate]
+            original_to_unique_idx.append(unique_idx)
+            unique_to_original_indices[unique_idx].append(orig_idx)
+            continue
+        unique_idx = len(unique_candidates)
+        seen[normalized_candidate] = unique_idx
+        unique_candidates.append(raw_candidate)
+        original_to_unique_idx.append(unique_idx)
+        unique_to_original_indices.append([orig_idx])
+
+    return unique_candidates, original_to_unique_idx, unique_to_original_indices, normalized_candidates
+
+
+def parse_group_rank_response(
+    raw_text: str,
+    *,
+    candidate_count: int,
+) -> tuple[list[int], list[int], dict[int, str]]:
+    obj = json.loads(raw_text)
+    if not isinstance(obj, dict):
+        raise ValueError("group rank response must be a JSON object")
+
+    ranking = obj.get("ranking")
+    if not isinstance(ranking, list):
+        raise ValueError("ranking must be a list")
+    if len(ranking) != int(candidate_count):
+        raise ValueError("ranking length mismatch")
+    if any(not isinstance(candidate_id, int) for candidate_id in ranking):
+        raise ValueError("ranking must contain integers only")
+    if sorted(ranking) != list(range(1, int(candidate_count) + 1)):
+        raise ValueError("ranking must be a strict permutation of 1..N")
+
+    critical_ids = obj.get("critical_candidate_ids", [])
+    if critical_ids is None:
+        critical_ids = []
+    if not isinstance(critical_ids, list):
+        raise ValueError("critical_candidate_ids must be a list")
+    deduped_critical: list[int] = []
+    seen_critical: set[int] = set()
+    for candidate_id in critical_ids:
+        if not isinstance(candidate_id, int):
+            raise ValueError("critical_candidate_ids must contain integers only")
+        if candidate_id < 1 or candidate_id > int(candidate_count):
+            raise ValueError("critical candidate id out of range")
+        if candidate_id in seen_critical:
+            continue
+        seen_critical.add(candidate_id)
+        deduped_critical.append(candidate_id)
+
+    reasons_in = obj.get("reasons", {}) or {}
+    if not isinstance(reasons_in, dict):
+        raise ValueError("reasons must be a dict")
+    reasons: dict[int, str] = {}
+    for raw_key, raw_value in reasons_in.items():
+        candidate_id = int(raw_key)
+        if candidate_id < 1 or candidate_id > int(candidate_count):
+            raise ValueError("reason candidate id out of range")
+        reasons[candidate_id] = str(raw_value)
+
+    return list(ranking), deduped_critical, reasons
+
+
+def tie_aware_centered_borda_rewards_from_unique_ranking(
+    *,
+    unique_ranking_ids: list[int],
+    unique_to_original_indices: list[list[int]],
+    original_candidate_count: int,
+    critical_unique_candidate_ids: list[int] | None = None,
+    critical_error_penalty: float = 0.0,
+    duplicate_extra_penalty: float = 0.0,
+) -> list[float]:
+    candidate_count = int(original_candidate_count)
+    pos_rewards = [
+        (candidate_count - pos) - ((candidate_count - 1) / 2.0)
+        for pos in range(1, candidate_count + 1)
+    ]
+
+    critical_ids = set(critical_unique_candidate_ids or [])
+    rewards = [0.0] * candidate_count
+    slot_start = 0
+
+    for unique_id in unique_ranking_ids:
+        original_indices = unique_to_original_indices[unique_id - 1]
+        width = len(original_indices)
+        slot_end = slot_start + width
+        base_reward = sum(pos_rewards[slot_start:slot_end]) / float(width)
+        if unique_id in critical_ids:
+            base_reward += float(critical_error_penalty)
+        for original_idx in original_indices:
+            rewards[original_idx] = float(base_reward)
+        if float(duplicate_extra_penalty) != 0.0 and len(original_indices) > 1:
+            for original_idx in original_indices[1:]:
+                rewards[original_idx] += float(duplicate_extra_penalty)
+        slot_start = slot_end
+
+    return rewards
+
+
+def _expand_group_rank_ranking_to_original_ids(
+    *,
+    unique_ranking_ids: list[int],
+    unique_to_original_indices: list[list[int]],
+) -> list[int]:
+    ranking: list[int] = []
+    for unique_id in unique_ranking_ids:
+        ranking.extend(idx + 1 for idx in unique_to_original_indices[unique_id - 1])
+    return ranking
+
+
+def _propagate_group_rank_reasons_to_original_ids(
+    *,
+    unique_reasons: dict[int, str],
+    unique_to_original_indices: list[list[int]],
+) -> dict[int, str]:
+    reasons: dict[int, str] = {}
+    for unique_id, reason in unique_reasons.items():
+        for original_idx in unique_to_original_indices[unique_id - 1]:
+            reasons[original_idx + 1] = str(reason)
+    return reasons
+
+
+def _propagate_group_rank_critical_ids_to_original_ids(
+    *,
+    critical_unique_candidate_ids: list[int],
+    unique_to_original_indices: list[list[int]],
+) -> list[int]:
+    critical_ids: list[int] = []
+    for unique_id in critical_unique_candidate_ids:
+        critical_ids.extend(idx + 1 for idx in unique_to_original_indices[unique_id - 1])
+    return critical_ids
+
+
+def _record_group_rank_parse_failure(
+    *,
+    log_path: Path | None,
+    model_name: str,
+    group: GroupRankSample,
+    unique_candidates: list[str],
+    raw_output: str,
+    error: str,
+) -> None:
+    if log_path is None:
+        return
+    payload = {
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime()),
+        "pid": int(os.getpid()),
+        "scorer": "group_rank",
+        "model_name": model_name,
+        "group_id": group.group_id,
+        "source": group.src,
+        "reference": group.ref,
+        "source_lang": group.source_lang,
+        "target_lang": group.target_lang,
+        "unique_candidates": list(unique_candidates),
+        "raw_output": raw_output,
+        "error": str(error),
+    }
+    try:
+        _append_jsonl_record(log_path, payload)
+    except Exception as exc:
+        logger.warning("Failed to append group_rank parse failure record to %s: %s", log_path, exc)
+
+
+@dataclass
+class OpenAICompatibleGroupRankScorer:
+    cfg: GroupRankConfig
+    predict_fn: Callable[[list[list[dict[str, str]]]], list[str]] | None = None
+    parse_failure_log_path: str | Path | None = None
+
+    def __post_init__(self) -> None:
+        self._chat_url: str | None = None
+        self._api_key: str | None = None
+        self._parse_failure_log_path = Path(self.parse_failure_log_path) if self.parse_failure_log_path else None
+        if self.predict_fn is not None or not self.cfg.enabled:
+            return
+
+        if not self.cfg.base_url or not str(self.cfg.base_url).strip():
+            raise ValueError("Group rank scorer requires cfg.base_url when enabled.")
+        self._chat_url = self._resolve_chat_url(self.cfg.base_url)
+
+        if self.cfg.api_key and str(self.cfg.api_key).strip():
+            self._api_key = str(self.cfg.api_key).strip()
+        else:
+            env_name = (self.cfg.api_key_env or "OPENAI_API_KEY").strip()
+            self._api_key = os.environ.get(env_name) or os.environ.get("OPENAI_API_KEY")
+            if self._api_key and self._api_key.strip():
+                self._api_key = self._api_key.strip()
+            else:
+                self._api_key = None
+
+    @staticmethod
+    def _resolve_chat_url(base_url: str) -> str:
+        url = str(base_url).strip().rstrip("/")
+        if not url:
+            raise ValueError("group rank base_url must not be empty.")
+        if url.endswith("/chat/completions"):
+            return url
+        if url.endswith("/v1"):
+            return f"{url}/chat/completions"
+        return f"{url}/v1/chat/completions"
+
+    def score_groups(self, groups: list[GroupRankSample]) -> dict[str, Any]:
+        candidate_reward_rows: list[list[float]] = []
+        ranking_rows: list[list[int]] = []
+        critical_candidate_rows: list[list[int]] = []
+        reasons_rows: list[dict[int, str]] = []
+        raw_outputs: list[str] = []
+        skipped_rows: list[bool] = []
+        skip_reasons: list[str | None] = []
+        meta_rows: list[dict[str, Any]] = []
+
+        if not groups:
+            return {
+                "candidate_reward_rows": candidate_reward_rows,
+                "ranking_rows": ranking_rows,
+                "critical_candidate_rows": critical_candidate_rows,
+                "reasons_rows": reasons_rows,
+                "raw_outputs": raw_outputs,
+                "skipped_rows": skipped_rows,
+                "skip_reasons": skip_reasons,
+                "meta_rows": meta_rows,
+            }
+
+        prepared_rows: list[dict[str, Any]] = []
+        message_rows: list[list[dict[str, str]]] = []
+        prepared_group_indices: list[int] = []
+
+        for group_idx, group in enumerate(groups):
+            original_candidates = list(group.candidates)
+            original_count = len(original_candidates)
+            normalization_mode = str(self.cfg.duplicate_text_normalization or "strip_nfkc").strip() or "strip_nfkc"
+            if bool(self.cfg.deduplicate_exact_candidates):
+                (
+                    unique_candidates,
+                    original_to_unique_idx,
+                    unique_to_original_indices,
+                    normalized_candidates,
+                ) = deduplicate_group_rank_candidates(
+                    original_candidates,
+                    normalization_mode=normalization_mode,
+                )
+            else:
+                normalized_candidates = [
+                    normalize_group_rank_candidate_text(candidate, mode=normalization_mode)
+                    for candidate in original_candidates
+                ]
+                unique_candidates = list(original_candidates)
+                original_to_unique_idx = list(range(original_count))
+                unique_to_original_indices = [[idx] for idx in range(original_count)]
+
+            unique_count = len(unique_candidates)
+            duplicate_class_count = sum(1 for indices in unique_to_original_indices if len(indices) > 1)
+            duplicate_candidate_count = max(0, original_count - unique_count)
+            base_meta = {
+                "group_id": group.group_id,
+                "original_candidate_count": int(original_count),
+                "unique_candidate_count": int(unique_count),
+                "duplicate_class_count": int(duplicate_class_count),
+                "duplicate_candidate_count": int(duplicate_candidate_count),
+                "had_duplicates": bool(duplicate_candidate_count > 0),
+                "all_candidates_identical_after_dedup": bool(original_count > 0 and unique_count == 1),
+                "normalized_candidates": list(normalized_candidates),
+                "original_to_unique_idx": list(original_to_unique_idx),
+                "unique_to_original_indices": [list(indices) for indices in unique_to_original_indices],
+                "parse_failed": False,
+            }
+
+            if unique_count == 1:
+                candidate_reward_rows.append([0.0 for _ in original_candidates])
+                ranking_rows.append([])
+                critical_candidate_rows.append([])
+                reasons_rows.append({})
+                raw_outputs.append("")
+                skipped_rows.append(True)
+                skip_reasons.append("all_candidates_identical_after_dedup")
+                meta_rows.append(base_meta)
+                continue
+
+            if unique_count < int(self.cfg.candidate_min) or unique_count > int(self.cfg.candidate_max):
+                exc = ValueError(
+                    f"group rank unique candidate count {unique_count} outside configured range "
+                    f"[{self.cfg.candidate_min}, {self.cfg.candidate_max}]"
+                )
+                if str(self.cfg.failure_policy).strip().lower() == "raise":
+                    raise exc
+                candidate_reward_rows.append([0.0 for _ in original_candidates])
+                ranking_rows.append([])
+                critical_candidate_rows.append([])
+                reasons_rows.append({})
+                raw_outputs.append("")
+                skipped_rows.append(True)
+                skip_reasons.append(str(exc))
+                meta_rows.append(base_meta)
+                continue
+
+            messages = build_group_rank_messages(
+                source_lang=str(group.source_lang or "Unknown").strip() or "Unknown",
+                target_lang=str(group.target_lang or "Unknown").strip() or "Unknown",
+                source_seg=group.src,
+                candidates=unique_candidates,
+                ref=group.ref if bool(self.cfg.use_reference) else None,
+                prompt_pack=str(self.cfg.prompt_pack or "ko_en_enterprise_group_rank_v1"),
+                use_fewshot=bool(self.cfg.use_fewshot),
+            )
+            candidate_reward_rows.append([])
+            ranking_rows.append([])
+            critical_candidate_rows.append([])
+            reasons_rows.append({})
+            raw_outputs.append("")
+            skipped_rows.append(False)
+            skip_reasons.append(None)
+            meta_rows.append(base_meta)
+            prepared_rows.append(
+                {
+                    "group": group,
+                    "messages": messages,
+                    "unique_candidates": unique_candidates,
+                    "unique_to_original_indices": unique_to_original_indices,
+                    "meta": base_meta,
+                }
+            )
+            message_rows.append(messages)
+            prepared_group_indices.append(group_idx)
+
+        if message_rows:
+            if self.predict_fn is not None:
+                batch_raw_outputs = list(self.predict_fn(message_rows))
+                if len(batch_raw_outputs) != len(message_rows):
+                    raise RuntimeError(
+                        "Group rank predict_fn returned mismatched output length: "
+                        f"requested={len(message_rows)} returned={len(batch_raw_outputs)}"
+                    )
+            else:
+                max_workers = max(1, int(self.cfg.batch_size))
+                if max_workers == 1:
+                    batch_raw_outputs = [
+                        self._score_one_group(prepared["messages"])
+                        for prepared in prepared_rows
+                    ]
+                else:
+                    with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="group-rank-scorer") as executor:
+                        batch_raw_outputs = _run_jobs_with_bounded_concurrency(
+                            executor=executor,
+                            jobs=[(prepared["messages"],) for prepared in prepared_rows],
+                            worker_fn=lambda messages: self._score_one_group(messages),
+                            max_in_flight=max_workers,
+                        )
+
+            for prepared, group_idx, raw_output in zip(prepared_rows, prepared_group_indices, batch_raw_outputs):
+                group = prepared["group"]
+                unique_candidates = prepared["unique_candidates"]
+                unique_to_original_indices = prepared["unique_to_original_indices"]
+                meta = prepared["meta"]
+                if isinstance(raw_output, Exception):
+                    exc = raw_output
+                    if str(self.cfg.failure_policy).strip().lower() == "raise":
+                        raise exc
+                    candidate_reward_rows[group_idx] = [0.0 for _ in group.candidates]
+                    raw_outputs[group_idx] = ""
+                    skipped_rows[group_idx] = True
+                    skip_reasons[group_idx] = str(exc)
+                    meta_rows[group_idx] = dict(meta)
+                    continue
+
+                raw_outputs[group_idx] = str(raw_output)
+                try:
+                    ranking_ids, critical_unique_ids, unique_reasons = parse_group_rank_response(
+                        str(raw_output),
+                        candidate_count=len(unique_candidates),
+                    )
+                except Exception as exc:
+                    _record_group_rank_parse_failure(
+                        log_path=self._parse_failure_log_path,
+                        model_name=self.cfg.model_name,
+                        group=group,
+                        unique_candidates=unique_candidates,
+                        raw_output=str(raw_output),
+                        error=str(exc),
+                    )
+                    if str(self.cfg.failure_policy).strip().lower() == "raise":
+                        raise
+                    candidate_reward_rows[group_idx] = [0.0 for _ in group.candidates]
+                    skipped_rows[group_idx] = True
+                    skip_reasons[group_idx] = str(exc)
+                    failed_meta = dict(meta)
+                    failed_meta["parse_failed"] = True
+                    meta_rows[group_idx] = failed_meta
+                    continue
+
+                candidate_reward_rows[group_idx] = tie_aware_centered_borda_rewards_from_unique_ranking(
+                    unique_ranking_ids=ranking_ids,
+                    unique_to_original_indices=unique_to_original_indices,
+                    original_candidate_count=len(group.candidates),
+                    critical_unique_candidate_ids=critical_unique_ids,
+                    critical_error_penalty=float(self.cfg.critical_error_penalty),
+                    duplicate_extra_penalty=float(self.cfg.duplicate_extra_penalty),
+                )
+                ranking_rows[group_idx] = _expand_group_rank_ranking_to_original_ids(
+                    unique_ranking_ids=ranking_ids,
+                    unique_to_original_indices=unique_to_original_indices,
+                )
+                critical_candidate_rows[group_idx] = _propagate_group_rank_critical_ids_to_original_ids(
+                    critical_unique_candidate_ids=critical_unique_ids,
+                    unique_to_original_indices=unique_to_original_indices,
+                )
+                reasons_rows[group_idx] = _propagate_group_rank_reasons_to_original_ids(
+                    unique_reasons=unique_reasons,
+                    unique_to_original_indices=unique_to_original_indices,
+                )
+
+        return {
+            "candidate_reward_rows": candidate_reward_rows,
+            "ranking_rows": ranking_rows,
+            "critical_candidate_rows": critical_candidate_rows,
+            "reasons_rows": reasons_rows,
+            "raw_outputs": raw_outputs,
+            "skipped_rows": skipped_rows,
+            "skip_reasons": skip_reasons,
+            "meta_rows": meta_rows,
+        }
+
+    def _score_one_group(self, messages: list[dict[str, str]]) -> str:
+        last_exc: Exception | None = None
+        attempts = max(1, int(self.cfg.max_retries) + 1)
+        for _ in range(attempts):
+            try:
+                return self._call_openai_compatible_api(messages)
+            except Exception as exc:
+                last_exc = exc
+                continue
+        if last_exc is None:
+            raise RuntimeError("group rank scoring failed without an exception.")
+        raise last_exc
+
+    def _call_openai_compatible_api(self, messages: list[dict[str, str]]) -> str:
+        if self._chat_url is None:
+            raise RuntimeError("group rank scorer chat URL is not set.")
+
+        payload = {
+            "model": self.cfg.model_name,
+            "messages": messages,
+            "temperature": float(self.cfg.temperature),
+            "top_p": float(self.cfg.top_p),
+            "max_tokens": int(self.cfg.max_tokens),
+        }
+        if self.cfg.top_k is not None:
+            payload["top_k"] = int(self.cfg.top_k)
+        if self.cfg.presence_penalty is not None:
+            payload["presence_penalty"] = float(self.cfg.presence_penalty)
+        if self.cfg.repetition_penalty is not None:
+            payload["repetition_penalty"] = float(self.cfg.repetition_penalty)
+        if self.cfg.stop:
+            payload["stop"] = list(self.cfg.stop)
+        if self.cfg.chat_template_kwargs:
+            payload["chat_template_kwargs"] = dict(self.cfg.chat_template_kwargs)
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+        req = urllib_request.Request(
+            self._chat_url,
+            data=body,
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        if self._api_key:
+            req.add_header("Authorization", f"Bearer {self._api_key}")
+
+        try:
+            timeout = float(self.cfg.timeout_s or self.cfg.timeout_sec)
+            restore_proxy_env = _temporarily_unset_proxy_env()
+            try:
+                opener = urllib_request.build_opener(urllib_request.ProxyHandler({}))
+                with opener.open(req, timeout=timeout) as resp:
+                    resp_body = resp.read().decode("utf-8")
+            finally:
+                restore_proxy_env()
+        except urllib_error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"group rank API HTTPError status={exc.code} body={detail}") from exc
+        except urllib_error.URLError as exc:
+            raise RuntimeError(f"group rank API URLError: {exc}") from exc
+
+        try:
+            parsed = json.loads(resp_body)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("group rank API response is not valid JSON.") from exc
+
+        return _extract_openai_response_text(
+            parsed=parsed,
+            scorer_name="group_rank",
+            log_io=False,
+            log_max_chars=20000,
+        )
+
+
 def metricx_qe_input(src: str, mt: str) -> str:
     return f"source: {src} candidate: {mt}"
 

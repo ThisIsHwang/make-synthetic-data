@@ -224,6 +224,43 @@ class ESAConfig:
 
 
 @dataclass
+class GroupRankConfig:
+    enabled: bool = False
+    base_url: str | None = None
+    model_name: str = "qwen3.5-397b-instruct"
+    api_key: str | None = None
+    api_key_env: str = "OPENAI_API_KEY"
+    reasoning_parser: str | None = None
+
+    timeout_sec: float = 120.0
+    timeout_s: float | None = None
+    max_retries: int = 2
+    batch_size: int = 1
+
+    temperature: float = 0.0
+    top_p: float = 1.0
+    top_k: int | None = None
+    presence_penalty: float | None = None
+    repetition_penalty: float | None = None
+    max_tokens: int = 768
+    stop: list[str] = field(default_factory=list)
+    chat_template_kwargs: dict[str, Any] = field(default_factory=lambda: {"enable_thinking": False})
+
+    candidate_min: int = 2
+    candidate_max: int = 4
+    critical_error_penalty: float = 0.0
+    failure_policy: str = "zero"  # zero|raise
+    use_reference: bool = False
+
+    prompt_pack: str = "ko_en_enterprise_group_rank_v1"
+    use_fewshot: bool = True
+
+    deduplicate_exact_candidates: bool = True
+    duplicate_text_normalization: str = "strip_nfkc"  # none|strip|strip_nfkc
+    duplicate_extra_penalty: float = 0.0
+
+
+@dataclass
 class RewardConfig:
     w_metricx: float = 1.0
     w_xcomet_seq: float = 0.0
@@ -234,6 +271,8 @@ class RewardConfig:
     # w_esa_seq=0.2 has similar magnitude to common MQM setup (w_mqm_seq=0.2).
     w_esa_seq: float = 0.2
     esa_seq_scale: float = 0.25
+    w_group_rank_seq: float = 0.0
+    group_rank_seq_scale: float = 1.0
     severity_weights: dict[str, float] = field(
         default_factory=lambda: {
             "MINOR": -1.0,
@@ -278,6 +317,7 @@ class RewardConfig:
     xcomet: XCometConfig = field(default_factory=XCometConfig)
     mqm: MQMConfig = field(default_factory=MQMConfig)
     esa: ESAConfig = field(default_factory=ESAConfig)
+    group_rank: GroupRankConfig = field(default_factory=GroupRankConfig)
 
 
 @dataclass
@@ -326,6 +366,7 @@ class LoggingConfig:
     rollout_jsonl_name: str = "train_rollouts.jsonl"
     mqm_parse_failure_jsonl_name: str = "mqm_parse_failures.jsonl"
     esa_parse_failure_jsonl_name: str = "esa_parse_failures.jsonl"
+    group_rank_parse_failure_jsonl_name: str = "group_rank_parse_failures.jsonl"
     tensorboard_enabled: bool = True
     tensorboard_dir: str | None = None
     wandb_enabled: bool = False
@@ -600,6 +641,8 @@ def _validate_config(cfg: RLPostTrainConfig) -> None:
         raise ValueError("logging.mqm_parse_failure_jsonl_name must not be empty")
     if not str(cfg.logging.esa_parse_failure_jsonl_name or "").strip():
         raise ValueError("logging.esa_parse_failure_jsonl_name must not be empty")
+    if not str(cfg.logging.group_rank_parse_failure_jsonl_name or "").strip():
+        raise ValueError("logging.group_rank_parse_failure_jsonl_name must not be empty")
     reference_runtime = str(cfg.model.reference_runtime or "worker").strip().lower()
     if reference_runtime not in {"worker", "in_process", "cpu", "colocate"}:
         raise ValueError("model.reference_runtime must be worker|in_process|cpu|colocate")
@@ -663,6 +706,8 @@ def _validate_config(cfg: RLPostTrainConfig) -> None:
         ("reward.assistant_fallback_seq_penalty", cfg.reward.assistant_fallback_seq_penalty),
         ("reward.assistant_fallback_token_penalty", cfg.reward.assistant_fallback_token_penalty),
         ("reward.script_mismatch_seq_penalty", cfg.reward.script_mismatch_seq_penalty),
+        ("reward.w_group_rank_seq", cfg.reward.w_group_rank_seq),
+        ("reward.group_rank_seq_scale", cfg.reward.group_rank_seq_scale),
     ):
         try:
             value = float(raw)
@@ -741,6 +786,7 @@ def _validate_config(cfg: RLPostTrainConfig) -> None:
         and not cfg.reward.xcomet.enabled
         and not cfg.reward.mqm.enabled
         and not cfg.reward.esa.enabled
+        and not cfg.reward.group_rank.enabled
     ):
         raise ValueError("At least one reward model must be enabled.")
     if cfg.reward.mqm.error_policy not in {"raise", "zero"}:
@@ -768,6 +814,62 @@ def _validate_config(cfg: RLPostTrainConfig) -> None:
         raise ValueError(
             "reward.esa.prompt_pack must be one of: generic, ko_en_enterprise_v1"
         )
+    valid_group_rank_prompt_packs = {"ko_en_enterprise_group_rank_v1"}
+    if cfg.reward.group_rank.failure_policy not in {"zero", "raise"}:
+        raise ValueError("reward.group_rank.failure_policy must be zero|raise")
+    if str(cfg.reward.group_rank.prompt_pack or "").strip() not in valid_group_rank_prompt_packs:
+        raise ValueError(
+            "reward.group_rank.prompt_pack must be one of: ko_en_enterprise_group_rank_v1"
+        )
+    if int(cfg.reward.group_rank.candidate_min) < 2:
+        raise ValueError("reward.group_rank.candidate_min must be >= 2")
+    if int(cfg.reward.group_rank.candidate_max) < int(cfg.reward.group_rank.candidate_min):
+        raise ValueError("reward.group_rank.candidate_max must be >= reward.group_rank.candidate_min")
+    if int(cfg.reward.group_rank.batch_size) <= 0:
+        raise ValueError("reward.group_rank.batch_size must be > 0")
+    if int(cfg.reward.group_rank.max_retries) < 0:
+        raise ValueError("reward.group_rank.max_retries must be >= 0")
+    if float(cfg.reward.group_rank.timeout_s or cfg.reward.group_rank.timeout_sec) <= 0:
+        raise ValueError("reward.group_rank.timeout_s/timeout_sec must be > 0")
+    if str(cfg.reward.group_rank.duplicate_text_normalization or "").strip() not in {
+        "none",
+        "strip",
+        "strip_nfkc",
+    }:
+        raise ValueError(
+            "reward.group_rank.duplicate_text_normalization must be one of: none, strip, strip_nfkc"
+        )
+    if float(cfg.reward.group_rank.duplicate_extra_penalty) > 0.0:
+        raise ValueError("reward.group_rank.duplicate_extra_penalty must be <= 0.0")
+    if int(cfg.generation.num_samples_per_prompt) > int(cfg.reward.group_rank.candidate_max):
+        raise ValueError(
+            "generation.num_samples_per_prompt must be <= reward.group_rank.candidate_max"
+        )
+    if not isinstance(cfg.reward.group_rank.use_fewshot, bool):
+        raise ValueError("reward.group_rank.use_fewshot must be a bool")
+    if not isinstance(cfg.reward.group_rank.deduplicate_exact_candidates, bool):
+        raise ValueError("reward.group_rank.deduplicate_exact_candidates must be a bool")
+    if not isinstance(cfg.reward.group_rank.use_reference, bool):
+        raise ValueError("reward.group_rank.use_reference must be a bool")
+    if cfg.reward.group_rank.chat_template_kwargs is not None and not isinstance(
+        cfg.reward.group_rank.chat_template_kwargs, dict
+    ):
+        raise ValueError("reward.group_rank.chat_template_kwargs must be a dict")
+    if cfg.reward.group_rank.reasoning_parser is not None and not str(
+        cfg.reward.group_rank.reasoning_parser
+    ).strip():
+        raise ValueError("reward.group_rank.reasoning_parser must not be empty when set")
+    if cfg.reward.group_rank.top_k is not None and int(cfg.reward.group_rank.top_k) <= 0:
+        raise ValueError("reward.group_rank.top_k must be > 0 when set")
+    if (
+        cfg.reward.group_rank.repetition_penalty is not None
+        and float(cfg.reward.group_rank.repetition_penalty) <= 0
+    ):
+        raise ValueError("reward.group_rank.repetition_penalty must be > 0 when set")
+    if int(cfg.reward.group_rank.max_tokens) <= 0:
+        raise ValueError("reward.group_rank.max_tokens must be > 0")
+    if not isinstance(cfg.reward.group_rank.stop, list):
+        raise ValueError("reward.group_rank.stop must be a list")
     if cfg.reward.mqm.enabled:
         if not cfg.reward.mqm.base_url or not str(cfg.reward.mqm.base_url).strip():
             raise ValueError("reward.mqm.base_url must be set when reward.mqm.enabled=true")
@@ -814,6 +916,9 @@ def _validate_config(cfg: RLPostTrainConfig) -> None:
             raise ValueError("reward.esa.top_k must be > 0 when set")
         if cfg.reward.esa.repetition_penalty is not None and float(cfg.reward.esa.repetition_penalty) <= 0:
             raise ValueError("reward.esa.repetition_penalty must be > 0 when set")
+    if cfg.reward.group_rank.enabled:
+        if not cfg.reward.group_rank.base_url or not str(cfg.reward.group_rank.base_url).strip():
+            raise ValueError("reward.group_rank.base_url must be set when reward.group_rank.enabled=true")
     if cfg.data.eval_sampling_count is not None:
         if int(cfg.data.eval_sampling_count) <= 0:
             raise ValueError("data.eval_sampling_count must be > 0 when set.")
