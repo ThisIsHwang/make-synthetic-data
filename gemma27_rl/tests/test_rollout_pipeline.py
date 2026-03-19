@@ -220,3 +220,16 @@ def test_eval_pipeline_can_use_esa_without_training_esa_reward(monkeypatch) -> N
     assert scorer.calls == [["ex-0"], ["ex-1"]]
     assert report["esa_score_mean"] == pytest.approx(80.0)
     assert [row["esa_score"] for row in report["eval_rows"]] == [81.0, 79.0]
+
+
+def test_effective_esa_runtime_cfg_enables_eval_only_esa_without_mutating_reward_cfg() -> None:
+    cfg = _cfg()
+    cfg.reward.esa.enabled = False
+    cfg.reward.esa.base_url = "http://localhost:8000"
+    cfg.eval.use_esa = True
+
+    effective = trainer_mod._effective_esa_runtime_cfg(cfg)
+
+    assert effective.enabled is True
+    assert effective.base_url == "http://localhost:8000"
+    assert cfg.reward.esa.enabled is False

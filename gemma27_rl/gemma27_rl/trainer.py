@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import datetime
 import json
 import logging
@@ -89,6 +89,14 @@ _DEFAULT_NGRAM_TOKEN_PENALTY = -1.0
 _DEFAULT_NGRAM_SEQUENCE_PENALTY = -0.5
 _DEFAULT_SPECIAL_TOKEN_PENALTY = -50.0
 _DEFAULT_SPECIAL_SEQUENCE_PENALTY = -10.0
+
+
+def _effective_esa_runtime_cfg(cfg: RLPostTrainConfig) -> Any:
+    if bool(cfg.reward.esa.enabled):
+        return cfg.reward.esa
+    if bool(cfg.eval.use_esa):
+        return replace(cfg.reward.esa, enabled=True)
+    return cfg.reward.esa
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -4962,10 +4970,11 @@ def run_metric_only_eval(cfg: RLPostTrainConfig) -> dict[str, Any]:
         if cfg.reward.mqm.enabled
         else None
     )
-    esa_runtime_enabled = bool(cfg.reward.esa.enabled or cfg.eval.use_esa)
+    esa_runtime_cfg = _effective_esa_runtime_cfg(cfg)
+    esa_runtime_enabled = bool(esa_runtime_cfg.enabled)
     esa_scorer = (
         OpenAICompatibleESAScorer(
-            cfg.reward.esa,
+            esa_runtime_cfg,
             parse_failure_log_path=output_dir / cfg.logging.esa_parse_failure_jsonl_name,
         )
         if esa_runtime_enabled
@@ -5181,10 +5190,11 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
         if cfg.reward.mqm.enabled and ((not use_deepspeed) or rank0)
         else None
     )
-    esa_runtime_enabled = bool(cfg.reward.esa.enabled or cfg.eval.use_esa)
+    esa_runtime_cfg = _effective_esa_runtime_cfg(cfg)
+    esa_runtime_enabled = bool(esa_runtime_cfg.enabled)
     esa_scorer = (
         OpenAICompatibleESAScorer(
-            cfg.reward.esa,
+            esa_runtime_cfg,
             parse_failure_log_path=output_dir / cfg.logging.esa_parse_failure_jsonl_name,
         )
         if esa_runtime_enabled and ((not use_deepspeed) or rank0)
