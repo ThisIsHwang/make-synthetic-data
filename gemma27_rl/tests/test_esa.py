@@ -112,6 +112,143 @@ def test_gemba_esa_format_error_spans_repairs_doubled_quotes_in_json_spans() -> 
     ]
 
 
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (
+            """{
+  "errors": [
+    {
+      "severity": "major",
+      "type": "accuracy/mistranslation",
+      "target_span": "for those who comply with the display methods for advertisements, etc., as stipulated in Article 5-2 of the "Act on the Management of Outdoor Advertisements, etc. and the Promotion of the Outdoor Advertising Industry" (hereinafter referred to as the "Act"), and contribute to the development of the advertising industry.",
+      "source_span": "광고물등의 표시방법을 준수하고 광고산업 발전에 기여한 광고업자에 대해서는",
+      "confidence": 0.95
+    }
+  ]
+}""",
+            [
+                {
+                    "severity": "major",
+                    "type": "accuracy/mistranslation",
+                    "target_span": (
+                        'for those who comply with the display methods for advertisements, etc., '
+                        'as stipulated in Article 5-2 of the "Act on the Management of Outdoor '
+                        'Advertisements, etc. and the Promotion of the Outdoor Advertising '
+                        'Industry" (hereinafter referred to as the "Act"), and contribute to the '
+                        "development of the advertising industry."
+                    ),
+                    "source_span": "광고물등의 표시방법을 준수하고 광고산업 발전에 기여한 광고업자에 대해서는",
+                    "confidence": pytest.approx(0.95),
+                }
+            ],
+        ),
+        (
+            """{
+  "errors": [
+    {
+      "severity": "minor",
+      "type": "accuracy/mistranslation",
+      "target_span": "Seongdong-gu residents (hereinafter referred to as "residents")",
+      "source_span": "성동구민 (이하"구민"이라 한다)",
+      "confidence": 0.95
+    }
+  ]
+}""",
+            [
+                {
+                    "severity": "minor",
+                    "type": "accuracy/mistranslation",
+                    "target_span": 'Seongdong-gu residents (hereinafter referred to as "residents")',
+                    "source_span": '성동구민 (이하"구민"이라 한다)',
+                    "confidence": pytest.approx(0.95),
+                }
+            ],
+        ),
+        (
+            """{
+  "errors": [
+    {
+      "severity": "major",
+      "type": "accuracy/mistranslation",
+      "target_span": "collaboration with related organizations, institutions, experts, and Seongdong-gu residents",
+      "source_span": "성동구민(이하"구민"이라 한다) 을 포함한 관련 단체·기관 및 전문가가 참여하여 협력할 수 있는",
+      "confidence": 0.95
+    }
+  ]
+}""",
+            [
+                {
+                    "severity": "major",
+                    "type": "accuracy/mistranslation",
+                    "target_span": (
+                        "collaboration with related organizations, institutions, experts, and "
+                        "Seongdong-gu residents"
+                    ),
+                    "source_span": '성동구민(이하"구민"이라 한다) 을 포함한 관련 단체·기관 및 전문가가 참여하여 협력할 수 있는',
+                    "confidence": pytest.approx(0.95),
+                }
+            ],
+        ),
+        (
+            """{
+  "errors": [
+    {
+      "severity": "major",
+      "type": "accuracy/mistranslation",
+      "target_span": "구민(이하"구민")",
+      "source_span": "Geumcheon-gu residents (hereinafter referred to as"Gu residents")",
+      "confidence": 0.98
+    },
+    {
+      "severity": "minor",
+      "type": "accuracy/mistranslation",
+      "target_span": "중요하게 생각하고",
+      "source_span": "highly regarded by",
+      "confidence": 0.90
+    },
+    {
+      "severity": "minor",
+      "type": "fluency/grammar",
+      "target_span": "추진하는 사항 관련자가",
+      "source_span": "persons related to matters to be promoted",
+      "confidence": 0.85
+    }
+  ]
+}""",
+            [
+                {
+                    "severity": "major",
+                    "type": "accuracy/mistranslation",
+                    "target_span": '구민(이하"구민")',
+                    "source_span": 'Geumcheon-gu residents (hereinafter referred to as"Gu residents")',
+                    "confidence": pytest.approx(0.98),
+                },
+                {
+                    "severity": "minor",
+                    "type": "accuracy/mistranslation",
+                    "target_span": "중요하게 생각하고",
+                    "source_span": "highly regarded by",
+                    "confidence": pytest.approx(0.90),
+                },
+                {
+                    "severity": "minor",
+                    "type": "fluency/grammar",
+                    "target_span": "추진하는 사항 관련자가",
+                    "source_span": "persons related to matters to be promoted",
+                    "confidence": pytest.approx(0.85),
+                },
+            ],
+        ),
+    ],
+)
+def test_gemba_esa_parse_structured_errors_handles_logged_malformed_quote_patterns(
+    raw: str,
+    expected: list[dict[str, object]],
+) -> None:
+    assert gemba_esa_parse_structured_errors(raw) == expected
+
+
 def test_gemba_esa_parse_errors_rejects_unstructured_output() -> None:
     with pytest.raises(ValueError, match="structured errors|unparseable"):
         gemba_esa_parse_errors("I do not see major issues here.")
