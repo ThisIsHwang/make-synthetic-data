@@ -42,6 +42,10 @@ _EVAL_OBJECT_GROUP_TIMEOUT_SEC: float = -1.0
 _DEFAULT_DEEPSPEED_EVAL_OBJECT_TIMEOUT_SEC = 7200.0
 
 
+def _eval_uses_esa(cfg: RLPostTrainConfig) -> bool:
+    return bool(cfg.reward.esa.enabled or cfg.eval.use_esa)
+
+
 def _empty_eval_report(*, collect_outputs: bool) -> dict[str, Any]:
     empty = {
         "metricx_score_mean": 0.0,
@@ -435,7 +439,7 @@ def _should_pipeline_eval_api_scoring(
         return False
     return bool(
         (cfg.reward.mqm.enabled and mqm_scorer is not None)
-        or (cfg.reward.esa.enabled and esa_scorer is not None)
+        or (_eval_uses_esa(cfg) and esa_scorer is not None)
     )
 
 
@@ -456,7 +460,7 @@ def _resolve_eval_rollout_pipeline_chunk_size(*, total_examples: int, cfg: RLPos
     batch_hints: list[int] = []
     if cfg.reward.mqm.enabled:
         batch_hints.append(max(1, int(cfg.reward.mqm.batch_size)))
-    if cfg.reward.esa.enabled:
+    if _eval_uses_esa(cfg):
         batch_hints.append(max(1, int(cfg.reward.esa.batch_size)))
     hint = min(batch_hints) if batch_hints else total
     default_chunk = min(hint, int(math.ceil(total / 2.0)))
@@ -542,7 +546,7 @@ def _score_eval_rollouts(
     metricx_enabled = metricx_scorer is not None and cfg.reward.metricx.enabled
     xcomet_enabled = xcomet_scorer is not None and cfg.reward.xcomet.enabled
     mqm_enabled = mqm_scorer is not None and cfg.reward.mqm.enabled
-    esa_enabled = esa_scorer is not None and cfg.reward.esa.enabled
+    esa_enabled = esa_scorer is not None and _eval_uses_esa(cfg)
 
     def _score_metricx_eval() -> tuple[list[float], list[float]]:
         metricx_out = metricx_scorer.score_batch(samples)  # type: ignore[union-attr]

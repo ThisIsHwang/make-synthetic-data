@@ -4962,12 +4962,13 @@ def run_metric_only_eval(cfg: RLPostTrainConfig) -> dict[str, Any]:
         if cfg.reward.mqm.enabled
         else None
     )
+    esa_runtime_enabled = bool(cfg.reward.esa.enabled or cfg.eval.use_esa)
     esa_scorer = (
         OpenAICompatibleESAScorer(
             cfg.reward.esa,
             parse_failure_log_path=output_dir / cfg.logging.esa_parse_failure_jsonl_name,
         )
-        if cfg.reward.esa.enabled
+        if esa_runtime_enabled
         else None
     )
 
@@ -5180,12 +5181,13 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
         if cfg.reward.mqm.enabled and ((not use_deepspeed) or rank0)
         else None
     )
+    esa_runtime_enabled = bool(cfg.reward.esa.enabled or cfg.eval.use_esa)
     esa_scorer = (
         OpenAICompatibleESAScorer(
             cfg.reward.esa,
             parse_failure_log_path=output_dir / cfg.logging.esa_parse_failure_jsonl_name,
         )
-        if cfg.reward.esa.enabled and ((not use_deepspeed) or rank0)
+        if esa_runtime_enabled and ((not use_deepspeed) or rank0)
         else None
     )
     group_rank_scorer = (
@@ -5202,7 +5204,7 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
         logger.info(
             "reward config: esa_enabled=%s esa_runtime=%s w_esa_seq=%.6f esa_seq_scale=%.6f "
             "effective_esa_weight=%.6f score_range=[%.3f, %.3f] scale_to_unit_interval=%s error_policy=%s",
-            bool(cfg.reward.esa.enabled),
+            bool(esa_runtime_enabled),
             bool(esa_scorer is not None),
             float(cfg.reward.w_esa_seq),
             float(cfg.reward.esa_seq_scale),
@@ -5212,17 +5214,17 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
             bool(cfg.reward.esa.scale_to_unit_interval),
             str(cfg.reward.esa.error_policy),
         )
-        if cfg.reward.esa.enabled and abs(effective_esa_weight) <= 0.0:
+        if esa_runtime_enabled and abs(effective_esa_weight) <= 0.0:
             logger.warning(
                 "ESA is enabled but effective sequence weight is 0.0 "
                 "(w_esa_seq * esa_seq_scale == 0). ESA score will not affect loss."
             )
-        if cfg.reward.esa.enabled and float(cfg.reward.esa.score_max) <= 0.0:
+        if esa_runtime_enabled and float(cfg.reward.esa.score_max) <= 0.0:
             logger.warning(
                 "reward.esa.score_max <= 0.0. GEMBA-ESA usually returns 0..100, "
                 "so outputs may clip to 0.0. Recommended range is score_min=0, score_max=100."
             )
-        if cfg.reward.esa.enabled and str(cfg.reward.esa.error_policy).strip().lower() == "zero":
+        if esa_runtime_enabled and str(cfg.reward.esa.error_policy).strip().lower() == "zero":
             logger.warning(
                 "reward.esa.error_policy=zero: ESA API/parsing failures are converted to 0.0."
             )

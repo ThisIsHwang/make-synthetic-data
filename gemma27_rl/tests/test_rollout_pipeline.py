@@ -40,6 +40,21 @@ class _MQMRecorder:
         )
 
 
+class _ESARecorder:
+    def __init__(self, scores_by_src: dict[str, float]) -> None:
+        self._scores_by_src = dict(scores_by_src)
+        self.calls: list[list[str]] = []
+
+    def score_batch(self, samples):  # type: ignore[no-untyped-def]
+        self.calls.append([str(sample.src) for sample in samples])
+        return RewardOutput(
+            sequence_scores=[float(self._scores_by_src[str(sample.src)]) for sample in samples],
+            metadata={
+                "skipped_rows": [False for _ in samples],
+            },
+        )
+
+
 def _cfg() -> RLPostTrainConfig:
     cfg = RLPostTrainConfig()
     cfg.reward.metricx.enabled = False
@@ -130,6 +145,7 @@ def test_training_pipeline_chunks_rollouts_and_merges_scores(monkeypatch) -> Non
         xcomet_scorer=None,
         mqm_scorer=scorer,  # type: ignore[arg-type]
         esa_scorer=None,
+        group_rank_scorer=None,
         metricx_cache={},
         xcomet_cache={},
         mqm_cache={},
@@ -172,3 +188,35 @@ def test_eval_pipeline_chunks_rollouts_and_merges_scores(monkeypatch) -> None:  
     assert scorer.calls == [["ex-0"], ["ex-1"]]
     assert report["mqm_score_mean"] == pytest.approx(-2.0)
     assert [row["example_id"] for row in report["eval_rows"]] == ["ex-0", "ex-1"]
+
+
+def test_eval_pipeline_can_use_esa_without_training_esa_reward(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    cfg = _cfg()
+    cfg.reward.mqm.enabled = False
+    cfg.reward.esa.enabled = False
+    cfg.eval.use_esa = True
+    scorer = _ESARecorder({"ex-0": 81.0, "ex-1": 79.0})
+    rollout_calls: list[list[str]] = []
+
+    def _fake_generate_rollouts(**kwargs):  # type: ignore[no-untyped-def]
+        chunk_examples = list(kwargs["examples"])
+        rollout_calls.append([str(example.example_id) for example in chunk_examples])
+        return [_rollout(example) for example in chunk_examples]
+
+    monkeypatch.setenv("GEMMA27_RL_ROLLOUT_PIPELINE_CHUNK", "1")
+    monkeypatch.setattr(eval_mod, "generate_rollouts", _fake_generate_rollouts)
+
+    report = eval_mod.evaluate_on_dataset(
+        examples=_examples(),
+        policy_model=object(),
+        tokenizer=_DummyTokenizer(),
+        cfg=cfg,
+        device="cpu",
+        esa_scorer=scorer,  # type: ignore[arg-type]
+        collect_outputs=True,
+    )
+
+    assert rollout_calls == [["ex-0"], ["ex-1"]]
+    assert scorer.calls == [["ex-0"], ["ex-1"]]
+    assert report["esa_score_mean"] == pytest.approx(80.0)
+    assert [row["esa_score"] for row in report["eval_rows"]] == [81.0, 79.0]

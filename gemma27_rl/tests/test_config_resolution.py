@@ -588,3 +588,32 @@ def test_group_rank_candidate_max_must_cover_num_samples_per_prompt(tmp_path: Pa
 
     with pytest.raises(ValueError, match="generation.num_samples_per_prompt must be <= reward.group_rank.candidate_max"):
         _ = load_config(cfg_path)
+
+
+def test_eval_use_esa_requires_esa_base_url(tmp_path: Path) -> None:
+    cfg_path = tmp_path / "eval_use_esa.yaml"
+    cfg_path.write_text(
+        "\n".join(
+            [
+                "data:",
+                "  hf_dataset_name: dummy/dataset",
+                "reward:",
+                "  metricx:",
+                "    enabled: false",
+                "  xcomet:",
+                "    enabled: false",
+                "  mqm:",
+                "    enabled: false",
+                "  group_rank:",
+                "    enabled: true",
+                "    base_url: http://localhost:8000",
+                "eval:",
+                "  use_esa: true",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="reward.esa.base_url must be set when reward.esa.enabled=true or eval.use_esa=true"):
+        _ = load_config(cfg_path)

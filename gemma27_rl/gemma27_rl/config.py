@@ -350,6 +350,7 @@ class EvalConfig:
     eval_limit: int = 64
     run_before_train: bool = True
     distributed_shard: bool = False
+    use_esa: bool = False
     # Optional eval-only generation overrides.
     # Example:
     # generation_overrides:
@@ -683,6 +684,8 @@ def _validate_config(cfg: RLPostTrainConfig) -> None:
         raise ValueError("eval.generation_overrides must be a dict")
     if not isinstance(cfg.eval.distributed_shard, bool):
         raise ValueError("eval.distributed_shard must be a bool")
+    if not isinstance(cfg.eval.use_esa, bool):
+        raise ValueError("eval.use_esa must be a bool")
     if cfg.reward.overlap_policy not in {"any_overlap", "majority_overlap"}:
         raise ValueError("reward.overlap_policy must be any_overlap or majority_overlap")
     if cfg.reward.span_combine_policy not in {"sum", "min", "max"}:
@@ -891,9 +894,10 @@ def _validate_config(cfg: RLPostTrainConfig) -> None:
             raise ValueError("reward.mqm.top_k must be > 0 when set")
         if cfg.reward.mqm.repetition_penalty is not None and float(cfg.reward.mqm.repetition_penalty) <= 0:
             raise ValueError("reward.mqm.repetition_penalty must be > 0 when set")
-    if cfg.reward.esa.enabled:
+    esa_runtime_enabled = bool(cfg.reward.esa.enabled or cfg.eval.use_esa)
+    if esa_runtime_enabled:
         if not cfg.reward.esa.base_url or not str(cfg.reward.esa.base_url).strip():
-            raise ValueError("reward.esa.base_url must be set when reward.esa.enabled=true")
+            raise ValueError("reward.esa.base_url must be set when reward.esa.enabled=true or eval.use_esa=true")
         if float(cfg.reward.esa.score_max) <= float(cfg.reward.esa.score_min):
             raise ValueError("reward.esa.score_max must be greater than reward.esa.score_min")
         if int(cfg.reward.esa.max_retries) < 0:
