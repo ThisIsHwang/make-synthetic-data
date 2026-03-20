@@ -83,6 +83,72 @@ def test_parse_group_rank_response_accepts_valid_json() -> None:
     assert reasons == {1: "slightly awkward", 3: "assistant fallback"}
 
 
+def test_parse_group_rank_response_accepts_json_with_trailing_explanation() -> None:
+    ranking, critical_ids, reasons = parse_group_rank_response(
+        """{
+  "ranking": [3, 1, 2],
+  "critical_candidate_ids": [],
+  "reasons": {
+    "3": "Most faithful; captures the uncertainty ('maybe').",
+    "4": "Candidate 4 is missing from the input list."
+  }
+}
+
+Wait, I need to re-evaluate the title translation.""",
+        candidate_count=3,
+    )
+
+    assert ranking == [3, 1, 2]
+    assert critical_ids == []
+    assert reasons == {3: "Most faithful; captures the uncertainty ('maybe')."}
+
+
+def test_parse_group_rank_response_flattens_nested_reasons_and_ignores_aux_keys() -> None:
+    ranking, critical_ids, reasons = parse_group_rank_response(
+        """{
+  "ranking": [2, 4, 1, 3],
+  "critical_candidate_ids": [],
+  "reasons": {
+    "2": "Top-level reason for candidate 2.",
+    "4": "Top-level reason for candidate 4.",
+    "reasons": {
+      "1": "Nested reason for candidate 1.",
+      "3": "Nested reason for candidate 3.",
+      "note": "Ignore this note.",
+      "5": "Ignore this out-of-range candidate."
+    }
+  }
+}""",
+        candidate_count=4,
+    )
+
+    assert ranking == [2, 4, 1, 3]
+    assert critical_ids == []
+    assert reasons == {
+        1: "Nested reason for candidate 1.",
+        2: "Top-level reason for candidate 2.",
+        3: "Nested reason for candidate 3.",
+        4: "Top-level reason for candidate 4.",
+    }
+
+
+def test_parse_group_rank_response_repairs_unescaped_quotes_in_reason_strings() -> None:
+    ranking, critical_ids, reasons = parse_group_rank_response(
+        """{
+  "ranking": [2, 1, 3],
+  "critical_candidate_ids": [],
+  "reasons": {
+    "3": "Slightly less polished article formatting (as "School Sports Promotion Plan" vs as the "School Sports Promotion Plan") and uses law."
+  }
+}""",
+        candidate_count=3,
+    )
+
+    assert ranking == [2, 1, 3]
+    assert critical_ids == []
+    assert '"School Sports Promotion Plan"' in reasons[3]
+
+
 @pytest.mark.parametrize(
     "raw_text",
     [

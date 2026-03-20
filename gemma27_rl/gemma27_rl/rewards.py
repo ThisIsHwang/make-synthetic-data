@@ -2584,14 +2584,79 @@ def deduplicate_group_rank_candidates(
     return unique_candidates, original_to_unique_idx, unique_to_original_indices, normalized_candidates
 
 
+def _parse_group_rank_json_object(raw_text: str) -> dict[str, Any]:
+    obj = _try_parse_json_object(raw_text)
+    if obj is not None:
+        return obj
+
+    try:
+        parsed = json.loads(raw_text)
+    except Exception as exc:
+        raise ValueError(str(exc)) from exc
+    if not isinstance(parsed, dict):
+        raise ValueError("group rank response must be a JSON object")
+    return parsed
+
+
+def _parse_group_rank_reason_candidate_id(raw_key: Any) -> int | None:
+    if isinstance(raw_key, bool):
+        return None
+    if isinstance(raw_key, int):
+        return int(raw_key)
+    key_text = str(raw_key).strip()
+    if not key_text or re.fullmatch(r"\d+", key_text) is None:
+        return None
+    try:
+        return int(key_text)
+    except Exception:
+        return None
+
+
+def _collect_group_rank_reasons(
+    reasons_in: Any,
+    *,
+    candidate_count: int,
+) -> dict[int, str]:
+    if reasons_in is None:
+        return {}
+    if not isinstance(reasons_in, dict):
+        raise ValueError("reasons must be a dict")
+
+    reasons: dict[int, str] = {}
+    stack: list[dict[Any, Any]] = [reasons_in]
+
+    while stack:
+        current = stack.pop()
+        for raw_key, raw_value in current.items():
+            candidate_id = _parse_group_rank_reason_candidate_id(raw_key)
+            if candidate_id is None:
+                if isinstance(raw_value, dict):
+                    stack.append(raw_value)
+                elif isinstance(raw_value, list):
+                    for item in raw_value:
+                        if isinstance(item, dict):
+                            stack.append(item)
+                continue
+
+            if candidate_id < 1 or candidate_id > int(candidate_count):
+                continue
+            if candidate_id in reasons:
+                continue
+
+            if isinstance(raw_value, (dict, list)):
+                reasons[candidate_id] = json.dumps(raw_value, ensure_ascii=False)
+            else:
+                reasons[candidate_id] = str(raw_value)
+
+    return reasons
+
+
 def parse_group_rank_response(
     raw_text: str,
     *,
     candidate_count: int,
 ) -> tuple[list[int], list[int], dict[int, str]]:
-    obj = json.loads(raw_text)
-    if not isinstance(obj, dict):
-        raise ValueError("group rank response must be a JSON object")
+    obj = _parse_group_rank_json_object(raw_text)
 
     ranking = obj.get("ranking")
     if not isinstance(ranking, list):
@@ -2620,15 +2685,10 @@ def parse_group_rank_response(
         seen_critical.add(candidate_id)
         deduped_critical.append(candidate_id)
 
-    reasons_in = obj.get("reasons", {}) or {}
-    if not isinstance(reasons_in, dict):
-        raise ValueError("reasons must be a dict")
-    reasons: dict[int, str] = {}
-    for raw_key, raw_value in reasons_in.items():
-        candidate_id = int(raw_key)
-        if candidate_id < 1 or candidate_id > int(candidate_count):
-            raise ValueError("reason candidate id out of range")
-        reasons[candidate_id] = str(raw_value)
+    reasons = _collect_group_rank_reasons(
+        obj.get("reasons", {}) or {},
+        candidate_count=int(candidate_count),
+    )
 
     return list(ranking), deduped_critical, reasons
 
