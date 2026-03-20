@@ -868,14 +868,29 @@ def _extract_lenient_gemba_errors_array_body(text: str | None) -> str | None:
 
     start_idx = match.end() - 1
     depth = 0
+    in_string = False
+    escape = False
     for idx in range(start_idx, len(raw)):
         ch = raw[idx]
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+            continue
         if ch == "[":
             depth += 1
         elif ch == "]":
             depth -= 1
             if depth == 0:
                 return raw[start_idx + 1 : idx]
+    if depth > 0:
+        return raw[start_idx + 1 :]
     return None
 
 
@@ -887,7 +902,20 @@ def _extract_lenient_json_object_fragments(text: str | None) -> list[str]:
     fragments: list[str] = []
     depth = 0
     start_idx: int | None = None
+    in_string = False
+    escape = False
     for idx, ch in enumerate(raw):
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+            continue
         if ch == "{":
             if depth == 0:
                 start_idx = idx
@@ -899,6 +927,8 @@ def _extract_lenient_json_object_fragments(text: str | None) -> list[str]:
             if depth == 0 and start_idx is not None:
                 fragments.append(raw[start_idx : idx + 1])
                 start_idx = None
+    if depth > 0 and start_idx is not None:
+        fragments.append(raw[start_idx:])
     return fragments
 
 
@@ -939,12 +969,14 @@ def _parse_lenient_gemba_error_object(fragment: str) -> dict[str, Any] | None:
             raw_value = raw_value[:-1].rstrip()
         parsed[field_name] = _parse_lenient_gemba_json_value(raw_value, field_name=field_name)
 
-    if "severity" not in parsed or "type" not in parsed or "confidence" not in parsed:
+    if "severity" not in parsed or "type" not in parsed:
         return None
     if "target_span" not in parsed:
         parsed["target_span"] = None
     if "source_span" not in parsed:
         parsed["source_span"] = None
+    if "confidence" not in parsed:
+        parsed["confidence"] = 1.0
     return parsed
 
 
