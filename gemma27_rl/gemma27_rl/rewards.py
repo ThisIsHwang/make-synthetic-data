@@ -3775,8 +3775,6 @@ def _compute_mqm_unanchored_seq_penalty(
         type_weight = _resolve_mqm_token_type_weight(error_type, type_weights)
         penalty_total += severity_weight * type_weight * scale_f
     return float(penalty_total)
-
-
 def spans_to_token_rewards(
     mt_text: str,
     token_char_offsets: list[tuple[int, int]],

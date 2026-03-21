@@ -354,8 +354,6 @@ def test_gemba_mqm_extract_error_spans_returns_all_detected_spans() -> None:
     spans = gemba_mqm_extract_error_spans(raw, mt)
 
     assert [span["text"] for span in spans] == ["a", "b", "c", "d", "e", "f"]
-
-
 def test_gemba_mqm_extract_error_spans_sets_error_type() -> None:
     mt = "나는 학교에 갔다."
     raw = _mqm_json_errors(
@@ -440,8 +438,6 @@ def test_compute_mqm_unanchored_seq_penalty_filters_allowed_types_and_applies_sc
     )
 
     assert penalty == pytest.approx(-7.5)
-
-
 def test_gemba_mqm_parse_errors_rejects_unstructured_output() -> None:
     with pytest.raises(ValueError, match="structured errors|unparseable"):
         gemba_mqm_parse_errors("The translation looks mostly fine to me.")
