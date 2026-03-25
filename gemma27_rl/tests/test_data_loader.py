@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+from pathlib import Path
 
 from gemma27_rl.config import DataConfig
 from gemma27_rl.data import _WARNED_UNKNOWN_BAD_SOURCE_FLAGS, load_examples
@@ -81,6 +82,112 @@ def test_eval_file_override_with_hf_train(monkeypatch, tmp_path) -> None:
     examples = load_examples(cfg, split="eval", limit=16)
     assert [x.example_id for x in examples] == ["10", "11"]
     assert [x.src_text for x in examples] == ["eval-a", "eval-b"]
+
+
+def test_load_examples_from_train_dir_uses_sorted_matches(tmp_path: Path) -> None:
+    train_dir = tmp_path / "train"
+    train_dir.mkdir()
+    rows_by_name = {
+        "b.jsonl": [{"id": 2, "source": "src-b", "target": "tgt-b"}],
+        "a.jsonl": [{"id": 1, "source": "src-a", "target": "tgt-a"}],
+    }
+    for name, rows in rows_by_name.items():
+        path = train_dir / name
+        with path.open("w", encoding="utf-8") as f:
+            for row in rows:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+    cfg = DataConfig(
+        train_file=None,
+        train_dir=str(train_dir),
+        train_glob="*.jsonl",
+        id_field="id",
+        src_text_field="source",
+        ref_text_field="target",
+    )
+
+    examples = load_examples(cfg, split="train", limit=None)
+
+    assert [example.example_id for example in examples] == ["1", "2"]
+    assert [Path(example.input_file_path or "").name for example in examples] == ["a.jsonl", "b.jsonl"]
+
+
+def test_train_dir_takes_precedence_over_train_file(tmp_path: Path) -> None:
+    train_dir = tmp_path / "train"
+    train_dir.mkdir()
+    dir_path = train_dir / "dir_rows.jsonl"
+    file_path = tmp_path / "single.jsonl"
+
+    dir_path.write_text(json.dumps({"id": 10, "source": "dir", "target": "tgt"}, ensure_ascii=False) + "\n", encoding="utf-8")
+    file_path.write_text(
+        json.dumps({"id": 99, "source": "file", "target": "tgt"}, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+
+    cfg = DataConfig(
+        train_file=str(file_path),
+        train_dir=str(train_dir),
+        train_glob="*.jsonl",
+        id_field="id",
+        src_text_field="source",
+        ref_text_field="target",
+    )
+
+    examples = load_examples(cfg, split="train", limit=None)
+
+    assert [example.example_id for example in examples] == ["10"]
+    assert examples[0].src_text == "dir"
+
+
+def test_load_examples_derives_domain_from_teacher_path_translation_segment(tmp_path: Path) -> None:
+    data_path = tmp_path / "domains.jsonl"
+    data_path.write_text(
+        json.dumps(
+            {
+                "id": 1,
+                "source": "hello",
+                "target": "안녕하세요",
+                "teacher": {
+                    "path": "/root/raw/translation/aihub.en-ko-casual.71265/01/train.json",
+                },
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    cfg = DataConfig(
+        train_file=str(data_path),
+        id_field="id",
+        src_text_field="source",
+        ref_text_field="target",
+    )
+
+    examples = load_examples(cfg, split="train", limit=None)
+
+    assert examples[0].teacher_path == "/root/raw/translation/aihub.en-ko-casual.71265/01/train.json"
+    assert examples[0].domain == "aihub.en-ko-casual.71265"
+
+
+def test_load_examples_domain_falls_back_to_input_filename_when_teacher_path_missing(tmp_path: Path) -> None:
+    data_path = tmp_path / "sample.aihub.en-ko-casual.71265.jsonl"
+    data_path.write_text(
+        json.dumps({"id": 1, "source": "hello", "target": "안녕하세요"}, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+
+    cfg = DataConfig(
+        train_file=str(data_path),
+        id_field="id",
+        src_text_field="source",
+        ref_text_field="target",
+    )
+
+    examples = load_examples(cfg, split="train", limit=None)
+
+    assert examples[0].teacher_path is None
+    assert examples[0].domain == "sample.aihub.en-ko-casual.71265"
 
 
 def test_eval_sampling_split_from_single_train_file(tmp_path) -> None:

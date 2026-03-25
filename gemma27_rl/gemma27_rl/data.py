@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 import json
 import hashlib
 import logging
@@ -14,6 +15,12 @@ logger = logging.getLogger(__name__)
 _BAD_SOURCE_FLAG_TRUE_VALUES = {"1", "true", "t", "yes", "y", "on"}
 _BAD_SOURCE_FLAG_FALSE_VALUES = {"0", "false", "f", "no", "n", "off"}
 _WARNED_UNKNOWN_BAD_SOURCE_FLAGS: set[str] = set()
+
+
+@dataclass(frozen=True)
+class _LoadedRecord:
+    row: dict[str, Any]
+    input_file_path: str | None = None
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -68,6 +75,29 @@ def _load_records(path: str) -> list[dict[str, Any]]:
     raise ValueError(f"Unsupported data file extension: {suffix}")
 
 
+def _discover_data_files(directory: str, pattern: str) -> list[Path]:
+    base_dir = Path(directory)
+    files = sorted(path.resolve() for path in base_dir.glob(pattern) if path.is_file())
+    if files:
+        return files
+    raise FileNotFoundError(f"No data files matched pattern={pattern!r} under directory={directory!r}")
+
+
+def _load_records_from_file(path: str) -> list[_LoadedRecord]:
+    file_path = Path(path).resolve()
+    return [
+        _LoadedRecord(row=row, input_file_path=str(file_path))
+        for row in _load_records(str(file_path))
+    ]
+
+
+def _load_records_from_dir(directory: str, pattern: str) -> list[_LoadedRecord]:
+    records: list[_LoadedRecord] = []
+    for path in _discover_data_files(directory, pattern):
+        records.extend(_load_records_from_file(str(path)))
+    return records
+
+
 def _load_records_from_hf_dataset(
     dataset_name: str,
     dataset_config_name: str | None,
@@ -104,6 +134,10 @@ def _load_records_from_hf_dataset(
     return [dict(row) for row in ds]
 
 
+def _wrap_hf_records(records: list[dict[str, Any]]) -> list[_LoadedRecord]:
+    return [_LoadedRecord(row=row, input_file_path=None) for row in records]
+
+
 def _pick_text(row: dict[str, Any], field: str, default: str | None = None) -> str | None:
     if field not in row or row[field] is None:
         return default
@@ -111,6 +145,50 @@ def _pick_text(row: dict[str, Any], field: str, default: str | None = None) -> s
     if not value:
         return default
     return value
+
+
+def _pick_nested_text(row: dict[str, Any], field_path: str | None, default: str | None = None) -> str | None:
+    path_text = str(field_path or "").strip()
+    if not path_text:
+        return default
+
+    current: Any = row
+    for part in path_text.split("."):
+        key = str(part).strip()
+        if not key:
+            return default
+        if not isinstance(current, dict) or key not in current:
+            return default
+        current = current[key]
+
+    if current is None:
+        return default
+    text = str(current).strip()
+    if not text:
+        return default
+    return text
+
+
+def _derive_domain(teacher_path: str | None, input_file_path: str | None) -> str:
+    teacher_path_text = str(teacher_path or "").strip()
+    if teacher_path_text:
+        normalized = teacher_path_text.replace("\\", "/")
+        parts = [part for part in normalized.split("/") if part]
+        for idx, part in enumerate(parts[:-1]):
+            if part == "translation" and idx + 1 < len(parts):
+                dataset_id = str(parts[idx + 1]).strip()
+                if dataset_id:
+                    return dataset_id
+        teacher_stem = Path(teacher_path_text).stem.strip()
+        if teacher_stem:
+            return teacher_stem
+
+    input_path_text = str(input_file_path or "").strip()
+    if input_path_text:
+        input_stem = Path(input_path_text).stem.strip()
+        if input_stem:
+            return input_stem
+    return "unknown-domain"
 
 
 def _parse_bad_source_flag(value: Any) -> bool:
@@ -150,6 +228,9 @@ def _append_example_with_optional_reverse(
     src_lang_code: str | None,
     tgt_lang_code: str | None,
     ref_text: str | None,
+    domain: str | None,
+    teacher_path: str | None,
+    input_file_path: str | None,
     bidirectional_with_ref: bool,
     limit: int | None,
 ) -> bool:
@@ -162,6 +243,9 @@ def _append_example_with_optional_reverse(
             src_lang_code=src_lang_code,
             tgt_lang_code=tgt_lang_code,
             ref_text=ref_text,
+            domain=domain,
+            teacher_path=teacher_path,
+            input_file_path=input_file_path,
         )
     )
     if limit is not None and len(examples) >= limit:
@@ -180,15 +264,22 @@ def _append_example_with_optional_reverse(
             src_lang_code=tgt_lang_code,
             tgt_lang_code=src_lang_code,
             ref_text=src_text,
+            domain=domain,
+            teacher_path=teacher_path,
+            input_file_path=input_file_path,
         )
     )
     return limit is not None and len(examples) >= limit
 
 
-def _resolve_split(records: list[dict[str, Any]], split_field: str | None, split_name: str | None) -> list[dict[str, Any]]:
+def _resolve_split(
+    records: list[_LoadedRecord],
+    split_field: str | None,
+    split_name: str | None,
+) -> list[_LoadedRecord]:
     if not split_field or not split_name:
         return records
-    return [row for row in records if str(row.get(split_field, "")).strip() == split_name]
+    return [record for record in records if str(record.row.get(split_field, "")).strip() == split_name]
 
 
 def _build_split_key(row: dict[str, Any], id_field: str) -> str:
@@ -207,14 +298,14 @@ def _stable_split_hash(seed: int, key: str) -> int:
 
 
 def _apply_eval_sampling_split(
-    records: list[dict[str, Any]],
+    records: list[_LoadedRecord],
     split: str,
     id_field: str,
     eval_ratio: float | None,
     eval_count: int | None,
     seed: int,
     min_eval_samples: int,
-) -> list[dict[str, Any]]:
+) -> list[_LoadedRecord]:
     if split not in {"train", "eval"}:
         return records
 
@@ -233,8 +324,8 @@ def _apply_eval_sampling_split(
     eval_size = max(1, eval_size)
 
     scored: list[tuple[int, int]] = []
-    for idx, row in enumerate(records):
-        key = _build_split_key(row, id_field=id_field)
+    for idx, record in enumerate(records):
+        key = _build_split_key(record.row, id_field=id_field)
         score = _stable_split_hash(seed=seed, key=key)
         scored.append((idx, score))
 
@@ -242,9 +333,9 @@ def _apply_eval_sampling_split(
     eval_idx = {idx for idx, _score in scored[:eval_size]}
 
     if split == "eval":
-        sampled = [row for idx, row in enumerate(records) if idx in eval_idx]
+        sampled = [record for idx, record in enumerate(records) if idx in eval_idx]
     else:
-        sampled = [row for idx, row in enumerate(records) if idx not in eval_idx]
+        sampled = [record for idx, record in enumerate(records) if idx not in eval_idx]
 
     logger.info(
         "Applied eval_sampling split=%s total=%s eval_size=%s train_size=%s seed=%s mode=%s ratio=%s count=%s",
@@ -260,21 +351,42 @@ def _apply_eval_sampling_split(
     return sampled
 
 
+def _resolve_file_or_dir_override(
+    cfg: DataConfig,
+    split: str,
+) -> tuple[str | None, str | None, str | None]:
+    if split == "train":
+        if cfg.train_dir:
+            return "dir", cfg.train_dir, cfg.train_glob
+        if cfg.train_file:
+            return "file", cfg.train_file, None
+        return None, None, None
+
+    if cfg.eval_dir:
+        return "dir", cfg.eval_dir, cfg.eval_glob or cfg.train_glob
+    if cfg.eval_file:
+        return "file", cfg.eval_file, None
+    if cfg.train_dir:
+        return "dir", cfg.train_dir, cfg.train_glob
+    if cfg.train_file:
+        return "file", cfg.train_file, None
+    return None, None, None
+
+
 def load_examples(cfg: DataConfig, split: str, limit: int | None = None) -> list[Example]:
     use_hf_dataset = bool(cfg.hf_dataset_name and str(cfg.hf_dataset_name).strip())
     bidirectional_with_ref = bool(cfg.bidirectional_with_ref)
     if split == "eval" and cfg.eval_bidirectional_with_ref is not None:
         bidirectional_with_ref = bool(cfg.eval_bidirectional_with_ref)
 
-    # Allow file-based eval override even when train uses HF datasets.
-    file_override: str | None = None
-    if split == "train" and cfg.train_file:
-        file_override = cfg.train_file
-    if split == "eval" and cfg.eval_file:
-        file_override = cfg.eval_file
+    source_kind, source_value, source_glob = _resolve_file_or_dir_override(cfg, split)
 
-    if file_override:
-        records = _load_records(file_override)
+    if source_kind == "dir" and source_value:
+        records = _load_records_from_dir(source_value, source_glob or cfg.train_glob)
+        split_name = cfg.train_split if split == "train" else cfg.eval_split
+        records = _resolve_split(records, cfg.split_field, split_name)
+    elif source_kind == "file" and source_value:
+        records = _load_records_from_file(source_value)
         split_name = cfg.train_split if split == "train" else cfg.eval_split
         records = _resolve_split(records, cfg.split_field, split_name)
     elif use_hf_dataset:
@@ -282,25 +394,27 @@ def load_examples(cfg: DataConfig, split: str, limit: int | None = None) -> list
             hf_split = cfg.hf_train_split
         else:
             hf_split = cfg.hf_eval_split or cfg.hf_train_split
-        records = _load_records_from_hf_dataset(
-            dataset_name=cfg.hf_dataset_name or "",
-            dataset_config_name=cfg.hf_dataset_config_name,
-            split_name=hf_split,
-            revision=cfg.hf_revision,
-            streaming=cfg.hf_streaming,
-            limit=limit,
+        records = _wrap_hf_records(
+            _load_records_from_hf_dataset(
+                dataset_name=cfg.hf_dataset_name or "",
+                dataset_config_name=cfg.hf_dataset_config_name,
+                split_name=hf_split,
+                revision=cfg.hf_revision,
+                streaming=cfg.hf_streaming,
+                limit=limit,
+            )
         )
     else:
-        data_file = cfg.train_file if split == "train" else (cfg.eval_file or cfg.train_file)
-        if not data_file:
+        if not source_value:
             raise ValueError(f"No data file configured for split={split}")
-        records = _load_records(data_file)
+        records = _load_records_from_file(source_value)
         split_name = cfg.train_split if split == "train" else cfg.eval_split
         records = _resolve_split(records, cfg.split_field, split_name)
 
     if (
-        not use_hf_dataset
+        source_kind in {"file", "dir"}
         and cfg.eval_file is None
+        and cfg.eval_dir is None
         and (cfg.eval_sampling_count is not None or cfg.eval_sampling_ratio is not None)
         and not (cfg.split_field and (cfg.train_split or cfg.eval_split))
     ):
@@ -318,7 +432,8 @@ def load_examples(cfg: DataConfig, split: str, limit: int | None = None) -> list
     skipped_bad_source = 0
     skipped_empty_source = 0
     reverse_examples_added = 0
-    for idx, row in enumerate(records):
+    for idx, record in enumerate(records):
+        row = record.row
         if cfg.skip_bad_source and _parse_bad_source_flag(row.get(cfg.is_bad_source_field, False)):
             skipped_bad_source += 1
             continue
@@ -333,6 +448,8 @@ def load_examples(cfg: DataConfig, split: str, limit: int | None = None) -> list
         src_code = _pick_text(row, cfg.src_lang_code_field, cfg.default_src_lang_code)
         tgt_code = _pick_text(row, cfg.tgt_lang_code_field, cfg.default_tgt_lang_code)
         ref_text = _pick_text(row, cfg.ref_text_field, None)
+        teacher_path = _pick_nested_text(row, cfg.domain_field_path, None)
+        domain = _derive_domain(teacher_path, record.input_file_path)
         ex_id = _pick_text(row, cfg.id_field, str(idx)) or str(idx)
 
         before_count = len(examples)
@@ -345,6 +462,9 @@ def load_examples(cfg: DataConfig, split: str, limit: int | None = None) -> list
             src_lang_code=src_code,
             tgt_lang_code=tgt_code,
             ref_text=ref_text,
+            domain=domain,
+            teacher_path=teacher_path,
+            input_file_path=record.input_file_path,
             bidirectional_with_ref=bidirectional_with_ref,
             limit=limit,
         )
@@ -353,10 +473,11 @@ def load_examples(cfg: DataConfig, split: str, limit: int | None = None) -> list
             break
 
     logger.info(
-        "Loaded %s examples for split=%s (records=%s skipped_bad_source=%s skipped_empty_source=%s reverse_examples=%s)",
+        "Loaded %s examples for split=%s (records=%s source=%s skipped_bad_source=%s skipped_empty_source=%s reverse_examples=%s)",
         len(examples),
         split,
         len(records),
+        source_kind or ("hf" if use_hf_dataset else "file"),
         skipped_bad_source,
         skipped_empty_source,
         reverse_examples_added,

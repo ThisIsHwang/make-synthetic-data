@@ -311,6 +311,96 @@ def test_disable_reference_model_allows_reference_gpu_settings_without_deepspeed
     assert cfg.model.reference_gpu_ids == [0, 1]
 
 
+def test_data_dir_and_bucketing_fields_load_from_yaml(tmp_path: Path) -> None:
+    data_dir = tmp_path / "datasets"
+    data_dir.mkdir()
+
+    cfg_path = tmp_path / "train.yaml"
+    cfg_path.write_text(
+        "\n".join(
+            [
+                "data:",
+                "  train_dir: ./datasets",
+                "  train_glob: '*.jsonl'",
+                "  eval_dir: ./datasets",
+                "  eval_glob: '**/*.jsonl'",
+                "  batching_strategy: direction_domain_length",
+                "  domain_field_path: metadata.teacher_path",
+                "reward:",
+                "  xcomet:",
+                "    enabled: false",
+                "  mqm:",
+                "    enabled: false",
+                "  esa:",
+                "    enabled: false",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    cfg = load_config(cfg_path)
+
+    assert cfg.data.train_dir == str(data_dir)
+    assert cfg.data.eval_dir == str(data_dir)
+    assert cfg.data.train_glob == "*.jsonl"
+    assert cfg.data.eval_glob == "**/*.jsonl"
+    assert cfg.data.batching_strategy == "direction_domain_length"
+    assert cfg.data.domain_field_path == "metadata.teacher_path"
+
+
+def test_train_dir_must_exist_when_configured(tmp_path: Path) -> None:
+    cfg_path = tmp_path / "train.yaml"
+    cfg_path.write_text(
+        "\n".join(
+            [
+                "data:",
+                "  train_dir: ./missing",
+                "reward:",
+                "  xcomet:",
+                "    enabled: false",
+                "  mqm:",
+                "    enabled: false",
+                "  esa:",
+                "    enabled: false",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(FileNotFoundError, match="data.train_dir not found"):
+        _ = load_config(cfg_path)
+
+
+def test_batching_strategy_validation_rejects_unknown_value(tmp_path: Path) -> None:
+    data_dir = tmp_path / "datasets"
+    data_dir.mkdir()
+
+    cfg_path = tmp_path / "train.yaml"
+    cfg_path.write_text(
+        "\n".join(
+            [
+                "data:",
+                "  train_dir: ./datasets",
+                "  batching_strategy: unknown_mode",
+                "reward:",
+                "  xcomet:",
+                "    enabled: false",
+                "  mqm:",
+                "    enabled: false",
+                "  esa:",
+                "    enabled: false",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="data.batching_strategy must be direction\\|direction_domain_length"):
+        _ = load_config(cfg_path)
+
+
 def test_colocated_reference_with_lora_allows_overlapping_gpu_ids(tmp_path: Path) -> None:
     cfg_path = tmp_path / "train.yaml"
     cfg_path.write_text(

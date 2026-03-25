@@ -63,7 +63,12 @@ from .rewards import (
     metricx_score_to_reward,
     spans_to_token_rewards,
 )
-from .rollout import compute_completion_logprobs, compute_completion_logprobs_batch, generate_rollouts
+from .rollout import (
+    compute_completion_logprobs,
+    compute_completion_logprobs_batch,
+    compute_prompt_token_lengths,
+    generate_rollouts,
+)
 from .rl_types import Example, GroupRankSample, Rollout, SampleForScoring
 from .utils import (
     build_worker_launch_command,
@@ -133,6 +138,10 @@ def _example_direction_key(example: Example) -> str:
     return f"{src}->{tgt}"
 
 
+def _example_domain_key(example: Example) -> str:
+    return str(example.domain or "").strip() or "unknown-domain"
+
+
 class _DirectionBatchSampler:
     def __init__(self, *, examples: list[Example], rng: random.Random) -> None:
         self._rng = rng
@@ -182,6 +191,158 @@ class _DirectionBatchSampler:
                     break
             selected.append(int(queue.popleft()))
         return direction, selected
+
+
+class _DirectionDomainLengthBatchSampler:
+    def __init__(
+        self,
+        *,
+        examples: list[Example],
+        prompt_token_lengths: list[int],
+        effective_batch_size: int,
+        rng: random.Random,
+    ) -> None:
+        if len(examples) != len(prompt_token_lengths):
+            raise ValueError(
+                "prompt_token_lengths must align with examples: "
+                f"{len(prompt_token_lengths)} != {len(examples)}"
+            )
+        self._rng = rng
+        self._effective_batch_size = max(1, int(effective_batch_size))
+        self._prompt_token_lengths = [max(0, int(length)) for length in prompt_token_lengths]
+        self._group_indices: dict[str, list[int]] = {}
+        self._group_buckets_base: dict[str, list[list[int]]] = {}
+        self._queues: dict[str, deque[list[int]]] = {}
+        self._active_groups: deque[str] = deque()
+
+        for idx, example in enumerate(examples):
+            group_key = f"{_example_direction_key(example)}|{_example_domain_key(example)}"
+            self._group_indices.setdefault(group_key, []).append(idx)
+
+        for group_key, indices in self._group_indices.items():
+            sorted_indices = sorted(indices, key=lambda idx: (self._prompt_token_lengths[idx], idx))
+            buckets: list[list[int]] = []
+            for start in range(0, len(sorted_indices), self._effective_batch_size):
+                bucket = [int(idx) for idx in sorted_indices[start:start + self._effective_batch_size]]
+                if not bucket:
+                    continue
+                partial_bucket = list(bucket)
+                while len(bucket) < self._effective_batch_size:
+                    refill_idx = (len(bucket) - len(partial_bucket)) % len(partial_bucket)
+                    bucket.append(int(partial_bucket[refill_idx]))
+                buckets.append(bucket)
+            self._group_buckets_base[group_key] = buckets
+            self._queues[group_key] = deque()
+
+        self._refill_all_groups()
+
+    @property
+    def group_keys(self) -> list[str]:
+        return sorted(self._group_indices)
+
+    def _refill_all_groups(self) -> None:
+        active_groups: list[str] = []
+        for group_key, buckets in self._group_buckets_base.items():
+            bucket_rows = [list(bucket) for bucket in buckets]
+            self._rng.shuffle(bucket_rows)
+            self._queues[group_key] = deque(bucket_rows)
+            if bucket_rows:
+                active_groups.append(group_key)
+        self._rng.shuffle(active_groups)
+        self._active_groups = deque(active_groups)
+
+    def next_batch(self, batch_size: int) -> tuple[str, list[int]]:
+        requested = max(1, int(batch_size))
+        if requested != self._effective_batch_size:
+            raise ValueError(
+                "direction_domain_length sampler expects a fixed effective batch size: "
+                f"requested={requested} configured={self._effective_batch_size}"
+            )
+
+        while True:
+            if not self._active_groups:
+                self._refill_all_groups()
+            while self._active_groups:
+                group_key = str(self._active_groups.popleft())
+                queue = self._queues.get(group_key)
+                if not queue:
+                    continue
+                batch = [int(idx) for idx in queue.popleft()]
+                if queue:
+                    self._active_groups.append(group_key)
+                return group_key, batch
+            if not self._group_buckets_base:
+                raise ValueError("Direction/domain/length batch sampler has no examples.")
+
+
+def _summarize_batch_values(values: list[str], *, max_items: int = 3) -> str:
+    clean = [str(value).strip() for value in values if str(value).strip()]
+    if not clean:
+        return "unknown"
+    unique = sorted(set(clean))
+    if len(unique) == 1:
+        return unique[0]
+    preview = ", ".join(unique[:max_items])
+    if len(unique) > max_items:
+        preview += f", +{len(unique) - max_items} more"
+    return f"mixed[{len(unique)}]: {preview}"
+
+
+def _build_batch_log_summary(
+    *,
+    examples: list[Example],
+    batch_indices: list[int],
+    prompt_token_lengths: list[int] | None = None,
+) -> dict[str, Any]:
+    if not batch_indices:
+        return {
+            "direction": "unknown",
+            "domain": "unknown",
+            "prompt_count": 0,
+            "prompt_token_length_min": None,
+            "prompt_token_length_max": None,
+        }
+
+    directions = [_example_direction_key(examples[idx]) for idx in batch_indices]
+    domains = [_example_domain_key(examples[idx]) for idx in batch_indices]
+    prompt_lengths: list[int] = []
+    if prompt_token_lengths is not None:
+        prompt_lengths = [
+            max(0, int(prompt_token_lengths[idx]))
+            for idx in batch_indices
+            if 0 <= int(idx) < len(prompt_token_lengths)
+        ]
+
+    return {
+        "direction": _summarize_batch_values(directions),
+        "domain": _summarize_batch_values(domains),
+        "prompt_count": len(batch_indices),
+        "prompt_token_length_min": min(prompt_lengths) if prompt_lengths else None,
+        "prompt_token_length_max": max(prompt_lengths) if prompt_lengths else None,
+    }
+
+
+def _log_selected_training_batch(
+    *,
+    update_idx: int,
+    examples: list[Example],
+    batch_indices: list[int],
+    prompt_token_lengths: list[int] | None = None,
+) -> None:
+    summary = _build_batch_log_summary(
+        examples=examples,
+        batch_indices=batch_indices,
+        prompt_token_lengths=prompt_token_lengths,
+    )
+    logger.info(
+        "update=%s selected training batch direction=%s domain=%s prompts=%s prompt_token_len_min=%s prompt_token_len_max=%s",
+        update_idx,
+        summary["direction"],
+        summary["domain"],
+        summary["prompt_count"],
+        summary["prompt_token_length_min"],
+        summary["prompt_token_length_max"],
+    )
 
 
 def _span_overlap_chars(start: int, end: int, tok_s: int, tok_e: int) -> int:
@@ -5141,8 +5302,26 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
             f"limit={cfg.data.limit}, "
             f"hf_dataset_name={cfg.data.hf_dataset_name!r}, "
             f"hf_train_split={cfg.data.hf_train_split!r}, "
-            f"train_file={cfg.data.train_file!r}."
+            f"train_file={cfg.data.train_file!r}, "
+            f"train_dir={cfg.data.train_dir!r}."
         )
+
+    batching_strategy = str(cfg.data.batching_strategy or "direction").strip().lower() or "direction"
+    train_prompt_token_lengths: list[int] | None = None
+    if batching_strategy == "direction_domain_length":
+        train_prompt_token_lengths = compute_prompt_token_lengths(
+            examples=train_examples,
+            tokenizer=tokenizer,
+            template=cfg.prompt.template,
+            gen_cfg=cfg.generation,
+        )
+        if rank0:
+            logger.info(
+                "Prepared prompt token lengths for bucketed batching: examples=%s min=%s max=%s",
+                len(train_prompt_token_lengths),
+                min(train_prompt_token_lengths) if train_prompt_token_lengths else 0,
+                max(train_prompt_token_lengths) if train_prompt_token_lengths else 0,
+            )
 
     eval_limit = cfg.eval.eval_limit if cfg.eval.eval_limit is not None else cfg.data.eval_limit
     eval_examples = load_examples(cfg.data, split="eval", limit=eval_limit)
@@ -5687,7 +5866,19 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
     rng = random.Random(cfg.misc.seed)
     per_rank_batch_size = max(1, int(cfg.rl.batch_size))
     effective_batch_size = per_rank_batch_size * (world_size if (use_deepspeed and world_size > 1) else 1)
-    train_batch_sampler = _DirectionBatchSampler(examples=train_examples, rng=rng)
+    if batching_strategy == "direction_domain_length":
+        if train_prompt_token_lengths is None:
+            raise RuntimeError("prompt token lengths must be prepared for direction_domain_length batching")
+        train_batch_sampler: _DirectionBatchSampler | _DirectionDomainLengthBatchSampler = (
+            _DirectionDomainLengthBatchSampler(
+                examples=train_examples,
+                prompt_token_lengths=train_prompt_token_lengths,
+                effective_batch_size=effective_batch_size,
+                rng=rng,
+            )
+        )
+    else:
+        train_batch_sampler = _DirectionBatchSampler(examples=train_examples, rng=rng)
     updates_per_epoch = math.ceil(len(train_examples) / max(1, effective_batch_size))
     if (not use_deepspeed) or rank0:
         logger.info(
@@ -5698,7 +5889,13 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
             updates_per_epoch,
             cfg.rl.updates,
         )
-        if len(train_batch_sampler.directions) > 1:
+        if batching_strategy == "direction_domain_length":
+            logger.info(
+                "Direction/domain/length train batching enabled: groups=%s effective_batch_size=%s",
+                len(train_batch_sampler.group_keys),
+                effective_batch_size,
+            )
+        elif len(train_batch_sampler.directions) > 1:
             logger.info(
                 "Directional train batching enabled: each update uses a single direction. directions=%s",
                 train_batch_sampler.directions,
@@ -5741,12 +5938,12 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
             if not local_indices:
                 logger.warning("Rank %s has empty rollout shard at update=%s; skipping step.", rank, update_idx)
             local_examples = [train_examples[i] for i in local_indices]
-            if local_examples and rank0 and batch_direction:
-                logger.info(
-                    "update=%s selected training direction=%s prompts=%s",
-                    update_idx,
-                    batch_direction,
-                    len(local_examples) * world_size,
+            if local_examples and rank0:
+                _log_selected_training_batch(
+                    update_idx=update_idx,
+                    examples=train_examples,
+                    batch_indices=global_indices,
+                    prompt_token_lengths=train_prompt_token_lengths,
                 )
             local_prompt_instance_ids = [
                 f"u{update_idx}:r{rank}:p{pos}:idx{int(local_indices[pos])}"
@@ -5921,12 +6118,12 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
         elif (not use_deepspeed) or rank0:
             batch_direction, batch_indices = train_batch_sampler.next_batch(max(1, cfg.rl.batch_size))
             batch_examples = [train_examples[i] for i in batch_indices]
-            if batch_examples and batch_direction:
-                logger.info(
-                    "update=%s selected training direction=%s prompts=%s",
-                    update_idx,
-                    batch_direction,
-                    len(batch_examples),
+            if batch_examples:
+                _log_selected_training_batch(
+                    update_idx=update_idx,
+                    examples=train_examples,
+                    batch_indices=batch_indices,
+                    prompt_token_lengths=train_prompt_token_lengths,
                 )
             prompt_instance_ids = [
                 f"u{update_idx}:r{rank}:p{pos}:idx{int(batch_indices[pos])}"

@@ -13,6 +13,9 @@ class Example:
     src_lang_code: str | None = None
     tgt_lang_code: str | None = None
     ref_text: str | None = None
+    domain: str | None = None
+    teacher_path: str | None = None
+    input_file_path: str | None = None
 
 
 @dataclass

@@ -72,6 +72,10 @@ class LoRAConfig:
 class DataConfig:
     train_file: str | None = "../runs/exp001/final_dataset.jsonl"
     eval_file: str | None = None
+    train_dir: str | None = None
+    eval_dir: str | None = None
+    train_glob: str = "*.jsonl"
+    eval_glob: str | None = None
     hf_dataset_name: str | None = None
     hf_dataset_config_name: str | None = None
     hf_train_split: str = "train"
@@ -105,6 +109,8 @@ class DataConfig:
     default_tgt_lang: str = "Korean"
     default_src_lang_code: str = "en"
     default_tgt_lang_code: str = "ko"
+    batching_strategy: str = "direction"  # direction|direction_domain_length
+    domain_field_path: str = "teacher.path"
 
 
 @dataclass
@@ -589,16 +595,43 @@ def _host_label(host: str | None) -> str:
 
 def _validate_config(cfg: RLPostTrainConfig) -> None:
     use_hf_dataset = bool(cfg.data.hf_dataset_name and str(cfg.data.hf_dataset_name).strip())
-    if use_hf_dataset:
+    train_file_override = bool(cfg.data.train_file and str(cfg.data.train_file).strip())
+    train_dir_override = bool(cfg.data.train_dir and str(cfg.data.train_dir).strip())
+    eval_file_override = bool(cfg.data.eval_file and str(cfg.data.eval_file).strip())
+    eval_dir_override = bool(cfg.data.eval_dir and str(cfg.data.eval_dir).strip())
+
+    if use_hf_dataset and (not train_file_override) and (not train_dir_override):
         if not cfg.data.hf_train_split.strip():
             raise ValueError("data.hf_train_split must not be empty when data.hf_dataset_name is set.")
-        if cfg.data.eval_file and not Path(cfg.data.eval_file).exists():
-            raise FileNotFoundError(f"data.eval_file not found: {cfg.data.eval_file}")
-    else:
-        if not cfg.data.train_file or not Path(cfg.data.train_file).exists():
-            raise FileNotFoundError(f"data.train_file not found: {cfg.data.train_file}")
-        if cfg.data.eval_file and not Path(cfg.data.eval_file).exists():
-            raise FileNotFoundError(f"data.eval_file not found: {cfg.data.eval_file}")
+    elif (not use_hf_dataset) and (not train_file_override) and (not train_dir_override):
+        raise FileNotFoundError(
+            "One of data.train_file or data.train_dir must be configured when data.hf_dataset_name is not set."
+        )
+
+    if train_file_override and (not train_dir_override) and (not use_hf_dataset) and not Path(cfg.data.train_file or "").exists():
+        raise FileNotFoundError(f"data.train_file not found: {cfg.data.train_file}")
+    if eval_file_override and (not eval_dir_override) and not Path(cfg.data.eval_file or "").exists():
+        raise FileNotFoundError(f"data.eval_file not found: {cfg.data.eval_file}")
+    if train_dir_override:
+        train_dir = Path(cfg.data.train_dir or "")
+        if not train_dir.exists():
+            raise FileNotFoundError(f"data.train_dir not found: {cfg.data.train_dir}")
+        if not train_dir.is_dir():
+            raise ValueError(f"data.train_dir must be a directory: {cfg.data.train_dir}")
+    if eval_dir_override:
+        eval_dir = Path(cfg.data.eval_dir or "")
+        if not eval_dir.exists():
+            raise FileNotFoundError(f"data.eval_dir not found: {cfg.data.eval_dir}")
+        if not eval_dir.is_dir():
+            raise ValueError(f"data.eval_dir must be a directory: {cfg.data.eval_dir}")
+    if not str(cfg.data.train_glob or "").strip():
+        raise ValueError("data.train_glob must not be empty")
+    if cfg.data.eval_glob is not None and not str(cfg.data.eval_glob).strip():
+        raise ValueError("data.eval_glob must not be empty when set")
+    if str(cfg.data.batching_strategy or "").strip().lower() not in {"direction", "direction_domain_length"}:
+        raise ValueError("data.batching_strategy must be direction|direction_domain_length")
+    if not str(cfg.data.domain_field_path or "").strip():
+        raise ValueError("data.domain_field_path must not be empty")
     if cfg.generation.num_samples_per_prompt <= 0:
         raise ValueError("generation.num_samples_per_prompt must be > 0")
     for field_name, raw in (
@@ -1038,6 +1071,8 @@ def load_config(path: str | Path) -> RLPostTrainConfig:
     base_dir = cfg_path.parent.resolve()
     cfg.data.train_file = _resolve_optional_path(cfg.data.train_file, base_dir)
     cfg.data.eval_file = _resolve_optional_path(cfg.data.eval_file, base_dir)
+    cfg.data.train_dir = _resolve_optional_path(cfg.data.train_dir, base_dir)
+    cfg.data.eval_dir = _resolve_optional_path(cfg.data.eval_dir, base_dir)
     cfg.model.policy_name_or_path = (
         _resolve_model_name_or_path(cfg.model.policy_name_or_path, base_dir)
         or cfg.model.policy_name_or_path
@@ -1049,6 +1084,10 @@ def load_config(path: str | Path) -> RLPostTrainConfig:
     cfg.logging.tensorboard_dir = _resolve_optional_path(cfg.logging.tensorboard_dir, base_dir)
     cfg.misc.huggingface_cache_dir = _resolve_optional_path(cfg.misc.huggingface_cache_dir, base_dir)
     cfg.rl.deepspeed_config_path = _resolve_optional_path(cfg.rl.deepspeed_config_path, base_dir)
+    cfg.data.train_glob = str(cfg.data.train_glob or "*.jsonl").strip() or "*.jsonl"
+    cfg.data.eval_glob = _normalize_optional_text(cfg.data.eval_glob)
+    cfg.data.batching_strategy = str(cfg.data.batching_strategy or "direction").strip().lower() or "direction"
+    cfg.data.domain_field_path = str(cfg.data.domain_field_path or "teacher.path").strip() or "teacher.path"
     cfg.logging.wandb_entity = _normalize_optional_text(cfg.logging.wandb_entity)
     cfg.logging.wandb_run_name = _normalize_optional_text(cfg.logging.wandb_run_name)
     cfg.logging.wandb_mode = str(cfg.logging.wandb_mode or "online").strip().lower() or "online"

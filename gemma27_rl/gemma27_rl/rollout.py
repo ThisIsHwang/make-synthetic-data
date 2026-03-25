@@ -614,6 +614,26 @@ def _encode_prompt_rows(
     return out_rows
 
 
+def compute_prompt_token_lengths(
+    *,
+    examples: list[Example],
+    tokenizer: PreTrainedTokenizerBase,
+    template: str = DEFAULT_TRANSLATION_PROMPT_TEMPLATE,
+    gen_cfg: GenerationConfig | None = None,
+) -> list[int]:
+    if not examples:
+        return []
+
+    prompt_texts = [format_translation_prompt(example, template=template) for example in examples]
+    prompt_rows = _encode_prompt_rows(
+        tokenizer=tokenizer,
+        prompt_texts=prompt_texts,
+        gen_cfg=gen_cfg or GenerationConfig(),
+        pad_token_id=tokenizer.pad_token_id,
+    )
+    return [len(row) for row in prompt_rows]
+
+
 def _build_left_padded_prompt_tensors(
     *,
     prompt_id_rows: list[list[int]],
