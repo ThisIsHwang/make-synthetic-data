@@ -15,6 +15,8 @@ logger = logging.getLogger(__name__)
 _BAD_SOURCE_FLAG_TRUE_VALUES = {"1", "true", "t", "yes", "y", "on"}
 _BAD_SOURCE_FLAG_FALSE_VALUES = {"0", "false", "f", "no", "n", "off"}
 _WARNED_UNKNOWN_BAD_SOURCE_FLAGS: set[str] = set()
+_CACHE_INPUT_FILE_PATH_FIELD = "__gemma27_input_file_path__"
+_SPLIT_CACHE_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -85,10 +87,17 @@ def _discover_data_files(directory: str, pattern: str) -> list[Path]:
 
 def _load_records_from_file(path: str) -> list[_LoadedRecord]:
     file_path = Path(path).resolve()
-    return [
-        _LoadedRecord(row=row, input_file_path=str(file_path))
-        for row in _load_records(str(file_path))
-    ]
+    records: list[_LoadedRecord] = []
+    for row in _load_records(str(file_path)):
+        row_copy = dict(row)
+        cached_input_file_path = row_copy.pop(_CACHE_INPUT_FILE_PATH_FIELD, None)
+        input_file_path = (
+            str(cached_input_file_path).strip()
+            if isinstance(cached_input_file_path, str) and str(cached_input_file_path).strip()
+            else str(file_path)
+        )
+        records.append(_LoadedRecord(row=row_copy, input_file_path=input_file_path))
+    return records
 
 
 def _load_records_from_dir(directory: str, pattern: str) -> list[_LoadedRecord]:
@@ -282,14 +291,19 @@ def _resolve_split(
     return [record for record in records if str(record.row.get(split_field, "")).strip() == split_name]
 
 
-def _build_split_key(row: dict[str, Any], id_field: str) -> str:
+def _build_split_key(row: dict[str, Any], id_field: str, input_file_path: str | None = None) -> str:
     raw = row.get(id_field)
     if raw is not None:
         text = str(raw).strip()
         if text:
+            if input_file_path:
+                return f"{input_file_path}::{text}"
             return text
     # Fallback for rows without stable IDs.
-    return json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    payload_text = json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    if input_file_path:
+        return f"{input_file_path}::{payload_text}"
+    return payload_text
 
 
 def _stable_split_hash(seed: int, key: str) -> int:
@@ -325,7 +339,7 @@ def _apply_eval_sampling_split(
 
     scored: list[tuple[int, int]] = []
     for idx, record in enumerate(records):
-        key = _build_split_key(record.row, id_field=id_field)
+        key = _build_split_key(record.row, id_field=id_field, input_file_path=record.input_file_path)
         score = _stable_split_hash(seed=seed, key=key)
         scored.append((idx, score))
 
@@ -349,6 +363,287 @@ def _apply_eval_sampling_split(
         eval_count,
     )
     return sampled
+
+
+def _record_domain(record: _LoadedRecord, domain_field_path: str) -> str:
+    teacher_path = _pick_nested_text(record.row, domain_field_path, None)
+    return _derive_domain(teacher_path, record.input_file_path)
+
+
+def _compute_eval_size_for_ratio(*, total: int, eval_ratio: float | None, min_eval_samples: int) -> int:
+    if total <= 1:
+        return 0
+    ratio = float(eval_ratio or 0.0)
+    eval_size = int(round(total * ratio))
+    eval_size = max(int(min_eval_samples), eval_size)
+    eval_size = min(eval_size, total - 1)
+    return max(1, eval_size)
+
+
+def _allocate_eval_counts_by_domain(
+    *,
+    domain_sizes: dict[str, int],
+    total_eval_count: int,
+) -> dict[str, int]:
+    eligible = [
+        (domain, int(size))
+        for domain, size in sorted(domain_sizes.items())
+        if int(size) > 1
+    ]
+    if not eligible:
+        return {domain: 0 for domain in domain_sizes}
+
+    max_total = sum(size - 1 for _, size in eligible)
+    target = min(max(0, int(total_eval_count)), max_total)
+    if target <= 0:
+        return {domain: 0 for domain in domain_sizes}
+
+    total_weight = sum(size for _, size in eligible)
+    allocations: dict[str, int] = {domain: 0 for domain in domain_sizes}
+    remainders: list[tuple[float, str]] = []
+
+    assigned = 0
+    for domain, size in eligible:
+        ideal = (float(target) * float(size)) / float(max(1, total_weight))
+        base = min(size - 1, int(ideal))
+        allocations[domain] = base
+        assigned += base
+        remainders.append((ideal - float(base), domain))
+
+    remainders.sort(key=lambda item: (-item[0], item[1]))
+    remainder_idx = 0
+    while assigned < target and remainders:
+        _, domain = remainders[remainder_idx % len(remainders)]
+        capacity = int(domain_sizes.get(domain, 0)) - 1
+        if allocations[domain] < capacity:
+            allocations[domain] += 1
+            assigned += 1
+        remainder_idx += 1
+        if remainder_idx > (len(remainders) * max(1, target + len(remainders))):
+            break
+
+    return allocations
+
+
+def _apply_domain_stratified_eval_sampling_split(
+    *,
+    records: list[_LoadedRecord],
+    split: str,
+    id_field: str,
+    eval_ratio: float | None,
+    eval_count: int | None,
+    seed: int,
+    min_eval_samples: int,
+    domain_field_path: str,
+) -> list[_LoadedRecord]:
+    if split not in {"train", "eval"}:
+        return records
+
+    domain_to_indices: dict[str, list[int]] = {}
+    for idx, record in enumerate(records):
+        domain = _record_domain(record, domain_field_path)
+        domain_to_indices.setdefault(domain, []).append(idx)
+
+    if eval_count is not None:
+        eval_counts_by_domain = _allocate_eval_counts_by_domain(
+            domain_sizes={domain: len(indices) for domain, indices in domain_to_indices.items()},
+            total_eval_count=int(eval_count),
+        )
+    else:
+        eval_counts_by_domain = {
+            domain: _compute_eval_size_for_ratio(
+                total=len(indices),
+                eval_ratio=eval_ratio,
+                min_eval_samples=min_eval_samples,
+            )
+            for domain, indices in domain_to_indices.items()
+        }
+
+    selected_eval_indices: set[int] = set()
+    summary_parts: list[str] = []
+    for domain, indices in sorted(domain_to_indices.items()):
+        eval_size = max(0, int(eval_counts_by_domain.get(domain, 0)))
+        if len(indices) <= 1 or eval_size <= 0:
+            summary_parts.append(f"{domain}:train={len(indices)} eval=0")
+            continue
+
+        scored: list[tuple[int, int]] = []
+        for idx in indices:
+            record = records[idx]
+            key = _build_split_key(record.row, id_field=id_field, input_file_path=record.input_file_path)
+            score = _stable_split_hash(seed=seed, key=key)
+            scored.append((idx, score))
+        scored.sort(key=lambda item: (item[1], item[0]))
+
+        domain_eval_indices = {idx for idx, _ in scored[:eval_size]}
+        selected_eval_indices.update(domain_eval_indices)
+        summary_parts.append(f"{domain}:train={len(indices) - len(domain_eval_indices)} eval={len(domain_eval_indices)}")
+
+    if split == "eval":
+        sampled = [record for idx, record in enumerate(records) if idx in selected_eval_indices]
+    else:
+        sampled = [record for idx, record in enumerate(records) if idx not in selected_eval_indices]
+
+    logger.info(
+        "Applied domain-stratified eval_sampling split=%s total=%s seed=%s mode=%s ratio=%s count=%s summary=%s",
+        split,
+        len(records),
+        seed,
+        "count" if eval_count is not None else "ratio",
+        eval_ratio,
+        eval_count,
+        ", ".join(summary_parts),
+    )
+    return sampled
+
+
+def _default_split_cache_dir(train_dir: str) -> Path:
+    train_dir_path = Path(train_dir).resolve()
+    return train_dir_path.parent / ".gemma27_split_cache" / train_dir_path.name
+
+
+def _resolve_split_cache_dir(cfg: DataConfig, train_dir: str) -> Path:
+    if cfg.split_cache_dir:
+        return Path(cfg.split_cache_dir).resolve()
+    return _default_split_cache_dir(train_dir)
+
+
+def _build_dir_split_cache_key(
+    *,
+    cfg: DataConfig,
+    train_dir: str,
+    pattern: str,
+    source_files: list[Path],
+) -> str:
+    payload = {
+        "version": _SPLIT_CACHE_VERSION,
+        "train_dir": str(Path(train_dir).resolve()),
+        "pattern": str(pattern),
+        "id_field": str(cfg.id_field),
+        "domain_field_path": str(cfg.domain_field_path),
+        "eval_sampling_ratio": cfg.eval_sampling_ratio,
+        "eval_sampling_count": cfg.eval_sampling_count,
+        "eval_sampling_seed": int(cfg.eval_sampling_seed),
+        "eval_sampling_min_samples": int(cfg.eval_sampling_min_samples),
+        "files": [
+            {
+                "path": str(path),
+                "size": int(path.stat().st_size),
+                "mtime_ns": int(path.stat().st_mtime_ns),
+            }
+            for path in source_files
+        ],
+    }
+    digest = hashlib.sha1(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return digest[:20]
+
+
+def _cache_payload_for_record(record: _LoadedRecord) -> dict[str, Any]:
+    row_copy = dict(record.row)
+    if record.input_file_path:
+        row_copy[_CACHE_INPUT_FILE_PATH_FIELD] = str(record.input_file_path)
+    return row_copy
+
+
+def _write_cached_split_records(path: Path, records: list[_LoadedRecord]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        for record in records:
+            handle.write(json.dumps(_cache_payload_for_record(record), ensure_ascii=False) + "\n")
+
+
+def _load_cached_or_build_dir_split_records(
+    *,
+    cfg: DataConfig,
+    split: str,
+    train_dir: str,
+    pattern: str,
+) -> tuple[list[_LoadedRecord], bool]:
+    source_files = _discover_data_files(train_dir, pattern)
+    cache_dir = _resolve_split_cache_dir(cfg, train_dir)
+    cache_key = _build_dir_split_cache_key(
+        cfg=cfg,
+        train_dir=train_dir,
+        pattern=pattern,
+        source_files=source_files,
+    )
+    cache_root = cache_dir / cache_key
+    train_cache_path = cache_root / "train.jsonl"
+    eval_cache_path = cache_root / "eval.jsonl"
+
+    if train_cache_path.exists() and eval_cache_path.exists():
+        cache_path = train_cache_path if split == "train" else eval_cache_path
+        logger.info("Using cached directory split for split=%s from %s", split, cache_path)
+        return _load_records_from_file(str(cache_path)), True
+
+    records = _load_records_from_dir(train_dir, pattern)
+    train_records = _apply_domain_stratified_eval_sampling_split(
+        records=records,
+        split="train",
+        id_field=cfg.id_field,
+        eval_ratio=float(cfg.eval_sampling_ratio) if cfg.eval_sampling_ratio is not None else None,
+        eval_count=int(cfg.eval_sampling_count) if cfg.eval_sampling_count is not None else None,
+        seed=int(cfg.eval_sampling_seed),
+        min_eval_samples=int(cfg.eval_sampling_min_samples),
+        domain_field_path=cfg.domain_field_path,
+    )
+    eval_records = _apply_domain_stratified_eval_sampling_split(
+        records=records,
+        split="eval",
+        id_field=cfg.id_field,
+        eval_ratio=float(cfg.eval_sampling_ratio) if cfg.eval_sampling_ratio is not None else None,
+        eval_count=int(cfg.eval_sampling_count) if cfg.eval_sampling_count is not None else None,
+        seed=int(cfg.eval_sampling_seed),
+        min_eval_samples=int(cfg.eval_sampling_min_samples),
+        domain_field_path=cfg.domain_field_path,
+    )
+
+    cache_root.mkdir(parents=True, exist_ok=True)
+    metadata = {
+        "version": _SPLIT_CACHE_VERSION,
+        "train_dir": str(Path(train_dir).resolve()),
+        "pattern": pattern,
+        "train_count": len(train_records),
+        "eval_count": len(eval_records),
+        "domain_field_path": cfg.domain_field_path,
+        "eval_sampling_ratio": cfg.eval_sampling_ratio,
+        "eval_sampling_count": cfg.eval_sampling_count,
+        "eval_sampling_seed": cfg.eval_sampling_seed,
+        "eval_sampling_min_samples": cfg.eval_sampling_min_samples,
+    }
+    (cache_root / "metadata.json").write_text(
+        json.dumps(metadata, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    _write_cached_split_records(train_cache_path, train_records)
+    _write_cached_split_records(eval_cache_path, eval_records)
+
+    cache_path = train_cache_path if split == "train" else eval_cache_path
+    logger.info(
+        "Created cached directory split for split=%s cache=%s train_count=%s eval_count=%s",
+        split,
+        cache_path,
+        len(train_records),
+        len(eval_records),
+    )
+    return (train_records if split == "train" else eval_records), True
+
+
+def _should_use_cached_directory_split(
+    *,
+    cfg: DataConfig,
+    source_kind: str | None,
+) -> bool:
+    return bool(
+        source_kind == "dir"
+        and cfg.split_cache_enabled
+        and cfg.eval_file is None
+        and cfg.eval_dir is None
+        and (cfg.eval_sampling_count is not None or cfg.eval_sampling_ratio is not None)
+        and not (cfg.split_field and (cfg.train_split or cfg.eval_split))
+    )
 
 
 def _resolve_file_or_dir_override(
@@ -380,8 +675,16 @@ def load_examples(cfg: DataConfig, split: str, limit: int | None = None) -> list
         bidirectional_with_ref = bool(cfg.eval_bidirectional_with_ref)
 
     source_kind, source_value, source_glob = _resolve_file_or_dir_override(cfg, split)
+    used_cached_split = False
 
-    if source_kind == "dir" and source_value:
+    if source_kind == "dir" and source_value and _should_use_cached_directory_split(cfg=cfg, source_kind=source_kind):
+        records, used_cached_split = _load_cached_or_build_dir_split_records(
+            cfg=cfg,
+            split=split,
+            train_dir=source_value,
+            pattern=source_glob or cfg.train_glob,
+        )
+    elif source_kind == "dir" and source_value:
         records = _load_records_from_dir(source_value, source_glob or cfg.train_glob)
         split_name = cfg.train_split if split == "train" else cfg.eval_split
         records = _resolve_split(records, cfg.split_field, split_name)
@@ -413,6 +716,7 @@ def load_examples(cfg: DataConfig, split: str, limit: int | None = None) -> list
 
     if (
         source_kind in {"file", "dir"}
+        and (not used_cached_split)
         and cfg.eval_file is None
         and cfg.eval_dir is None
         and (cfg.eval_sampling_count is not None or cfg.eval_sampling_ratio is not None)
@@ -473,11 +777,12 @@ def load_examples(cfg: DataConfig, split: str, limit: int | None = None) -> list
             break
 
     logger.info(
-        "Loaded %s examples for split=%s (records=%s source=%s skipped_bad_source=%s skipped_empty_source=%s reverse_examples=%s)",
+        "Loaded %s examples for split=%s (records=%s source=%s cached_split=%s skipped_bad_source=%s skipped_empty_source=%s reverse_examples=%s)",
         len(examples),
         split,
         len(records),
         source_kind or ("hf" if use_hf_dataset else "file"),
+        used_cached_split,
         skipped_bad_source,
         skipped_empty_source,
         reverse_examples_added,

@@ -314,6 +314,7 @@ def test_disable_reference_model_allows_reference_gpu_settings_without_deepspeed
 def test_data_dir_and_bucketing_fields_load_from_yaml(tmp_path: Path) -> None:
     data_dir = tmp_path / "datasets"
     data_dir.mkdir()
+    cache_dir = tmp_path / "cache"
 
     cfg_path = tmp_path / "train.yaml"
     cfg_path.write_text(
@@ -324,6 +325,8 @@ def test_data_dir_and_bucketing_fields_load_from_yaml(tmp_path: Path) -> None:
                 "  train_glob: '*.jsonl'",
                 "  eval_dir: ./datasets",
                 "  eval_glob: '**/*.jsonl'",
+                "  split_cache_dir: ./cache",
+                "  split_cache_enabled: false",
                 "  batching_strategy: direction_domain_length",
                 "  domain_field_path: metadata.teacher_path",
                 "reward:",
@@ -343,6 +346,8 @@ def test_data_dir_and_bucketing_fields_load_from_yaml(tmp_path: Path) -> None:
 
     assert cfg.data.train_dir == str(data_dir)
     assert cfg.data.eval_dir == str(data_dir)
+    assert cfg.data.split_cache_dir == str(cache_dir)
+    assert cfg.data.split_cache_enabled is False
     assert cfg.data.train_glob == "*.jsonl"
     assert cfg.data.eval_glob == "**/*.jsonl"
     assert cfg.data.batching_strategy == "direction_domain_length"
@@ -398,6 +403,36 @@ def test_batching_strategy_validation_rejects_unknown_value(tmp_path: Path) -> N
     )
 
     with pytest.raises(ValueError, match="data.batching_strategy must be direction\\|direction_domain_length"):
+        _ = load_config(cfg_path)
+
+
+def test_split_cache_dir_must_not_point_to_file(tmp_path: Path) -> None:
+    cache_file = tmp_path / "cache_file"
+    cache_file.write_text("x", encoding="utf-8")
+    data_dir = tmp_path / "datasets"
+    data_dir.mkdir()
+
+    cfg_path = tmp_path / "train.yaml"
+    cfg_path.write_text(
+        "\n".join(
+            [
+                "data:",
+                "  train_dir: ./datasets",
+                "  split_cache_dir: ./cache_file",
+                "reward:",
+                "  xcomet:",
+                "    enabled: false",
+                "  mqm:",
+                "    enabled: false",
+                "  esa:",
+                "    enabled: false",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="data.split_cache_dir must be a directory path"):
         _ = load_config(cfg_path)
 
 

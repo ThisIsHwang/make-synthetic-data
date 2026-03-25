@@ -190,6 +190,73 @@ def test_load_examples_domain_falls_back_to_input_filename_when_teacher_path_mis
     assert examples[0].domain == "sample.aihub.en-ko-casual.71265"
 
 
+def test_train_dir_eval_sampling_is_domain_stratified_and_cached(tmp_path: Path, monkeypatch) -> None:
+    train_dir = tmp_path / "train"
+    train_dir.mkdir()
+    cache_dir = tmp_path / "split_cache"
+
+    casual_rows = [
+        {
+            "id": f"casual-{idx}",
+            "source": f"casual-src-{idx}",
+            "target": f"casual-tgt-{idx}",
+            "teacher": {"path": "/root/raw/translation/aihub.en-ko-casual.71265/data.json"},
+        }
+        for idx in range(4)
+    ]
+    expert_rows = [
+        {
+            "id": f"expert-{idx}",
+            "source": f"expert-src-{idx}",
+            "target": f"expert-tgt-{idx}",
+            "teacher": {"path": "/root/raw/translation/aihub.en-ko-expert.111/data.json"},
+        }
+        for idx in range(4)
+    ]
+
+    for name, rows in (("casual.jsonl", casual_rows), ("expert.jsonl", expert_rows)):
+        path = train_dir / name
+        with path.open("w", encoding="utf-8") as f:
+            for row in rows:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+    cfg = DataConfig(
+        train_file=None,
+        eval_file=None,
+        train_dir=str(train_dir),
+        split_cache_dir=str(cache_dir),
+        train_glob="*.jsonl",
+        id_field="id",
+        src_text_field="source",
+        ref_text_field="target",
+        eval_sampling_ratio=0.25,
+        eval_sampling_seed=17,
+        eval_sampling_min_samples=1,
+    )
+
+    train_examples = load_examples(cfg, split="train", limit=None)
+    cache_children = list(cache_dir.iterdir())
+    assert len(cache_children) == 1
+    assert (cache_children[0] / "train.jsonl").exists()
+    assert (cache_children[0] / "eval.jsonl").exists()
+
+    monkeypatch.setattr(
+        "gemma27_rl.data._load_records_from_dir",
+        lambda directory, pattern: (_ for _ in ()).throw(AssertionError("cache should be reused")),
+    )
+    eval_examples = load_examples(cfg, split="eval", limit=None)
+
+    assert len(train_examples) == 6
+    assert len(eval_examples) == 2
+    assert {example.domain for example in eval_examples} == {
+        "aihub.en-ko-casual.71265",
+        "aihub.en-ko-expert.111",
+    }
+    assert {example.example_id for example in train_examples}.isdisjoint(
+        {example.example_id for example in eval_examples}
+    )
+
+
 def test_eval_sampling_split_from_single_train_file(tmp_path) -> None:
     data_path = tmp_path / "runs.jsonl"
     rows = []
