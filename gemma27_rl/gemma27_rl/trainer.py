@@ -49,6 +49,7 @@ from .config import RLPostTrainConfig, dump_config
 from .data import load_examples
 from .eval import build_eval_report_from_rollouts, evaluate_on_dataset, prepare_eval_rollouts
 from .grpo import update_policy
+from .preprocess import prepare_prompt_token_lengths
 from .prompting import (
     collect_tokenizer_special_token_strings as _collect_special_token_strings_shared,
     sanitize_text_for_scoring as _sanitize_text_for_scoring_shared,
@@ -66,7 +67,6 @@ from .rewards import (
 from .rollout import (
     compute_completion_logprobs,
     compute_completion_logprobs_batch,
-    compute_prompt_token_lengths,
     generate_rollouts,
 )
 from .rl_types import Example, GroupRankSample, Rollout, SampleForScoring
@@ -5309,18 +5309,21 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
     batching_strategy = str(cfg.data.batching_strategy or "direction").strip().lower() or "direction"
     train_prompt_token_lengths: list[int] | None = None
     if batching_strategy == "direction_domain_length":
-        train_prompt_token_lengths = compute_prompt_token_lengths(
+        train_prompt_token_lengths, prompt_length_cache = prepare_prompt_token_lengths(
+            cfg=cfg,
+            split="train",
             examples=train_examples,
             tokenizer=tokenizer,
-            template=cfg.prompt.template,
-            gen_cfg=cfg.generation,
+            limit=cfg.data.limit,
         )
         if rank0:
             logger.info(
-                "Prepared prompt token lengths for bucketed batching: examples=%s min=%s max=%s",
+                "Prepared prompt token lengths for bucketed batching: examples=%s min=%s max=%s cache_hit=%s cache=%s",
                 len(train_prompt_token_lengths),
                 min(train_prompt_token_lengths) if train_prompt_token_lengths else 0,
                 max(train_prompt_token_lengths) if train_prompt_token_lengths else 0,
+                bool(prompt_length_cache.cache_hit),
+                prompt_length_cache.path,
             )
 
     eval_limit = cfg.eval.eval_limit if cfg.eval.eval_limit is not None else cfg.data.eval_limit

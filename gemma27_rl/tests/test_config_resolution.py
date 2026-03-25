@@ -315,6 +315,7 @@ def test_data_dir_and_bucketing_fields_load_from_yaml(tmp_path: Path) -> None:
     data_dir = tmp_path / "datasets"
     data_dir.mkdir()
     cache_dir = tmp_path / "cache"
+    preprocess_cache_dir = tmp_path / "preprocess_cache"
 
     cfg_path = tmp_path / "train.yaml"
     cfg_path.write_text(
@@ -326,6 +327,7 @@ def test_data_dir_and_bucketing_fields_load_from_yaml(tmp_path: Path) -> None:
                 "  eval_dir: ./datasets",
                 "  eval_glob: '**/*.jsonl'",
                 "  split_cache_dir: ./cache",
+                "  preprocess_cache_dir: ./preprocess_cache",
                 "  split_cache_enabled: false",
                 "  batching_strategy: direction_domain_length",
                 "  domain_field_path: metadata.teacher_path",
@@ -347,6 +349,7 @@ def test_data_dir_and_bucketing_fields_load_from_yaml(tmp_path: Path) -> None:
     assert cfg.data.train_dir == str(data_dir)
     assert cfg.data.eval_dir == str(data_dir)
     assert cfg.data.split_cache_dir == str(cache_dir)
+    assert cfg.data.preprocess_cache_dir == str(preprocess_cache_dir)
     assert cfg.data.split_cache_enabled is False
     assert cfg.data.train_glob == "*.jsonl"
     assert cfg.data.eval_glob == "**/*.jsonl"
@@ -433,6 +436,36 @@ def test_split_cache_dir_must_not_point_to_file(tmp_path: Path) -> None:
     )
 
     with pytest.raises(ValueError, match="data.split_cache_dir must be a directory path"):
+        _ = load_config(cfg_path)
+
+
+def test_preprocess_cache_dir_must_not_point_to_file(tmp_path: Path) -> None:
+    cache_file = tmp_path / "preprocess_cache_file"
+    cache_file.write_text("x", encoding="utf-8")
+    data_dir = tmp_path / "datasets"
+    data_dir.mkdir()
+
+    cfg_path = tmp_path / "train.yaml"
+    cfg_path.write_text(
+        "\n".join(
+            [
+                "data:",
+                "  train_dir: ./datasets",
+                "  preprocess_cache_dir: ./preprocess_cache_file",
+                "reward:",
+                "  xcomet:",
+                "    enabled: false",
+                "  mqm:",
+                "    enabled: false",
+                "  esa:",
+                "    enabled: false",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="data.preprocess_cache_dir must be a directory path"):
         _ = load_config(cfg_path)
 
 

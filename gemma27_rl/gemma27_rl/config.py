@@ -75,6 +75,7 @@ class DataConfig:
     train_dir: str | None = None
     eval_dir: str | None = None
     split_cache_dir: str | None = None
+    preprocess_cache_dir: str | None = None
     split_cache_enabled: bool = True
     train_glob: str = "*.jsonl"
     eval_glob: str | None = None
@@ -638,6 +639,10 @@ def _validate_config(cfg: RLPostTrainConfig) -> None:
         cache_dir = Path(cfg.data.split_cache_dir)
         if cache_dir.exists() and (not cache_dir.is_dir()):
             raise ValueError(f"data.split_cache_dir must be a directory path: {cfg.data.split_cache_dir}")
+    if cfg.data.preprocess_cache_dir:
+        cache_dir = Path(cfg.data.preprocess_cache_dir)
+        if cache_dir.exists() and (not cache_dir.is_dir()):
+            raise ValueError(f"data.preprocess_cache_dir must be a directory path: {cfg.data.preprocess_cache_dir}")
     if not isinstance(cfg.data.split_cache_enabled, bool):
         raise ValueError("data.split_cache_enabled must be a bool")
     if cfg.generation.num_samples_per_prompt <= 0:
@@ -1082,6 +1087,7 @@ def load_config(path: str | Path) -> RLPostTrainConfig:
     cfg.data.train_dir = _resolve_optional_path(cfg.data.train_dir, base_dir)
     cfg.data.eval_dir = _resolve_optional_path(cfg.data.eval_dir, base_dir)
     cfg.data.split_cache_dir = _resolve_optional_path(cfg.data.split_cache_dir, base_dir)
+    cfg.data.preprocess_cache_dir = _resolve_optional_path(cfg.data.preprocess_cache_dir, base_dir)
     cfg.model.policy_name_or_path = (
         _resolve_model_name_or_path(cfg.model.policy_name_or_path, base_dir)
         or cfg.model.policy_name_or_path

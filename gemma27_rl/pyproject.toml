@@ -47,6 +47,7 @@ full = [
 
 [project.scripts]
 gemma27_rl = "gemma27_rl.cli:main"
+gemma27_rl_preprocess = "gemma27_rl.preprocess:main"
 
 [tool.setuptools]
 packages = ["gemma27_rl"]
