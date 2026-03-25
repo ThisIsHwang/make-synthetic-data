@@ -259,6 +259,7 @@ def prepare_prompt_token_lengths(
         tokenizer=tokenizer,
         template=cfg.prompt.template,
         gen_cfg=cfg.generation,
+        batch_size=cfg.data.prompt_length_batch_size,
     )
     cache_path, cache_key, metadata = resolve_prompt_length_cache_path(
         data_cfg=cfg.data,
@@ -323,6 +324,7 @@ def prepare_dataset_artifacts(
             {
                 "prepared_prompt_lengths": True,
                 "prompt_length_count": len(prompt_lengths),
+                "prompt_length_batch_size": int(cfg.data.prompt_length_batch_size),
                 "prompt_length_cache_hit": cache_info.cache_hit,
                 "prompt_length_cache_path": str(cache_info.path),
                 "prompt_length_min": min(prompt_lengths) if prompt_lengths else 0,

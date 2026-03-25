@@ -5318,10 +5318,11 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
         )
         if rank0:
             logger.info(
-                "Prepared prompt token lengths for bucketed batching: examples=%s min=%s max=%s cache_hit=%s cache=%s",
+                "Prepared prompt token lengths for bucketed batching: examples=%s min=%s max=%s batch_size=%s cache_hit=%s cache=%s",
                 len(train_prompt_token_lengths),
                 min(train_prompt_token_lengths) if train_prompt_token_lengths else 0,
                 max(train_prompt_token_lengths) if train_prompt_token_lengths else 0,
+                int(cfg.data.prompt_length_batch_size),
                 bool(prompt_length_cache.cache_hit),
                 prompt_length_cache.path,
             )

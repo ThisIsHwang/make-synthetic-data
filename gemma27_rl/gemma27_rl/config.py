@@ -112,6 +112,7 @@ class DataConfig:
     default_tgt_lang: str = "Korean"
     default_src_lang_code: str = "en"
     default_tgt_lang_code: str = "ko"
+    prompt_length_batch_size: int = 128
     batching_strategy: str = "direction"  # direction|direction_domain_length
     domain_field_path: str = "teacher.path"
 
@@ -645,6 +646,8 @@ def _validate_config(cfg: RLPostTrainConfig) -> None:
             raise ValueError(f"data.preprocess_cache_dir must be a directory path: {cfg.data.preprocess_cache_dir}")
     if not isinstance(cfg.data.split_cache_enabled, bool):
         raise ValueError("data.split_cache_enabled must be a bool")
+    if int(cfg.data.prompt_length_batch_size) <= 0:
+        raise ValueError("data.prompt_length_batch_size must be > 0")
     if cfg.generation.num_samples_per_prompt <= 0:
         raise ValueError("generation.num_samples_per_prompt must be > 0")
     for field_name, raw in (

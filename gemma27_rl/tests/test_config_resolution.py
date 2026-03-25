@@ -329,6 +329,7 @@ def test_data_dir_and_bucketing_fields_load_from_yaml(tmp_path: Path) -> None:
                 "  split_cache_dir: ./cache",
                 "  preprocess_cache_dir: ./preprocess_cache",
                 "  split_cache_enabled: false",
+                "  prompt_length_batch_size: 32",
                 "  batching_strategy: direction_domain_length",
                 "  domain_field_path: metadata.teacher_path",
                 "reward:",
@@ -351,6 +352,7 @@ def test_data_dir_and_bucketing_fields_load_from_yaml(tmp_path: Path) -> None:
     assert cfg.data.split_cache_dir == str(cache_dir)
     assert cfg.data.preprocess_cache_dir == str(preprocess_cache_dir)
     assert cfg.data.split_cache_enabled is False
+    assert cfg.data.prompt_length_batch_size == 32
     assert cfg.data.train_glob == "*.jsonl"
     assert cfg.data.eval_glob == "**/*.jsonl"
     assert cfg.data.batching_strategy == "direction_domain_length"
@@ -466,6 +468,34 @@ def test_preprocess_cache_dir_must_not_point_to_file(tmp_path: Path) -> None:
     )
 
     with pytest.raises(ValueError, match="data.preprocess_cache_dir must be a directory path"):
+        _ = load_config(cfg_path)
+
+
+def test_prompt_length_batch_size_must_be_positive(tmp_path: Path) -> None:
+    data_dir = tmp_path / "datasets"
+    data_dir.mkdir()
+
+    cfg_path = tmp_path / "train.yaml"
+    cfg_path.write_text(
+        "\n".join(
+            [
+                "data:",
+                "  train_dir: ./datasets",
+                "  prompt_length_batch_size: 0",
+                "reward:",
+                "  xcomet:",
+                "    enabled: false",
+                "  mqm:",
+                "    enabled: false",
+                "  esa:",
+                "    enabled: false",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="data.prompt_length_batch_size must be > 0"):
         _ = load_config(cfg_path)
 
 

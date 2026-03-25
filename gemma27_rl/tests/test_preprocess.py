@@ -3,9 +3,16 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
+pytest.importorskip("torch")
+
+import torch
+
 from gemma27_rl.config import RLPostTrainConfig
 from gemma27_rl.preprocess import prepare_dataset_artifacts, prepare_prompt_token_lengths
 from gemma27_rl.rl_types import Example
+from gemma27_rl.rollout import compute_prompt_token_lengths
 
 
 class _TokenizerStub:
@@ -20,6 +27,35 @@ class _TokenizerStub:
 
     def __len__(self) -> int:
         return 1234
+
+
+class _ChunkingTokenizer(_TokenizerStub):
+    def __init__(self) -> None:
+        super().__init__()
+        self.batch_sizes: list[int] = []
+
+    def __call__(self, texts, return_tensors="pt", add_special_tokens=True, padding=True):  # type: ignore[no-untyped-def]
+        del return_tensors, add_special_tokens, padding
+        text_list = [str(text) for text in texts]
+        self.batch_sizes.append(len(text_list))
+
+        rows: list[list[int]] = []
+        for idx, text in enumerate(text_list, start=1):
+            token_count = max(1, len(text) % 11 + 1)
+            rows.append([idx] * token_count)
+
+        width = max(len(row) for row in rows)
+        input_ids = []
+        attention_mask = []
+        for row in rows:
+            pad = width - len(row)
+            input_ids.append(row + ([0] * pad))
+            attention_mask.append(([1] * len(row)) + ([0] * pad))
+
+        return {
+            "input_ids": torch.tensor(input_ids, dtype=torch.long),
+            "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
+        }
 
 
 def _examples() -> list[Example]:
@@ -52,12 +88,14 @@ def _examples() -> list[Example]:
 def test_prepare_prompt_token_lengths_reuses_cache(tmp_path: Path, monkeypatch) -> None:
     cfg = RLPostTrainConfig()
     cfg.data.preprocess_cache_dir = str(tmp_path / "preprocess_cache")
+    cfg.data.prompt_length_batch_size = 3
     tokenizer = _TokenizerStub()
     examples = _examples()
+    seen_batch_sizes: list[int] = []
 
     monkeypatch.setattr(
         "gemma27_rl.preprocess.compute_prompt_token_lengths",
-        lambda **kwargs: [11, 17],
+        lambda **kwargs: seen_batch_sizes.append(int(kwargs["batch_size"])) or [11, 17],
     )
 
     lengths_first, cache_info_first = prepare_prompt_token_lengths(
@@ -69,6 +107,7 @@ def test_prepare_prompt_token_lengths_reuses_cache(tmp_path: Path, monkeypatch) 
     )
 
     assert lengths_first == [11, 17]
+    assert seen_batch_sizes == [3]
     assert cache_info_first.cache_hit is False
     assert cache_info_first.path.exists()
 
@@ -88,6 +127,35 @@ def test_prepare_prompt_token_lengths_reuses_cache(tmp_path: Path, monkeypatch) 
     assert lengths_second == [11, 17]
     assert cache_info_second.cache_hit is True
     assert cache_info_second.path == cache_info_first.path
+
+
+def test_compute_prompt_token_lengths_chunks_batches() -> None:
+    tokenizer = _ChunkingTokenizer()
+    examples = [
+        Example(
+            example_id=f"ex-{idx}",
+            src_text=("x" * (idx + 1)),
+            src_lang="English",
+            tgt_lang="Korean",
+            src_lang_code="en",
+            tgt_lang_code="ko",
+        )
+        for idx in range(5)
+    ]
+
+    chunked_lengths = compute_prompt_token_lengths(
+        examples=examples,
+        tokenizer=tokenizer,
+        batch_size=2,
+    )
+    unchunked_lengths = compute_prompt_token_lengths(
+        examples=examples,
+        tokenizer=_ChunkingTokenizer(),
+        batch_size=32,
+    )
+
+    assert tokenizer.batch_sizes == [2, 2, 1]
+    assert chunked_lengths == unchunked_lengths
 
 
 def test_prepare_dataset_artifacts_warms_split_and_prompt_length_caches(tmp_path: Path, monkeypatch) -> None:
@@ -135,6 +203,7 @@ def test_prepare_dataset_artifacts_warms_split_and_prompt_length_caches(tmp_path
     cfg.data.eval_sampling_ratio = 0.25
     cfg.data.eval_sampling_seed = 17
     cfg.data.eval_sampling_min_samples = 1
+    cfg.data.prompt_length_batch_size = 4
     cfg.data.batching_strategy = "direction_domain_length"
 
     monkeypatch.setattr(
@@ -152,6 +221,7 @@ def test_prepare_dataset_artifacts_warms_split_and_prompt_length_caches(tmp_path
     assert first_summary["eval_count"] == 2
     assert first_summary["prepared_prompt_lengths"] is True
     assert first_summary["prompt_length_count"] == 6
+    assert first_summary["prompt_length_batch_size"] == 4
     assert first_summary["prompt_length_cache_hit"] is False
     assert Path(first_summary["prompt_length_cache_path"]).exists()
 

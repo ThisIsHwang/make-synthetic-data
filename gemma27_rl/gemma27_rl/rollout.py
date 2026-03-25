@@ -620,18 +620,25 @@ def compute_prompt_token_lengths(
     tokenizer: PreTrainedTokenizerBase,
     template: str = DEFAULT_TRANSLATION_PROMPT_TEMPLATE,
     gen_cfg: GenerationConfig | None = None,
+    batch_size: int | None = None,
 ) -> list[int]:
     if not examples:
         return []
 
-    prompt_texts = [format_translation_prompt(example, template=template) for example in examples]
-    prompt_rows = _encode_prompt_rows(
-        tokenizer=tokenizer,
-        prompt_texts=prompt_texts,
-        gen_cfg=gen_cfg or GenerationConfig(),
-        pad_token_id=tokenizer.pad_token_id,
-    )
-    return [len(row) for row in prompt_rows]
+    effective_batch_size = len(examples) if batch_size is None else max(1, int(batch_size))
+    effective_gen_cfg = gen_cfg or GenerationConfig()
+    prompt_lengths: list[int] = []
+    for start in range(0, len(examples), effective_batch_size):
+        batch_examples = examples[start:start + effective_batch_size]
+        prompt_texts = [format_translation_prompt(example, template=template) for example in batch_examples]
+        prompt_rows = _encode_prompt_rows(
+            tokenizer=tokenizer,
+            prompt_texts=prompt_texts,
+            gen_cfg=effective_gen_cfg,
+            pad_token_id=tokenizer.pad_token_id,
+        )
+        prompt_lengths.extend(len(row) for row in prompt_rows)
+    return prompt_lengths
 
 
 def _build_left_padded_prompt_tensors(
