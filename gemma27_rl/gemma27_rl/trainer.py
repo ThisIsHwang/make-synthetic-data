@@ -3336,6 +3336,39 @@ def _vllm_rollout_enabled(cfg: RLPostTrainConfig) -> bool:
     return bool(getattr(getattr(cfg, "vllm", None), "enabled", False))
 
 
+def _create_vllm_rollout_client(
+    *,
+    cfg: RLPostTrainConfig,
+    policy_source: str,
+    tokenizer_source: str,
+    output_dir: Path,
+    owns_server: bool,
+    startup_reason: str,
+) -> LocalVLLMRolloutClient:
+    vllm_base_model_source = _read_local_adapter_base_model_name_or_path(policy_source) or policy_source
+    client = LocalVLLMRolloutClient(
+        cfg=cfg.vllm,
+        base_model_name_or_path=vllm_base_model_source,
+        tokenizer_name_or_path=tokenizer_source,
+        lora_rank=int(cfg.model.lora.r),
+        trust_remote_code=bool(cfg.model.trust_remote_code),
+        dtype=cfg.misc.dtype,
+        log_path=output_dir / "vllm_server.log",
+        owns_server=bool(owns_server),
+    )
+    if owns_server:
+        logger.info(
+            "Starting local vLLM rollout server for %s: base_model=%s tokenizer=%s tp=%s gpus=%s",
+            startup_reason,
+            vllm_base_model_source,
+            tokenizer_source,
+            int(cfg.vllm.tensor_parallel_size or 1),
+            cfg.vllm.gpu_ids,
+        )
+        client.start()
+    return client
+
+
 def _generate_training_rollouts(
     *,
     examples: list[Example],
@@ -3408,7 +3441,7 @@ def _sync_vllm_rollout_adapter(
             shutil.rmtree(adapter_dir)
         adapter_dir.parent.mkdir(parents=True, exist_ok=True)
     _dist_barrier()
-    _save_pretrained_model(policy_model, adapter_dir)
+    _save_pretrained_model(policy_model, adapter_dir, require_peft_adapter=True)
     _dist_barrier()
     if _is_rank0():
         vllm_rollout_client.load_adapter(adapter_dir)
@@ -4997,43 +5030,122 @@ def _save_checkpoint_to_dir(
     return ckpt_dir
 
 
+def _resolve_peft_export_model(model: Any) -> Any | None:
+    if PeftModel is None:
+        return None
+    current = model
+    visited: set[int] = set()
+    while current is not None:
+        marker = id(current)
+        if marker in visited:
+            break
+        visited.add(marker)
+        if isinstance(current, PeftModel):
+            return current
+        next_model = None
+        for attr in ("module", "wrapped_model", "model"):
+            candidate = getattr(current, attr, None)
+            if candidate is not None and id(candidate) not in visited:
+                next_model = candidate
+                break
+        current = next_model
+    return None
+
+
+def _collect_peft_export_parameters(model: Any) -> list[Any]:
+    seen: set[int] = set()
+    collected: list[Any] = []
+    for name, param in model.named_parameters():
+        if not torch.is_tensor(param):
+            continue
+        if ("lora_" not in name) and ("modules_to_save" not in name):
+            continue
+        marker = id(param)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        collected.append(param)
+    if collected:
+        return collected
+    for param in model.parameters():
+        if not torch.is_tensor(param) or (not getattr(param, "requires_grad", False)):
+            continue
+        marker = id(param)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        collected.append(param)
+    return collected
+
+
+def _clone_state_dict_to_cpu(state_dict: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for key, value in state_dict.items():
+        if torch.is_tensor(value):
+            out[key] = value.detach().cpu().clone()
+        else:
+            out[key] = value
+    return out
+
+
 def _build_zero3_peft_state_dict(model: Any) -> dict[str, Any] | None:
     if PeftModel is None or get_peft_model_state_dict is None:
         return None
-    if not isinstance(model, PeftModel):
+    export_model = _resolve_peft_export_model(model)
+    if export_model is None:
         return None
-    if deepspeed is None or _distributed_world_size() <= 1:
-        return None
-    zero = getattr(deepspeed, "zero", None)
-    gathered_parameters = getattr(zero, "GatheredParameters", None)
-    if gathered_parameters is None:
-        return None
+    adapter_name = getattr(export_model, "active_adapter", None)
+    adapter_kwargs: dict[str, Any] = {}
+    if isinstance(adapter_name, str) and adapter_name.strip():
+        adapter_kwargs["adapter_name"] = adapter_name
 
-    params_to_gather = [param for param in model.parameters() if param.requires_grad]
-    if not params_to_gather:
-        return None
+    if deepspeed is not None and _distributed_world_size() > 1:
+        zero = getattr(deepspeed, "zero", None)
+        gathered_parameters = getattr(zero, "GatheredParameters", None)
+        if gathered_parameters is not None:
+            params_to_gather = _collect_peft_export_parameters(export_model)
+            if params_to_gather:
+                with gathered_parameters(params_to_gather, modifier_rank=0):
+                    if not _is_rank0():
+                        return None
+                    state_dict = get_peft_model_state_dict(export_model, **adapter_kwargs)
+                    return _clone_state_dict_to_cpu(state_dict)
+            if not _is_rank0():
+                return None
+            state_dict = get_peft_model_state_dict(export_model, **adapter_kwargs)
+            return _clone_state_dict_to_cpu(state_dict)
 
-    with gathered_parameters(params_to_gather, modifier_rank=0):
-        if not _is_rank0():
-            return None
-        state_dict = get_peft_model_state_dict(model, state_dict=model.state_dict())
-        out: dict[str, Any] = {}
-        for key, value in state_dict.items():
-            if torch.is_tensor(value):
-                out[key] = value.detach().cpu().clone()
-            else:
-                out[key] = value
-        return out
+    state_dict = get_peft_model_state_dict(export_model, **adapter_kwargs)
+    return _clone_state_dict_to_cpu(state_dict)
 
 
-def _save_pretrained_model(model: Any, output_dir: Path) -> None:
+def _save_pretrained_model(model: Any, output_dir: Path, *, require_peft_adapter: bool = False) -> None:
+    export_model = _resolve_peft_export_model(model)
     zero3_state_dict = _build_zero3_peft_state_dict(model)
     _dist_barrier()
     if _is_rank0():
-        if zero3_state_dict is None:
-            model.save_pretrained(output_dir)
+        if export_model is not None:
+            if zero3_state_dict is None:
+                raise RuntimeError(
+                    f"Failed to build PEFT adapter state dict for export to {output_dir}."
+                )
+            if not zero3_state_dict:
+                raise RuntimeError(
+                    f"Refusing to export an empty LoRA adapter for vLLM at {output_dir}."
+                )
+            logger.info(
+                "Exporting PEFT adapter to %s with %s tensor(s); sample_keys=%s",
+                output_dir,
+                len(zero3_state_dict),
+                list(zero3_state_dict.keys())[:5],
+            )
+            export_model.save_pretrained(output_dir, state_dict=zero3_state_dict)
         else:
-            model.save_pretrained(output_dir, state_dict=zero3_state_dict)
+            if require_peft_adapter:
+                raise RuntimeError(
+                    "vLLM rollout requires a PEFT policy model, but no PeftModel wrapper was found during export."
+                )
+            model.save_pretrained(output_dir)
     _dist_barrier()
 
 
@@ -5280,6 +5392,18 @@ def run_metric_only_eval(cfg: RLPostTrainConfig) -> dict[str, Any]:
         cfg.reward.esa.target_lang = cfg.data.default_tgt_lang
 
     output_dir = Path(cfg.logging.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    vllm_rollout_client: LocalVLLMRolloutClient | None = None
+    if _vllm_rollout_enabled(cfg):
+        vllm_rollout_client = _create_vllm_rollout_client(
+            cfg=cfg,
+            policy_source=cfg.model.policy_name_or_path,
+            tokenizer_source=tokenizer_source,
+            output_dir=output_dir,
+            owns_server=True,
+            startup_reason="LoRA eval",
+        )
     metricx_scorer = MetricXQEScorer(cfg.reward.metricx) if cfg.reward.metricx.enabled else None
     xcomet_runtime_enabled = _should_enable_xcomet_runtime(cfg)
     xcomet_scorer = XCometXLScorer(cfg.reward.xcomet) if xcomet_runtime_enabled else None
@@ -5302,18 +5426,28 @@ def run_metric_only_eval(cfg: RLPostTrainConfig) -> dict[str, Any]:
         else None
     )
 
-    report = evaluate_on_dataset(
-        examples=eval_examples,
-        policy_model=model,
-        tokenizer=tokenizer,
-        cfg=cfg,
-        device=device,
-        metricx_scorer=metricx_scorer,
-        xcomet_scorer=xcomet_scorer,
-        mqm_scorer=mqm_scorer,
-        esa_scorer=esa_scorer,
-        show_progress=True,
-    )
+    try:
+        _sync_vllm_rollout_adapter(
+            update_idx=0,
+            vllm_rollout_client=vllm_rollout_client,
+            policy_model=model,
+        )
+        report = evaluate_on_dataset(
+            examples=eval_examples,
+            policy_model=model,
+            tokenizer=tokenizer,
+            cfg=cfg,
+            device=device,
+            vllm_rollout_client=vllm_rollout_client,
+            metricx_scorer=metricx_scorer,
+            xcomet_scorer=xcomet_scorer,
+            mqm_scorer=mqm_scorer,
+            esa_scorer=esa_scorer,
+            show_progress=True,
+        )
+    finally:
+        if vllm_rollout_client is not None:
+            vllm_rollout_client.close()
     logger.info("Eval report: %s", report)
     return report
 
@@ -5427,26 +5561,14 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
 
     vllm_rollout_client: LocalVLLMRolloutClient | None = None
     if _vllm_rollout_enabled(cfg):
-        vllm_base_model_source = _read_local_adapter_base_model_name_or_path(policy_source) or policy_source
-        vllm_rollout_client = LocalVLLMRolloutClient(
-            cfg=cfg.vllm,
-            base_model_name_or_path=vllm_base_model_source,
-            tokenizer_name_or_path=tokenizer_source,
-            lora_rank=int(cfg.model.lora.r),
-            trust_remote_code=bool(cfg.model.trust_remote_code),
-            dtype=cfg.misc.dtype,
-            log_path=output_dir / "vllm_server.log",
+        vllm_rollout_client = _create_vllm_rollout_client(
+            cfg=cfg,
+            policy_source=policy_source,
+            tokenizer_source=tokenizer_source,
+            output_dir=output_dir,
             owns_server=bool(rank0),
+            startup_reason="LoRA training",
         )
-        if rank0:
-            logger.info(
-                "Starting local vLLM rollout server for LoRA training: base_model=%s tokenizer=%s tp=%s gpus=%s",
-                vllm_base_model_source,
-                tokenizer_source,
-                int(cfg.vllm.tensor_parallel_size or 1),
-                cfg.vllm.gpu_ids,
-            )
-            vllm_rollout_client.start()
         _dist_barrier()
 
     ref_model: AutoModelForCausalLM | None = None
@@ -5900,13 +6022,19 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
             "but MQM/ESA report scoring overlaps the next training rollout before policy update."
         )
 
-    def _run_eval_once(*, collect_outputs: bool, show_progress: bool) -> dict[str, Any]:
+    def _run_eval_once(*, update_idx: int, collect_outputs: bool, show_progress: bool) -> dict[str, Any]:
+        _sync_vllm_rollout_adapter(
+            update_idx=update_idx,
+            vllm_rollout_client=vllm_rollout_client,
+            policy_model=policy_eval_model,
+        )
         return evaluate_on_dataset(
             examples=eval_examples,
             policy_model=policy_eval_model,
             tokenizer=tokenizer,
             cfg=cfg,
             device=device,
+            vllm_rollout_client=vllm_rollout_client,
             metricx_scorer=metricx_scorer,
             xcomet_scorer=xcomet_scorer,
             mqm_scorer=mqm_scorer,
@@ -5959,12 +6087,18 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
         nonlocal pending_async_eval
         if pending_async_eval is not None:
             _maybe_finalize_pending_async_eval(block=True)
+        _sync_vllm_rollout_adapter(
+            update_idx=update_idx,
+            vllm_rollout_client=vllm_rollout_client,
+            policy_model=policy_eval_model,
+        )
         eval_rollouts = prepare_eval_rollouts(
             examples=eval_examples,
             policy_model=policy_eval_model,
             tokenizer=tokenizer,
             cfg=cfg,
             device=device,
+            vllm_rollout_client=vllm_rollout_client,
             show_progress=show_progress,
             distributed_eval_shard=distributed_eval_shard,
             distributed_rank=rank,
@@ -6064,6 +6198,7 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
             )
         else:
             report = _run_eval_once(
+                update_idx=run_before_train_eval_update_idx,
                 collect_outputs=collect_eval_outputs,
                 show_progress=show_eval_progress,
             )
@@ -6586,6 +6721,7 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
                 )
             else:
                 report = _run_eval_once(
+                    update_idx=update_idx,
                     collect_outputs=collect_eval_outputs,
                     show_progress=show_eval_progress,
                 )

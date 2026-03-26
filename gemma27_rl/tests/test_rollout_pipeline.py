@@ -222,6 +222,41 @@ def test_eval_pipeline_can_use_esa_without_training_esa_reward(monkeypatch) -> N
     assert [row["esa_score"] for row in report["eval_rows"]] == [81.0, 79.0]
 
 
+def test_eval_pipeline_uses_vllm_when_client_present(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    cfg = _cfg()
+    examples = _examples()
+    scorer = _MQMRecorder({"ex-0": -1.0, "ex-1": -3.0})
+    rollout_calls: list[list[str]] = []
+
+    def _fail_generate_rollouts(**kwargs):  # type: ignore[no-untyped-def]
+        raise AssertionError("HF generate path should not be used when a vLLM client is provided")
+
+    def _fake_generate_rollouts_vllm(**kwargs):  # type: ignore[no-untyped-def]
+        chunk_examples = list(kwargs["examples"])
+        rollout_calls.append([str(example.example_id) for example in chunk_examples])
+        return [_rollout(example) for example in chunk_examples]
+
+    monkeypatch.setenv("GEMMA27_RL_ROLLOUT_PIPELINE_CHUNK", "1")
+    monkeypatch.setattr(eval_mod, "generate_rollouts", _fail_generate_rollouts)
+    monkeypatch.setattr(eval_mod, "generate_rollouts_vllm", _fake_generate_rollouts_vllm)
+
+    report = eval_mod.evaluate_on_dataset(
+        examples=examples,
+        policy_model=object(),
+        tokenizer=_DummyTokenizer(),
+        cfg=cfg,
+        device="cpu",
+        vllm_rollout_client=object(),  # type: ignore[arg-type]
+        mqm_scorer=scorer,  # type: ignore[arg-type]
+        collect_outputs=True,
+    )
+
+    assert rollout_calls == [["ex-0"], ["ex-1"]]
+    assert scorer.calls == [["ex-0"], ["ex-1"]]
+    assert report["mqm_score_mean"] == pytest.approx(-2.0)
+    assert [row["example_id"] for row in report["eval_rows"]] == ["ex-0", "ex-1"]
+
+
 def test_effective_esa_runtime_cfg_enables_eval_only_esa_without_mutating_reward_cfg() -> None:
     cfg = _cfg()
     cfg.reward.esa.enabled = False

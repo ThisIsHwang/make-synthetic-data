@@ -33,6 +33,7 @@ from .rewards import (
 )
 from .rollout import generate_rollouts
 from .rl_types import Example, Rollout, SampleForScoring
+from .vllm_rollout import LocalVLLMRolloutClient, generate_rollouts_vllm
 
 logger = logging.getLogger(__name__)
 _EVAL_PAD_PREFIX = "__eval_pad__:"
@@ -755,6 +756,7 @@ def prepare_eval_rollouts(
     tokenizer: PreTrainedTokenizerBase,
     cfg: RLPostTrainConfig,
     device: str,
+    vllm_rollout_client: LocalVLLMRolloutClient | None = None,
     show_progress: bool = False,
     distributed_eval_shard: bool = False,
     distributed_rank: int = 0,
@@ -783,20 +785,39 @@ def prepare_eval_rollouts(
         local_examples = examples
         pad_count = 0
 
-    local_rollouts = generate_rollouts(
-        examples=local_examples,
-        policy_model=policy_model,
-        tokenizer=tokenizer,
-        gen_cfg=gen_cfg,
-        device=device,
-        ref_model=None,
-        prompt_template=cfg.prompt.template,
-        show_progress=bool(show_progress),
-        progress_desc="eval rollout",
-        compute_old_logprobs=False,
-        compute_token_offsets=False,
-        include_prompt_input_ids=False,
-    )
+    if vllm_rollout_client is None:
+        local_rollouts = generate_rollouts(
+            examples=local_examples,
+            policy_model=policy_model,
+            tokenizer=tokenizer,
+            gen_cfg=gen_cfg,
+            device=device,
+            ref_model=None,
+            prompt_template=cfg.prompt.template,
+            show_progress=bool(show_progress),
+            progress_desc="eval rollout",
+            compute_old_logprobs=False,
+            compute_token_offsets=False,
+            include_prompt_input_ids=False,
+        )
+    else:
+        local_rollouts = generate_rollouts_vllm(
+            examples=local_examples,
+            policy_model=policy_model,
+            tokenizer=tokenizer,
+            gen_cfg=gen_cfg,
+            device=device,
+            vllm_rollout_client=vllm_rollout_client,
+            ref_model=None,
+            ref_device=None,
+            ref_logprob_fn=None,
+            prompt_template=cfg.prompt.template,
+            show_progress=bool(show_progress),
+            progress_desc="eval rollout",
+            compute_old_logprobs=False,
+            compute_token_offsets=False,
+            include_prompt_input_ids=False,
+        )
     if pad_count > 0:
         local_rollouts = [r for r in local_rollouts if not str(r.example_id).startswith(_EVAL_PAD_PREFIX)]
     if shard_eval:
@@ -1022,6 +1043,7 @@ def _generate_and_score_eval_rollouts_pipelined(
     gen_cfg: GenerationConfig,
     cfg: RLPostTrainConfig,
     device: str,
+    vllm_rollout_client: LocalVLLMRolloutClient | None,
     show_progress: bool,
     score_on_this_rank: bool,
     metricx_scorer: MetricXQEScorer | None = None,
@@ -1046,13 +1068,31 @@ def _generate_and_score_eval_rollouts_pipelined(
         )
 
     def _generate_chunk(chunk_idx: int, chunk_examples: list[Example]) -> list[Rollout]:
-        return generate_rollouts(
+        if vllm_rollout_client is None:
+            return generate_rollouts(
+                examples=chunk_examples,
+                policy_model=policy_model,
+                tokenizer=tokenizer,
+                gen_cfg=gen_cfg,
+                device=device,
+                ref_model=None,
+                prompt_template=cfg.prompt.template,
+                show_progress=bool(show_progress),
+                progress_desc=f"eval rollout [{chunk_idx + 1}/{len(chunk_ranges)}]",
+                compute_old_logprobs=False,
+                compute_token_offsets=False,
+                include_prompt_input_ids=False,
+            )
+        return generate_rollouts_vllm(
             examples=chunk_examples,
             policy_model=policy_model,
             tokenizer=tokenizer,
             gen_cfg=gen_cfg,
             device=device,
+            vllm_rollout_client=vllm_rollout_client,
             ref_model=None,
+            ref_device=None,
+            ref_logprob_fn=None,
             prompt_template=cfg.prompt.template,
             show_progress=bool(show_progress),
             progress_desc=f"eval rollout [{chunk_idx + 1}/{len(chunk_ranges)}]",
@@ -1114,6 +1154,7 @@ def evaluate_on_dataset(
     tokenizer: PreTrainedTokenizerBase,
     cfg: RLPostTrainConfig,
     device: str,
+    vllm_rollout_client: LocalVLLMRolloutClient | None = None,
     metricx_scorer: MetricXQEScorer | None = None,
     xcomet_scorer: XCometXLScorer | None = None,
     mqm_scorer: OpenAICompatibleMQMScorer | None = None,
@@ -1150,6 +1191,7 @@ def evaluate_on_dataset(
             gen_cfg=gen_cfg,
             cfg=cfg,
             device=device,
+            vllm_rollout_client=vllm_rollout_client,
             show_progress=bool(show_progress),
             score_on_this_rank=bool(distributed_world_size <= 1 or distributed_rank == 0),
             metricx_scorer=metricx_scorer,
@@ -1175,6 +1217,7 @@ def evaluate_on_dataset(
             tokenizer=tokenizer,
             cfg=cfg,
             device=device,
+            vllm_rollout_client=vllm_rollout_client,
             show_progress=bool(show_progress),
             distributed_eval_shard=distributed_eval_shard,
             distributed_rank=distributed_rank,

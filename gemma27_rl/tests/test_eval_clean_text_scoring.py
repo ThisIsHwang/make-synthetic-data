@@ -116,3 +116,42 @@ def test_evaluate_sanitizes_raw_text_when_completion_clean_text_missing(monkeypa
     assert "<bos>" not in scorer.seen_mts[0]
     assert "<|assistant|>" not in scorer.seen_mts[0]
     assert report["eval_rows"][0]["completion_clean_text"] == expected_clean
+
+
+def test_prepare_eval_rollouts_uses_vllm_when_client_present(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    rollout = _base_rollout(
+        completion_text="raw output",
+        completion_raw_text="raw output",
+        completion_clean_text="clean output",
+    )
+    seen: dict[str, object] = {}
+
+    def _fail_generate_rollouts(**kwargs):  # type: ignore[no-untyped-def]
+        raise AssertionError("HF generate path should not be used when a vLLM client is provided")
+
+    def _fake_generate_rollouts_vllm(**kwargs):  # type: ignore[no-untyped-def]
+        seen["compute_old_logprobs"] = kwargs["compute_old_logprobs"]
+        seen["compute_token_offsets"] = kwargs["compute_token_offsets"]
+        seen["include_prompt_input_ids"] = kwargs["include_prompt_input_ids"]
+        seen["progress_desc"] = kwargs["progress_desc"]
+        return [rollout]
+
+    monkeypatch.setattr(eval_mod, "generate_rollouts", _fail_generate_rollouts)
+    monkeypatch.setattr(eval_mod, "generate_rollouts_vllm", _fake_generate_rollouts_vllm)
+
+    rollouts = eval_mod.prepare_eval_rollouts(
+        examples=[_base_example()],
+        policy_model=object(),
+        tokenizer=_DummyTokenizer(),
+        cfg=_base_cfg(),
+        device="cpu",
+        vllm_rollout_client=object(),  # type: ignore[arg-type]
+    )
+
+    assert rollouts == [rollout]
+    assert seen == {
+        "compute_old_logprobs": False,
+        "compute_token_offsets": False,
+        "include_prompt_input_ids": False,
+        "progress_desc": "eval rollout",
+    }
