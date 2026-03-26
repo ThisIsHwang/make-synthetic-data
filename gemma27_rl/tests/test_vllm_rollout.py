@@ -97,6 +97,7 @@ def test_local_vllm_client_start_strips_dist_vars(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setenv("MASTER_PORT", "29500")
     monkeypatch.setenv("PYTHONHOME", "/tmp/fake-home")
     monkeypatch.setattr(vllm_mod, "_detect_vllm_log_request_flag_style", lambda python_executable: "enable")
+    monkeypatch.setattr(vllm_mod, "_detect_vllm_custom_all_reduce_flag_style", lambda python_executable: "toggle")
     monkeypatch.setattr(vllm_mod.subprocess, "Popen", _fake_popen)
     monkeypatch.setattr(vllm_mod.LocalVLLMRolloutClient, "_wait_until_ready", lambda self: None)
 
@@ -126,6 +127,7 @@ def test_local_vllm_client_start_strips_dist_vars(monkeypatch: pytest.MonkeyPatc
     assert "--enable-lora" in cmd
     assert "--max-lora-rank" in cmd
     assert "--no-enable-log-requests" in cmd
+    assert "--no-disable-custom-all-reduce" in cmd
     env = captured["env"]
     assert isinstance(env, dict)
     assert env.get("CUDA_VISIBLE_DEVICES") == "6,7"
@@ -232,3 +234,67 @@ def test_detect_vllm_log_request_flag_style_falls_back_to_old_disable_flag(monke
     monkeypatch.setattr(vllm_mod, "_VLLM_LOG_REQUEST_FLAG_STYLE_CACHE", {})
 
     assert vllm_mod._detect_vllm_log_request_flag_style("python") == "disable"
+
+
+def test_detect_vllm_custom_all_reduce_flag_style_prefers_toggle_flags(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _Completed:
+        stdout = "usage: ... [--disable-custom-all-reduce | --no-disable-custom-all-reduce]"
+        stderr = ""
+
+    monkeypatch.setattr(vllm_mod.subprocess, "run", lambda *args, **kwargs: _Completed())
+    monkeypatch.setattr(vllm_mod, "_VLLM_CUSTOM_ALL_REDUCE_FLAG_STYLE_CACHE", {})
+
+    assert vllm_mod._detect_vllm_custom_all_reduce_flag_style("python") == "toggle"
+
+
+def test_start_retries_with_disable_custom_all_reduce_when_startup_log_matches(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    captured_cmds: list[list[str]] = []
+
+    def _fake_popen(*args, **kwargs):  # type: ignore[no-untyped-def]
+        captured_cmds.append(list(args[0]))
+        return _FakeProc()
+
+    wait_calls = {"count": 0}
+
+    def _fake_wait(self):  # type: ignore[no-untyped-def]
+        wait_calls["count"] += 1
+        if wait_calls["count"] == 1:
+            self._log_path.write_text(
+                "Failed: Cuda error /workspace/csrc/custom_all_reduce.cuh:455 'invalid argument'\n",
+                encoding="utf-8",
+            )
+            raise RuntimeError("startup failed")
+        return None
+
+    monkeypatch.setattr(vllm_mod, "_detect_vllm_log_request_flag_style", lambda python_executable: "enable")
+    monkeypatch.setattr(vllm_mod, "_detect_vllm_custom_all_reduce_flag_style", lambda python_executable: "toggle")
+    monkeypatch.setattr(vllm_mod.subprocess, "Popen", _fake_popen)
+    monkeypatch.setattr(vllm_mod.LocalVLLMRolloutClient, "_wait_until_ready", _fake_wait)
+
+    cfg = VLLMConfig(
+        enabled=True,
+        gpu_ids=[6, 7],
+        tensor_parallel_size=2,
+        adapter_root_dir=str(tmp_path / "adapters"),
+        python_executable="python",
+    )
+    client = vllm_mod.LocalVLLMRolloutClient(
+        cfg=cfg,
+        base_model_name_or_path="google/gemma-3-27b-it",
+        tokenizer_name_or_path="google/gemma-3-27b-it",
+        lora_rank=64,
+        trust_remote_code=False,
+        dtype="bfloat16",
+        log_path=tmp_path / "vllm.log",
+        owns_server=True,
+    )
+
+    client.start()
+    client.close()
+
+    assert len(captured_cmds) == 2
+    assert "--no-disable-custom-all-reduce" in captured_cmds[0]
+    assert "--disable-custom-all-reduce" in captured_cmds[1]

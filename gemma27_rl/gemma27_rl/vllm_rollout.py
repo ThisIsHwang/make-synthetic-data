@@ -55,6 +55,7 @@ from .utils import collect_huggingface_worker_env, merge_env_overrides
 
 logger = logging.getLogger(__name__)
 _VLLM_LOG_REQUEST_FLAG_STYLE_CACHE: dict[str, str] = {}
+_VLLM_CUSTOM_ALL_REDUCE_FLAG_STYLE_CACHE: dict[str, str] = {}
 
 
 @dataclass
@@ -132,6 +133,42 @@ def _detect_vllm_log_request_flag_style(python_executable: str) -> str:
     return style
 
 
+def _detect_vllm_custom_all_reduce_flag_style(python_executable: str) -> str:
+    cached = _VLLM_CUSTOM_ALL_REDUCE_FLAG_STYLE_CACHE.get(str(python_executable))
+    if cached is not None:
+        return cached
+
+    cmd = [str(python_executable), "-m", "vllm.entrypoints.openai.api_server", "--help"]
+    style = "disable"
+    try:
+        proc = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=30.0,
+            check=False,
+        )
+        help_text = f"{proc.stdout or ''}\n{proc.stderr or ''}"
+        if "--no-disable-custom-all-reduce" in help_text:
+            style = "toggle"
+        elif "--disable-custom-all-reduce" in help_text:
+            style = "disable"
+    except Exception as exc:
+        logger.warning(
+            "Failed to inspect vLLM api_server --help for custom-all-reduce flags; defaulting to disable-only flags: %s",
+            exc,
+        )
+
+    _VLLM_CUSTOM_ALL_REDUCE_FLAG_STYLE_CACHE[str(python_executable)] = style
+    return style
+
+
+def _looks_like_custom_all_reduce_startup_failure(log_text: str) -> bool:
+    text = str(log_text or "").lower()
+    return ("custom_all_reduce" in text or "custom all reduce" in text) and "invalid argument" in text
+
+
 class LocalVLLMRolloutClient:
     def __init__(
         self,
@@ -157,6 +194,7 @@ class LocalVLLMRolloutClient:
         self._log_handle: Any | None = None
         self._adapter_loaded = False
         self._warned_missing_token_ids = False
+        self._disable_custom_all_reduce_active = False
 
     @property
     def adapter_dir(self) -> Path:
@@ -176,8 +214,6 @@ class LocalVLLMRolloutClient:
         if self._proc is not None and self._proc.poll() is None:
             return
 
-        self._log_path.parent.mkdir(parents=True, exist_ok=True)
-        self._log_handle = self._log_path.open("a", encoding="utf-8")
         worker_env = dict(os.environ)
         for key in ("LOCAL_RANK", "RANK", "WORLD_SIZE", "MASTER_ADDR", "MASTER_PORT"):
             worker_env.pop(key, None)
@@ -194,70 +230,32 @@ class LocalVLLMRolloutClient:
             worker_env.update(env_overrides)
 
         python_executable = str(self._cfg.python_executable or "python").strip() or "python"
-        log_request_flag_style = _detect_vllm_log_request_flag_style(python_executable)
-        cmd = [
-            python_executable,
-            "-m",
-            "vllm.entrypoints.openai.api_server",
-            "--model",
-            self._base_model_name_or_path,
-            "--host",
-            str(self._cfg.host),
-            "--port",
-            str(int(self._cfg.port)),
-            "--served-model-name",
-            str(self._cfg.served_model_name or "policy-base"),
-            "--enable-lora",
-            "--max-lora-rank",
-            str(self._lora_rank),
-            "--tensor-parallel-size",
-            str(int(self._cfg.tensor_parallel_size or 1)),
-            "--gpu-memory-utilization",
-            str(float(self._cfg.gpu_memory_utilization)),
-        ]
-        if self._tokenizer_name_or_path:
-            cmd.extend(["--tokenizer", self._tokenizer_name_or_path])
-        if self._trust_remote_code:
-            cmd.append("--trust-remote-code")
-        if self._dtype:
-            cmd.extend(["--dtype", self._dtype])
-        if self._cfg.max_model_len is not None:
-            cmd.extend(["--max-model-len", str(int(self._cfg.max_model_len))])
-        if self._cfg.max_num_seqs is not None:
-            cmd.extend(["--max-num-seqs", str(int(self._cfg.max_num_seqs))])
-        if self._cfg.max_num_batched_tokens is not None:
-            cmd.extend(["--max-num-batched-tokens", str(int(self._cfg.max_num_batched_tokens))])
-        if log_request_flag_style == "disable":
-            if bool(self._cfg.disable_log_requests):
-                cmd.append("--disable-log-requests")
-        else:
-            cmd.append("--no-enable-log-requests" if bool(self._cfg.disable_log_requests) else "--enable-log-requests")
-        if bool(self._cfg.enforce_eager):
-            cmd.append("--enforce-eager")
-
+        self._disable_custom_all_reduce_active = False
         try:
-            self._proc = subprocess.Popen(
-                cmd,
-                stdout=self._log_handle,
-                stderr=subprocess.STDOUT,
-                text=True,
-                env=worker_env,
+            self._launch_server_process(
+                python_executable=python_executable,
+                worker_env=worker_env,
+                disable_custom_all_reduce=False,
             )
-        except Exception as exc:
-            if self._log_handle is not None:
-                self._log_handle.close()
-                self._log_handle = None
-            raise RuntimeError(f"Failed to start local vLLM server: cmd={cmd}") from exc
-
-        logger.info(
-            "Started local vLLM server pid=%s host=%s port=%s gpus=%s log=%s",
-            getattr(self._proc, "pid", None),
-            self._cfg.host,
-            int(self._cfg.port),
-            self._cfg.gpu_ids,
-            self._log_path,
-        )
-        self._wait_until_ready()
+            self._wait_until_ready()
+            return
+        except RuntimeError as exc:
+            failure_text = self._read_recent_log_text()
+            if _looks_like_custom_all_reduce_startup_failure(failure_text):
+                logger.warning(
+                    "vLLM startup hit custom_all_reduce failure; retrying with custom all-reduce disabled. log=%s",
+                    self._log_path,
+                )
+                self.close()
+                self._launch_server_process(
+                    python_executable=python_executable,
+                    worker_env=worker_env,
+                    disable_custom_all_reduce=True,
+                )
+                self._wait_until_ready()
+                return
+            self.close()
+            raise exc
 
     def close(self) -> None:
         if self._proc is not None:
@@ -299,6 +297,109 @@ class LocalVLLMRolloutClient:
             "Timed out waiting for local vLLM server startup "
             f"(timeout={self._cfg.startup_timeout_sec}s, last_error={last_error}, log={self._log_path})"
         )
+
+    def _build_server_command(self, *, python_executable: str, disable_custom_all_reduce: bool) -> list[str]:
+        log_request_flag_style = _detect_vllm_log_request_flag_style(python_executable)
+        custom_all_reduce_flag_style = _detect_vllm_custom_all_reduce_flag_style(python_executable)
+        cmd = [
+            python_executable,
+            "-m",
+            "vllm.entrypoints.openai.api_server",
+            "--model",
+            self._base_model_name_or_path,
+            "--host",
+            str(self._cfg.host),
+            "--port",
+            str(int(self._cfg.port)),
+            "--served-model-name",
+            str(self._cfg.served_model_name or "policy-base"),
+            "--enable-lora",
+            "--max-lora-rank",
+            str(self._lora_rank),
+            "--tensor-parallel-size",
+            str(int(self._cfg.tensor_parallel_size or 1)),
+            "--gpu-memory-utilization",
+            str(float(self._cfg.gpu_memory_utilization)),
+        ]
+        if self._tokenizer_name_or_path:
+            cmd.extend(["--tokenizer", self._tokenizer_name_or_path])
+        if self._trust_remote_code:
+            cmd.append("--trust-remote-code")
+        if self._dtype:
+            cmd.extend(["--dtype", self._dtype])
+        if self._cfg.max_model_len is not None:
+            cmd.extend(["--max-model-len", str(int(self._cfg.max_model_len))])
+        if self._cfg.max_num_seqs is not None:
+            cmd.extend(["--max-num-seqs", str(int(self._cfg.max_num_seqs))])
+        if self._cfg.max_num_batched_tokens is not None:
+            cmd.extend(["--max-num-batched-tokens", str(int(self._cfg.max_num_batched_tokens))])
+        if log_request_flag_style == "disable":
+            if bool(self._cfg.disable_log_requests):
+                cmd.append("--disable-log-requests")
+        else:
+            cmd.append("--no-enable-log-requests" if bool(self._cfg.disable_log_requests) else "--enable-log-requests")
+        if custom_all_reduce_flag_style == "toggle":
+            cmd.append(
+                "--disable-custom-all-reduce"
+                if disable_custom_all_reduce
+                else "--no-disable-custom-all-reduce"
+            )
+        elif disable_custom_all_reduce:
+            cmd.append("--disable-custom-all-reduce")
+        if bool(self._cfg.enforce_eager):
+            cmd.append("--enforce-eager")
+        return cmd
+
+    def _launch_server_process(
+        self,
+        *,
+        python_executable: str,
+        worker_env: dict[str, str],
+        disable_custom_all_reduce: bool,
+    ) -> None:
+        self._log_path.parent.mkdir(parents=True, exist_ok=True)
+        self._log_handle = self._log_path.open("a", encoding="utf-8")
+        cmd = self._build_server_command(
+            python_executable=python_executable,
+            disable_custom_all_reduce=disable_custom_all_reduce,
+        )
+        try:
+            self._proc = subprocess.Popen(
+                cmd,
+                stdout=self._log_handle,
+                stderr=subprocess.STDOUT,
+                text=True,
+                env=worker_env,
+            )
+        except Exception as exc:
+            if self._log_handle is not None:
+                self._log_handle.close()
+                self._log_handle = None
+            raise RuntimeError(f"Failed to start local vLLM server: cmd={cmd}") from exc
+        self._disable_custom_all_reduce_active = bool(disable_custom_all_reduce)
+        logger.info(
+            "Started local vLLM server pid=%s host=%s port=%s gpus=%s disable_custom_all_reduce=%s log=%s",
+            getattr(self._proc, "pid", None),
+            self._cfg.host,
+            int(self._cfg.port),
+            self._cfg.gpu_ids,
+            disable_custom_all_reduce,
+            self._log_path,
+        )
+
+    def _read_recent_log_text(self, max_chars: int = 20000) -> str:
+        try:
+            if self._log_handle is not None:
+                self._log_handle.flush()
+        except Exception:
+            pass
+        try:
+            text = self._log_path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            return ""
+        if len(text) <= max_chars:
+            return text
+        return text[-max_chars:]
 
     def _request_json(self, path: str, *, method: str = "POST", payload: dict[str, Any] | None = None) -> Any:
         url = f"{self.server_base_url}{path}"
