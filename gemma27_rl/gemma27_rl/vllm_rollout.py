@@ -54,6 +54,7 @@ from .utils import collect_huggingface_worker_env, merge_env_overrides
 
 
 logger = logging.getLogger(__name__)
+_VLLM_LOG_REQUEST_FLAG_STYLE_CACHE: dict[str, str] = {}
 
 
 @dataclass
@@ -98,6 +99,37 @@ def _extract_text_content(value: Any) -> str:
         if isinstance(text, str):
             parts.append(text)
     return "".join(parts)
+
+
+def _detect_vllm_log_request_flag_style(python_executable: str) -> str:
+    cached = _VLLM_LOG_REQUEST_FLAG_STYLE_CACHE.get(str(python_executable))
+    if cached is not None:
+        return cached
+
+    cmd = [str(python_executable), "-m", "vllm.entrypoints.openai.api_server", "--help"]
+    style = "enable"
+    try:
+        proc = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=30.0,
+            check=False,
+        )
+        help_text = f"{proc.stdout or ''}\n{proc.stderr or ''}"
+        if "--enable-log-requests" in help_text or "--no-enable-log-requests" in help_text:
+            style = "enable"
+        elif "--disable-log-requests" in help_text:
+            style = "disable"
+    except Exception as exc:
+        logger.warning(
+            "Failed to inspect vLLM api_server --help for log-request flags; defaulting to new-style flags: %s",
+            exc,
+        )
+
+    _VLLM_LOG_REQUEST_FLAG_STYLE_CACHE[str(python_executable)] = style
+    return style
 
 
 class LocalVLLMRolloutClient:
@@ -162,6 +194,7 @@ class LocalVLLMRolloutClient:
             worker_env.update(env_overrides)
 
         python_executable = str(self._cfg.python_executable or "python").strip() or "python"
+        log_request_flag_style = _detect_vllm_log_request_flag_style(python_executable)
         cmd = [
             python_executable,
             "-m",
@@ -194,8 +227,11 @@ class LocalVLLMRolloutClient:
             cmd.extend(["--max-num-seqs", str(int(self._cfg.max_num_seqs))])
         if self._cfg.max_num_batched_tokens is not None:
             cmd.extend(["--max-num-batched-tokens", str(int(self._cfg.max_num_batched_tokens))])
-        if bool(self._cfg.disable_log_requests):
-            cmd.append("--disable-log-requests")
+        if log_request_flag_style == "disable":
+            if bool(self._cfg.disable_log_requests):
+                cmd.append("--disable-log-requests")
+        else:
+            cmd.append("--no-enable-log-requests" if bool(self._cfg.disable_log_requests) else "--enable-log-requests")
         if bool(self._cfg.enforce_eager):
             cmd.append("--enforce-eager")
 

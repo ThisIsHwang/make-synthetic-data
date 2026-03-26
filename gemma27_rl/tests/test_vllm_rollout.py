@@ -96,6 +96,7 @@ def test_local_vllm_client_start_strips_dist_vars(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setenv("MASTER_ADDR", "127.0.0.1")
     monkeypatch.setenv("MASTER_PORT", "29500")
     monkeypatch.setenv("PYTHONHOME", "/tmp/fake-home")
+    monkeypatch.setattr(vllm_mod, "_detect_vllm_log_request_flag_style", lambda python_executable: "enable")
     monkeypatch.setattr(vllm_mod.subprocess, "Popen", _fake_popen)
     monkeypatch.setattr(vllm_mod.LocalVLLMRolloutClient, "_wait_until_ready", lambda self: None)
 
@@ -124,6 +125,7 @@ def test_local_vllm_client_start_strips_dist_vars(monkeypatch: pytest.MonkeyPatc
     assert cmd[:3] == ["python", "-m", "vllm.entrypoints.openai.api_server"]
     assert "--enable-lora" in cmd
     assert "--max-lora-rank" in cmd
+    assert "--no-enable-log-requests" in cmd
     env = captured["env"]
     assert isinstance(env, dict)
     assert env.get("CUDA_VISIBLE_DEVICES") == "6,7"
@@ -208,3 +210,25 @@ def test_generate_rollouts_vllm_retokenizes_when_response_omits_token_ids(
     assert len(rollouts) == 1
     assert rollouts[0].completion_token_ids == [901, 902]
     assert client._warned_missing_token_ids is True
+
+
+def test_detect_vllm_log_request_flag_style_prefers_new_enable_flags(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _Completed:
+        stdout = "usage: ... [--enable-log-requests | --no-enable-log-requests]"
+        stderr = ""
+
+    monkeypatch.setattr(vllm_mod.subprocess, "run", lambda *args, **kwargs: _Completed())
+    monkeypatch.setattr(vllm_mod, "_VLLM_LOG_REQUEST_FLAG_STYLE_CACHE", {})
+
+    assert vllm_mod._detect_vllm_log_request_flag_style("python") == "enable"
+
+
+def test_detect_vllm_log_request_flag_style_falls_back_to_old_disable_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _Completed:
+        stdout = "usage: ... [--disable-log-requests]"
+        stderr = ""
+
+    monkeypatch.setattr(vllm_mod.subprocess, "run", lambda *args, **kwargs: _Completed())
+    monkeypatch.setattr(vllm_mod, "_VLLM_LOG_REQUEST_FLAG_STYLE_CACHE", {})
+
+    assert vllm_mod._detect_vllm_log_request_flag_style("python") == "disable"
