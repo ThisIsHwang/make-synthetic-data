@@ -230,18 +230,19 @@ class LocalVLLMRolloutClient:
             worker_env.update(env_overrides)
 
         python_executable = str(self._cfg.python_executable or "python").strip() or "python"
-        self._disable_custom_all_reduce_active = False
+        prefer_disable_custom_all_reduce = bool(getattr(self._cfg, "disable_custom_all_reduce", False))
+        self._disable_custom_all_reduce_active = prefer_disable_custom_all_reduce
         try:
             self._launch_server_process(
                 python_executable=python_executable,
                 worker_env=worker_env,
-                disable_custom_all_reduce=False,
+                disable_custom_all_reduce=prefer_disable_custom_all_reduce,
             )
             self._wait_until_ready()
             return
         except RuntimeError as exc:
             failure_text = self._read_recent_log_text()
-            if _looks_like_custom_all_reduce_startup_failure(failure_text):
+            if (not prefer_disable_custom_all_reduce) and _looks_like_custom_all_reduce_startup_failure(failure_text):
                 logger.warning(
                     "vLLM startup hit custom_all_reduce failure; retrying with custom all-reduce disabled. log=%s",
                     self._log_path,

@@ -10,7 +10,11 @@ pytest.importorskip("torch")
 import torch
 
 from gemma27_rl.config import RLPostTrainConfig
-from gemma27_rl.preprocess import prepare_dataset_artifacts, prepare_prompt_token_lengths
+from gemma27_rl.preprocess import (
+    filter_examples_by_max_prompt_tokens,
+    prepare_dataset_artifacts,
+    prepare_prompt_token_lengths,
+)
 from gemma27_rl.rl_types import Example
 from gemma27_rl.rollout import compute_prompt_token_lengths
 
@@ -129,6 +133,20 @@ def test_prepare_prompt_token_lengths_reuses_cache(tmp_path: Path, monkeypatch) 
     assert cache_info_second.path == cache_info_first.path
 
 
+def test_filter_examples_by_max_prompt_tokens_filters_long_examples() -> None:
+    examples = _examples()
+
+    filtered_examples, filtered_lengths, dropped = filter_examples_by_max_prompt_tokens(
+        examples=examples,
+        prompt_lengths=[100, 5000],
+        max_prompt_tokens=4096,
+    )
+
+    assert [example.example_id for example in filtered_examples] == ["ex-0"]
+    assert filtered_lengths == [100]
+    assert dropped == 1
+
+
 def test_compute_prompt_token_lengths_chunks_batches() -> None:
     tokenizer = _ChunkingTokenizer()
     examples = [
@@ -241,3 +259,60 @@ def test_prepare_dataset_artifacts_warms_split_and_prompt_length_caches(tmp_path
     assert second_summary["prepared_prompt_lengths"] is True
     assert second_summary["prompt_length_cache_hit"] is True
     assert second_summary["prompt_length_cache_path"] == first_summary["prompt_length_cache_path"]
+
+
+def test_prepare_dataset_artifacts_reports_max_prompt_token_filtering(tmp_path: Path, monkeypatch) -> None:
+    train_dir = tmp_path / "train"
+    train_dir.mkdir()
+    split_cache_dir = tmp_path / "split_cache"
+    preprocess_cache_dir = tmp_path / "preprocess_cache"
+    tokenizer = _TokenizerStub()
+
+    rows = [
+        {"id": "a", "source": "short-a", "target": "tgt-a"},
+        {"id": "b", "source": "long-b", "target": "tgt-b"},
+        {"id": "c", "source": "short-c", "target": "tgt-c"},
+        {"id": "d", "source": "long-d", "target": "tgt-d"},
+    ]
+    path = train_dir / "train.jsonl"
+    with path.open("w", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+    cfg = RLPostTrainConfig()
+    cfg.data.train_file = None
+    cfg.data.eval_file = None
+    cfg.data.train_dir = str(train_dir)
+    cfg.data.train_glob = "*.jsonl"
+    cfg.data.id_field = "id"
+    cfg.data.src_text_field = "source"
+    cfg.data.ref_text_field = "target"
+    cfg.data.split_cache_dir = str(split_cache_dir)
+    cfg.data.preprocess_cache_dir = str(preprocess_cache_dir)
+    cfg.data.eval_sampling_ratio = 0.25
+    cfg.data.eval_sampling_seed = 17
+    cfg.data.eval_sampling_min_samples = 1
+    cfg.data.max_prompt_tokens = 150
+
+    def _fake_lengths(**kwargs):
+        split = kwargs["split"]
+        examples = kwargs["examples"]
+        if split == "train":
+            return [100, 200, 110]
+        if split == "eval":
+            assert len(examples) == 1
+            return [250]
+        raise AssertionError(f"unexpected split {split}")
+
+    monkeypatch.setattr("gemma27_rl.preprocess.compute_prompt_token_lengths", _fake_lengths)
+
+    summary = prepare_dataset_artifacts(cfg, tokenizer=tokenizer)
+
+    assert summary["max_prompt_tokens"] == 150
+    assert summary["train_count"] == 3
+    assert summary["filtered_train_count"] == 2
+    assert summary["filtered_train_dropped_count"] == 1
+    assert summary["eval_count"] == 1
+    assert summary["filtered_eval_count"] == 0
+    assert summary["filtered_eval_dropped_count"] == 1
+    assert Path(summary["eval_prompt_length_cache_path"]).exists()

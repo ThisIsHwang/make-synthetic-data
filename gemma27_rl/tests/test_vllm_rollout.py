@@ -298,3 +298,45 @@ def test_start_retries_with_disable_custom_all_reduce_when_startup_log_matches(
     assert len(captured_cmds) == 2
     assert "--no-disable-custom-all-reduce" in captured_cmds[0]
     assert "--disable-custom-all-reduce" in captured_cmds[1]
+
+
+def test_start_prefers_disable_custom_all_reduce_when_configured(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    captured_cmds: list[list[str]] = []
+
+    def _fake_popen(*args, **kwargs):  # type: ignore[no-untyped-def]
+        captured_cmds.append(list(args[0]))
+        return _FakeProc()
+
+    monkeypatch.setattr(vllm_mod, "_detect_vllm_log_request_flag_style", lambda python_executable: "enable")
+    monkeypatch.setattr(vllm_mod, "_detect_vllm_custom_all_reduce_flag_style", lambda python_executable: "toggle")
+    monkeypatch.setattr(vllm_mod.subprocess, "Popen", _fake_popen)
+    monkeypatch.setattr(vllm_mod.LocalVLLMRolloutClient, "_wait_until_ready", lambda self: None)
+
+    cfg = VLLMConfig(
+        enabled=True,
+        gpu_ids=[6, 7],
+        tensor_parallel_size=2,
+        adapter_root_dir=str(tmp_path / "adapters"),
+        python_executable="python",
+        disable_custom_all_reduce=True,
+    )
+    client = vllm_mod.LocalVLLMRolloutClient(
+        cfg=cfg,
+        base_model_name_or_path="google/gemma-3-27b-it",
+        tokenizer_name_or_path="google/gemma-3-27b-it",
+        lora_rank=64,
+        trust_remote_code=False,
+        dtype="bfloat16",
+        log_path=tmp_path / "vllm.log",
+        owns_server=True,
+    )
+
+    client.start()
+    client.close()
+
+    assert len(captured_cmds) == 1
+    assert "--disable-custom-all-reduce" in captured_cmds[0]
+    assert "--no-disable-custom-all-reduce" not in captured_cmds[0]

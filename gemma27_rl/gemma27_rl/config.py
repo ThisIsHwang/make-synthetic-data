@@ -113,6 +113,7 @@ class DataConfig:
     default_src_lang_code: str = "en"
     default_tgt_lang_code: str = "ko"
     prompt_length_batch_size: int = 128
+    max_prompt_tokens: int | None = None
     batching_strategy: str = "direction"  # direction|direction_domain_length
     domain_field_path: str = "teacher.path"
 
@@ -387,6 +388,7 @@ class VLLMConfig:
     max_model_len: int | None = None
     max_num_seqs: int | None = None
     max_num_batched_tokens: int | None = None
+    disable_custom_all_reduce: bool = False
     disable_log_requests: bool = True
     enforce_eager: bool = False
 
@@ -670,6 +672,8 @@ def _validate_config(cfg: RLPostTrainConfig) -> None:
         raise ValueError("data.split_cache_enabled must be a bool")
     if int(cfg.data.prompt_length_batch_size) <= 0:
         raise ValueError("data.prompt_length_batch_size must be > 0")
+    if cfg.data.max_prompt_tokens is not None and int(cfg.data.max_prompt_tokens) <= 0:
+        raise ValueError("data.max_prompt_tokens must be > 0 when set")
     if cfg.generation.num_samples_per_prompt <= 0:
         raise ValueError("generation.num_samples_per_prompt must be > 0")
     for field_name, raw in (
@@ -778,6 +782,8 @@ def _validate_config(cfg: RLPostTrainConfig) -> None:
         raise ValueError("vllm.max_num_seqs must be > 0 when set")
     if cfg.vllm.max_num_batched_tokens is not None and int(cfg.vllm.max_num_batched_tokens) <= 0:
         raise ValueError("vllm.max_num_batched_tokens must be > 0 when set")
+    if not isinstance(cfg.vllm.disable_custom_all_reduce, bool):
+        raise ValueError("vllm.disable_custom_all_reduce must be a bool")
     if not isinstance(cfg.vllm.disable_log_requests, bool):
         raise ValueError("vllm.disable_log_requests must be a bool")
     if not isinstance(cfg.vllm.enforce_eager, bool):

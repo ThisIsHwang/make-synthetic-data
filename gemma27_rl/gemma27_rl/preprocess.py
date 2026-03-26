@@ -278,8 +278,38 @@ def prepare_prompt_token_lengths(
     return prompt_lengths, PromptLengthCacheInfo(path=cache_path, cache_key=cache_key, cache_hit=False)
 
 
+def filter_examples_by_max_prompt_tokens(
+    *,
+    examples: list[Example],
+    prompt_lengths: list[int],
+    max_prompt_tokens: int | None,
+) -> tuple[list[Example], list[int], int]:
+    if len(examples) != len(prompt_lengths):
+        raise ValueError(
+            "examples and prompt_lengths length mismatch: "
+            f"{len(examples)} != {len(prompt_lengths)}"
+        )
+    if max_prompt_tokens is None:
+        return list(examples), [max(0, int(length)) for length in prompt_lengths], 0
+
+    threshold = max(1, int(max_prompt_tokens))
+    kept_examples: list[Example] = []
+    kept_lengths: list[int] = []
+    dropped = 0
+    for example, raw_length in zip(examples, prompt_lengths):
+        length = max(0, int(raw_length))
+        if length <= threshold:
+            kept_examples.append(example)
+            kept_lengths.append(length)
+        else:
+            dropped += 1
+    return kept_examples, kept_lengths, dropped
+
+
 def _should_prepare_prompt_lengths(cfg: RLPostTrainConfig, *, force_prompt_lengths: bool) -> bool:
     if force_prompt_lengths:
+        return True
+    if getattr(cfg.data, "max_prompt_tokens", None) is not None:
         return True
     batching_strategy = str(cfg.data.batching_strategy or "direction").strip().lower() or "direction"
     return batching_strategy == "direction_domain_length"
@@ -331,6 +361,41 @@ def prepare_dataset_artifacts(
                 "prompt_length_max": max(prompt_lengths) if prompt_lengths else 0,
             }
         )
+        if cfg.data.max_prompt_tokens is not None:
+            filtered_train_examples, filtered_train_lengths, dropped_train = filter_examples_by_max_prompt_tokens(
+                examples=train_examples,
+                prompt_lengths=prompt_lengths,
+                max_prompt_tokens=cfg.data.max_prompt_tokens,
+            )
+            eval_prompt_lengths, eval_cache_info = prepare_prompt_token_lengths(
+                cfg=cfg,
+                split="eval",
+                examples=eval_examples,
+                tokenizer=prep_tokenizer,
+                limit=eval_limit,
+                force_recompute=force_recompute,
+            )
+            filtered_eval_examples, filtered_eval_lengths, dropped_eval = filter_examples_by_max_prompt_tokens(
+                examples=eval_examples,
+                prompt_lengths=eval_prompt_lengths,
+                max_prompt_tokens=cfg.data.max_prompt_tokens,
+            )
+            result.update(
+                {
+                    "max_prompt_tokens": int(cfg.data.max_prompt_tokens),
+                    "filtered_train_count": len(filtered_train_examples),
+                    "filtered_train_dropped_count": int(dropped_train),
+                    "filtered_train_prompt_length_min": min(filtered_train_lengths) if filtered_train_lengths else 0,
+                    "filtered_train_prompt_length_max": max(filtered_train_lengths) if filtered_train_lengths else 0,
+                    "eval_prompt_length_count": len(eval_prompt_lengths),
+                    "eval_prompt_length_cache_hit": bool(eval_cache_info.cache_hit),
+                    "eval_prompt_length_cache_path": str(eval_cache_info.path),
+                    "filtered_eval_count": len(filtered_eval_examples),
+                    "filtered_eval_dropped_count": int(dropped_eval),
+                    "filtered_eval_prompt_length_min": min(filtered_eval_lengths) if filtered_eval_lengths else 0,
+                    "filtered_eval_prompt_length_max": max(filtered_eval_lengths) if filtered_eval_lengths else 0,
+                }
+            )
 
     return result
 

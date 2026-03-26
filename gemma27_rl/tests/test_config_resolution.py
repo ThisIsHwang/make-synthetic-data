@@ -148,6 +148,62 @@ def test_vllm_python_executable_and_default_adapter_root_dir_resolve_from_config
     assert cfg.vllm.adapter_root_dir == str((Path(cfg.logging.output_dir) / "vllm_adapters").resolve())
 
 
+def test_vllm_disable_custom_all_reduce_loads_from_config(tmp_path: Path) -> None:
+    cfg_path = tmp_path / "train.yaml"
+    cfg_path.write_text(
+        "\n".join(
+            [
+                "data:",
+                "  hf_dataset_name: dummy/dataset",
+                "model:",
+                "  lora:",
+                "    enabled: true",
+                "reward:",
+                "  xcomet:",
+                "    enabled: false",
+                "  mqm:",
+                "    enabled: false",
+                "  esa:",
+                "    enabled: false",
+                "vllm:",
+                "  enabled: true",
+                "  gpu_ids: [6, 7]",
+                "  disable_custom_all_reduce: true",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    cfg = load_config(cfg_path)
+    assert cfg.vllm.disable_custom_all_reduce is True
+
+
+def test_max_prompt_tokens_loads_from_config(tmp_path: Path) -> None:
+    cfg_path = tmp_path / "train.yaml"
+    cfg_path.write_text(
+        "\n".join(
+            [
+                "data:",
+                "  hf_dataset_name: dummy/dataset",
+                "  max_prompt_tokens: 2048",
+                "reward:",
+                "  xcomet:",
+                "    enabled: false",
+                "  mqm:",
+                "    enabled: false",
+                "  esa:",
+                "    enabled: false",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    cfg = load_config(cfg_path)
+    assert cfg.data.max_prompt_tokens == 2048
+
+
 def test_vllm_enabled_requires_lora(tmp_path: Path) -> None:
     cfg_path = tmp_path / "train.yaml"
     cfg_path.write_text(

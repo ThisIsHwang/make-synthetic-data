@@ -49,7 +49,7 @@ from .config import RLPostTrainConfig, dump_config
 from .data import load_examples
 from .eval import build_eval_report_from_rollouts, evaluate_on_dataset, prepare_eval_rollouts
 from .grpo import update_policy
-from .preprocess import prepare_prompt_token_lengths
+from .preprocess import filter_examples_by_max_prompt_tokens, prepare_prompt_token_lengths
 from .prompting import (
     collect_tokenizer_special_token_strings as _collect_special_token_strings_shared,
     sanitize_text_for_scoring as _sanitize_text_for_scoring_shared,
@@ -344,6 +344,64 @@ def _log_selected_training_batch(
         summary["prompt_token_length_min"],
         summary["prompt_token_length_max"],
     )
+
+
+def _prepare_split_prompt_token_lengths(
+    *,
+    cfg: RLPostTrainConfig,
+    split: str,
+    examples: list[Example],
+    tokenizer: Any,
+    limit: int | None,
+    log_reason: str,
+    rank0: bool,
+) -> tuple[list[int], Any]:
+    prompt_lengths, cache_info = prepare_prompt_token_lengths(
+        cfg=cfg,
+        split=split,
+        examples=examples,
+        tokenizer=tokenizer,
+        limit=limit,
+    )
+    if rank0:
+        logger.info(
+            "Prepared prompt token lengths for %s: split=%s examples=%s min=%s max=%s batch_size=%s cache_hit=%s cache=%s",
+            log_reason,
+            split,
+            len(prompt_lengths),
+            min(prompt_lengths) if prompt_lengths else 0,
+            max(prompt_lengths) if prompt_lengths else 0,
+            int(cfg.data.prompt_length_batch_size),
+            bool(cache_info.cache_hit),
+            cache_info.path,
+        )
+    return prompt_lengths, cache_info
+
+
+def _apply_max_prompt_token_filter(
+    *,
+    cfg: RLPostTrainConfig,
+    split: str,
+    examples: list[Example],
+    prompt_lengths: list[int],
+    rank0: bool,
+) -> tuple[list[Example], list[int], int]:
+    filtered_examples, filtered_lengths, dropped_count = filter_examples_by_max_prompt_tokens(
+        examples=examples,
+        prompt_lengths=prompt_lengths,
+        max_prompt_tokens=cfg.data.max_prompt_tokens,
+    )
+    if rank0 and cfg.data.max_prompt_tokens is not None:
+        logger.info(
+            "Applied max_prompt_tokens=%s filter to split=%s: kept=%s dropped=%s prompt_token_len_min=%s prompt_token_len_max=%s",
+            int(cfg.data.max_prompt_tokens),
+            split,
+            len(filtered_examples),
+            int(dropped_count),
+            min(filtered_lengths) if filtered_lengths else 0,
+            max(filtered_lengths) if filtered_lengths else 0,
+        )
+    return filtered_examples, filtered_lengths, int(dropped_count)
 
 
 def _span_overlap_chars(start: int, end: int, tok_s: int, tok_e: int) -> int:
@@ -5177,6 +5235,23 @@ def run_metric_only_eval(cfg: RLPostTrainConfig) -> dict[str, Any]:
     eval_examples = load_examples(cfg.data, split="eval", limit=eval_limit)
     if eval_limit is not None and len(eval_examples) > int(eval_limit):
         eval_examples = eval_examples[: int(eval_limit)]
+    if eval_examples and cfg.data.max_prompt_tokens is not None:
+        eval_prompt_lengths, _ = _prepare_split_prompt_token_lengths(
+            cfg=cfg,
+            split="eval",
+            examples=eval_examples,
+            tokenizer=tokenizer,
+            limit=eval_limit,
+            log_reason="metric-only eval filtering",
+            rank0=True,
+        )
+        eval_examples, _, _ = _apply_max_prompt_token_filter(
+            cfg=cfg,
+            split="eval",
+            examples=eval_examples,
+            prompt_lengths=eval_prompt_lengths,
+            rank0=True,
+        )
     logger.info(
         "Prepared eval examples (metric-only): requested_limit=%s loaded=%s eval_file=%s hf_eval_split=%s",
         eval_limit,
@@ -5417,29 +5492,61 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
 
     batching_strategy = str(cfg.data.batching_strategy or "direction").strip().lower() or "direction"
     train_prompt_token_lengths: list[int] | None = None
-    if batching_strategy == "direction_domain_length":
-        train_prompt_token_lengths, prompt_length_cache = prepare_prompt_token_lengths(
+    needs_train_prompt_lengths = (
+        batching_strategy == "direction_domain_length"
+        or cfg.data.max_prompt_tokens is not None
+    )
+    if needs_train_prompt_lengths:
+        train_prompt_token_lengths, _ = _prepare_split_prompt_token_lengths(
             cfg=cfg,
             split="train",
             examples=train_examples,
             tokenizer=tokenizer,
             limit=cfg.data.limit,
+            log_reason=(
+                "bucketed batching and prompt filtering"
+                if batching_strategy == "direction_domain_length" and cfg.data.max_prompt_tokens is not None
+                else "bucketed batching"
+                if batching_strategy == "direction_domain_length"
+                else "prompt filtering"
+            ),
+            rank0=rank0,
         )
-        if rank0:
-            logger.info(
-                "Prepared prompt token lengths for bucketed batching: examples=%s min=%s max=%s batch_size=%s cache_hit=%s cache=%s",
-                len(train_prompt_token_lengths),
-                min(train_prompt_token_lengths) if train_prompt_token_lengths else 0,
-                max(train_prompt_token_lengths) if train_prompt_token_lengths else 0,
-                int(cfg.data.prompt_length_batch_size),
-                bool(prompt_length_cache.cache_hit),
-                prompt_length_cache.path,
+    if train_prompt_token_lengths is not None and cfg.data.max_prompt_tokens is not None:
+        train_examples, train_prompt_token_lengths, _ = _apply_max_prompt_token_filter(
+            cfg=cfg,
+            split="train",
+            examples=train_examples,
+            prompt_lengths=train_prompt_token_lengths,
+            rank0=rank0,
+        )
+        if not train_examples:
+            raise ValueError(
+                "No train examples remain after applying data.max_prompt_tokens="
+                f"{int(cfg.data.max_prompt_tokens)}."
             )
 
     eval_limit = cfg.eval.eval_limit if cfg.eval.eval_limit is not None else cfg.data.eval_limit
     eval_examples = load_examples(cfg.data, split="eval", limit=eval_limit)
     if eval_limit is not None and len(eval_examples) > int(eval_limit):
         eval_examples = eval_examples[: int(eval_limit)]
+    if eval_examples and cfg.data.max_prompt_tokens is not None:
+        eval_prompt_token_lengths, _ = _prepare_split_prompt_token_lengths(
+            cfg=cfg,
+            split="eval",
+            examples=eval_examples,
+            tokenizer=tokenizer,
+            limit=eval_limit,
+            log_reason="prompt filtering",
+            rank0=rank0,
+        )
+        eval_examples, _, _ = _apply_max_prompt_token_filter(
+            cfg=cfg,
+            split="eval",
+            examples=eval_examples,
+            prompt_lengths=eval_prompt_token_lengths,
+            rank0=rank0,
+        )
     logger.info(
         "Prepared eval examples: requested_limit=%s loaded=%s eval_file=%s hf_eval_split=%s",
         eval_limit,
