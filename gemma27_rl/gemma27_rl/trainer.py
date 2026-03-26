@@ -5120,6 +5120,57 @@ def _rewrite_peft_state_dict_for_vllm(model: Any, state_dict: dict[str, Any]) ->
     return rewritten
 
 
+def _rewrite_peft_adapter_config_for_vllm(model: Any, output_dir: Path) -> None:
+    config = getattr(model, "config", None)
+    model_type = str(getattr(config, "model_type", "") or "").strip().lower()
+    if model_type != "gemma3":
+        return
+
+    cfg_path = output_dir / _ADAPTER_CONFIG_FILENAME
+    if not cfg_path.exists():
+        return
+
+    try:
+        payload = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise RuntimeError(f"Failed to read PEFT adapter config for vLLM export: {cfg_path}") from exc
+
+    raw_target_modules = payload.get("target_modules")
+    if isinstance(raw_target_modules, str):
+        target_modules = [raw_target_modules]
+    elif isinstance(raw_target_modules, list):
+        target_modules = [str(name).strip() for name in raw_target_modules if str(name).strip()]
+    else:
+        return
+
+    replacements = {
+        "q_proj": "qkv_proj",
+        "k_proj": "qkv_proj",
+        "v_proj": "qkv_proj",
+        "gate_proj": "gate_up_proj",
+        "up_proj": "gate_up_proj",
+    }
+    rewritten: list[str] = []
+    seen: set[str] = set()
+    for name in target_modules:
+        mapped = replacements.get(name, name)
+        if mapped in seen:
+            continue
+        seen.add(mapped)
+        rewritten.append(mapped)
+
+    if rewritten == target_modules:
+        return
+
+    payload["target_modules"] = rewritten
+    cfg_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    logger.info(
+        "Rewrote Gemma3 PEFT adapter target_modules for vLLM compatibility: %s -> %s",
+        target_modules,
+        rewritten,
+    )
+
+
 def _build_zero3_peft_state_dict(model: Any) -> dict[str, Any] | None:
     if PeftModel is None or get_peft_model_state_dict is None:
         return None
@@ -5189,6 +5240,8 @@ def _save_pretrained_model(model: Any, output_dir: Path, *, require_peft_adapter
                 list(zero3_state_dict.keys())[:5],
             )
             export_model.save_pretrained(output_dir, state_dict=zero3_state_dict)
+            if require_peft_adapter:
+                _rewrite_peft_adapter_config_for_vllm(export_model, output_dir)
         else:
             if require_peft_adapter:
                 raise RuntimeError(

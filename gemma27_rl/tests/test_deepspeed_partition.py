@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime
+import json
 from contextlib import nullcontext
 import os
 from types import SimpleNamespace
@@ -17,6 +18,7 @@ from gemma27_rl.trainer import (
     _configure_nccl_heartbeat_timeout,
     _init_deepspeed_distributed,
     _is_deepspeed_resume_shard_mismatch_error,
+    _rewrite_peft_adapter_config_for_vllm,
     _rewrite_peft_state_dict_for_vllm,
     _register_qwen35_zero3_external_parameters,
     _load_policy_model,
@@ -329,6 +331,23 @@ def test_rewrite_peft_state_dict_for_vllm_raises_when_gemma3_multimodal_adapter_
 
     with pytest.raises(RuntimeError, match="no language_model LoRA weights remain"):
         _rewrite_peft_state_dict_for_vllm(model, state_dict)
+
+
+def test_rewrite_peft_adapter_config_for_vllm_packs_gemma3_target_modules(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    model = SimpleNamespace(config=SimpleNamespace(model_type="gemma3"))
+    cfg_path = tmp_path / "adapter_config.json"
+    cfg_path.write_text(
+        """{
+  "target_modules": ["down_proj", "v_proj", "gate_proj", "q_proj", "o_proj", "k_proj", "up_proj"]
+}
+""",
+        encoding="utf-8",
+    )
+
+    _rewrite_peft_adapter_config_for_vllm(model, tmp_path)
+
+    payload = json.loads(cfg_path.read_text(encoding="utf-8"))
+    assert payload["target_modules"] == ["down_proj", "qkv_proj", "gate_up_proj", "o_proj"]
 
 
 def test_build_zero3_peft_state_dict_gathers_trainable_params(monkeypatch: pytest.MonkeyPatch) -> None:
