@@ -5088,6 +5088,43 @@ def _clone_state_dict_to_cpu(state_dict: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _rewrite_peft_state_dict_for_vllm(model: Any, state_dict: dict[str, Any]) -> dict[str, Any]:
+    config = getattr(model, "config", None)
+    model_type = str(getattr(config, "model_type", "") or "").strip().lower()
+    if model_type != "gemma3":
+        return state_dict
+
+    replacements = (
+        ("base_model.model.model.language_model.model.", "base_model.model.model."),
+        ("base_model.model.model.language_model.", "base_model.model.model."),
+        ("base_model.model.language_model.model.", "base_model.model.model."),
+        ("base_model.model.language_model.", "base_model.model."),
+        ("model.language_model.model.", "model."),
+        ("model.language_model.", "model."),
+        ("language_model.model.", "model."),
+        ("language_model.", ""),
+    )
+
+    rewritten: dict[str, Any] = {}
+    changed = 0
+    for key, value in state_dict.items():
+        new_key = key
+        for old, new in replacements:
+            if old in new_key:
+                new_key = new_key.replace(old, new, 1)
+        if new_key != key:
+            changed += 1
+        rewritten[new_key] = value
+
+    if changed > 0:
+        logger.info(
+            "Rewrote %s Gemma3 LoRA adapter key(s) for vLLM compatibility; sample_keys=%s",
+            changed,
+            list(rewritten.keys())[:5],
+        )
+    return rewritten
+
+
 def _build_zero3_peft_state_dict(model: Any) -> dict[str, Any] | None:
     if PeftModel is None or get_peft_model_state_dict is None:
         return None
@@ -5108,14 +5145,29 @@ def _build_zero3_peft_state_dict(model: Any) -> dict[str, Any] | None:
                 with gathered_parameters(params_to_gather, modifier_rank=0):
                     if not _is_rank0():
                         return None
-                    state_dict = get_peft_model_state_dict(export_model, **adapter_kwargs)
+                    base_state_dict = export_model.state_dict()
+                    state_dict = get_peft_model_state_dict(
+                        export_model,
+                        state_dict=base_state_dict,
+                        **adapter_kwargs,
+                    )
                     return _clone_state_dict_to_cpu(state_dict)
             if not _is_rank0():
                 return None
-            state_dict = get_peft_model_state_dict(export_model, **adapter_kwargs)
+            base_state_dict = export_model.state_dict()
+            state_dict = get_peft_model_state_dict(
+                export_model,
+                state_dict=base_state_dict,
+                **adapter_kwargs,
+            )
             return _clone_state_dict_to_cpu(state_dict)
 
-    state_dict = get_peft_model_state_dict(export_model, **adapter_kwargs)
+    base_state_dict = export_model.state_dict()
+    state_dict = get_peft_model_state_dict(
+        export_model,
+        state_dict=base_state_dict,
+        **adapter_kwargs,
+    )
     return _clone_state_dict_to_cpu(state_dict)
 
 
@@ -5133,6 +5185,8 @@ def _save_pretrained_model(model: Any, output_dir: Path, *, require_peft_adapter
                 raise RuntimeError(
                     f"Refusing to export an empty LoRA adapter for vLLM at {output_dir}."
                 )
+            if require_peft_adapter:
+                zero3_state_dict = _rewrite_peft_state_dict_for_vllm(export_model, zero3_state_dict)
             logger.info(
                 "Exporting PEFT adapter to %s with %s tensor(s); sample_keys=%s",
                 output_dir,
