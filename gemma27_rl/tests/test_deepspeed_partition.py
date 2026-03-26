@@ -17,6 +17,7 @@ from gemma27_rl.trainer import (
     _configure_nccl_heartbeat_timeout,
     _init_deepspeed_distributed,
     _is_deepspeed_resume_shard_mismatch_error,
+    _rewrite_peft_state_dict_for_vllm,
     _register_qwen35_zero3_external_parameters,
     _load_policy_model,
     _validate_deepspeed_partition_strict,
@@ -302,6 +303,32 @@ class _FakePeftModelBase(nn.Module):
         super().__init__()
         self.lora = nn.Parameter(torch.ones(2, 3))
         self.base = nn.Parameter(torch.zeros(4, 5), requires_grad=False)
+
+
+def test_rewrite_peft_state_dict_for_vllm_keeps_only_gemma3_language_model_tensors() -> None:
+    model = SimpleNamespace(config=SimpleNamespace(model_type="gemma3"))
+    state_dict = {
+        "base_model.model.model.vision_tower.vision_model.encoder.layers.0.self_attn.q_proj.lora_A.weight": torch.ones(1),
+        "base_model.model.model.language_model.layers.0.self_attn.q_proj.lora_A.weight": torch.ones(1),
+        "base_model.model.model.language_model.layers.0.self_attn.q_proj.lora_B.weight": torch.ones(1),
+    }
+
+    rewritten = _rewrite_peft_state_dict_for_vllm(model, state_dict)
+
+    assert sorted(rewritten) == [
+        "base_model.model.model.language_model.layers.0.self_attn.q_proj.lora_A.weight",
+        "base_model.model.model.language_model.layers.0.self_attn.q_proj.lora_B.weight",
+    ]
+
+
+def test_rewrite_peft_state_dict_for_vllm_raises_when_gemma3_multimodal_adapter_has_no_language_keys() -> None:
+    model = SimpleNamespace(config=SimpleNamespace(model_type="gemma3"))
+    state_dict = {
+        "base_model.model.model.vision_tower.vision_model.encoder.layers.0.self_attn.q_proj.lora_A.weight": torch.ones(1),
+    }
+
+    with pytest.raises(RuntimeError, match="no language_model LoRA weights remain"):
+        _rewrite_peft_state_dict_for_vllm(model, state_dict)
 
 
 def test_build_zero3_peft_state_dict_gathers_trainable_params(monkeypatch: pytest.MonkeyPatch) -> None:

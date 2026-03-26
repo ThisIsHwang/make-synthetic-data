@@ -5094,32 +5094,27 @@ def _rewrite_peft_state_dict_for_vllm(model: Any, state_dict: dict[str, Any]) ->
     if model_type != "gemma3":
         return state_dict
 
-    replacements = (
-        ("base_model.model.model.language_model.model.", "base_model.model.model."),
-        ("base_model.model.model.language_model.", "base_model.model.model."),
-        ("base_model.model.language_model.model.", "base_model.model.model."),
-        ("base_model.model.language_model.", "base_model.model."),
-        ("model.language_model.model.", "model."),
-        ("model.language_model.", "model."),
-        ("language_model.model.", "model."),
-        ("language_model.", ""),
-    )
+    multimodal_markers = ("vision_tower.", "multi_modal_projector.", "vision_model.")
+    has_multimodal_keys = any(any(marker in key for marker in multimodal_markers) for key in state_dict)
+    if not has_multimodal_keys:
+        return state_dict
 
-    rewritten: dict[str, Any] = {}
-    changed = 0
-    for key, value in state_dict.items():
-        new_key = key
-        for old, new in replacements:
-            if old in new_key:
-                new_key = new_key.replace(old, new, 1)
-        if new_key != key:
-            changed += 1
-        rewritten[new_key] = value
-
-    if changed > 0:
+    rewritten = {
+        key: value
+        for key, value in state_dict.items()
+        if "language_model." in key
+    }
+    dropped = len(state_dict) - len(rewritten)
+    if not rewritten:
+        raise RuntimeError(
+            "Refusing to export a Gemma3 LoRA adapter for vLLM because no language_model LoRA weights "
+            "remain after removing multimodal adapter tensors."
+        )
+    if dropped > 0:
         logger.info(
-            "Rewrote %s Gemma3 LoRA adapter key(s) for vLLM compatibility; sample_keys=%s",
-            changed,
+            "Filtered %s non-language Gemma3 LoRA adapter tensor(s) for vLLM compatibility; kept=%s sample_keys=%s",
+            dropped,
+            len(rewritten),
             list(rewritten.keys())[:5],
         )
     return rewritten
