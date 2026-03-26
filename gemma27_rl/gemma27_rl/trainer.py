@@ -80,6 +80,7 @@ from .utils import (
     resolve_torch_dtype,
     set_seed,
 )
+from .vllm_rollout import LocalVLLMRolloutClient, generate_rollouts_vllm
 
 
 logger = logging.getLogger(__name__)
@@ -3273,6 +3274,89 @@ def _resolve_rollout_pipeline_chunk_size(*, total_examples: int, cfg: RLPostTrai
     return max(1, min(total, default_chunk))
 
 
+def _vllm_rollout_enabled(cfg: RLPostTrainConfig) -> bool:
+    return bool(getattr(getattr(cfg, "vllm", None), "enabled", False))
+
+
+def _generate_training_rollouts(
+    *,
+    examples: list[Example],
+    policy_model: Any,
+    tokenizer: Any,
+    cfg: RLPostTrainConfig,
+    device: str,
+    vllm_rollout_client: LocalVLLMRolloutClient | None,
+    ref_model: Any | None = None,
+    ref_device: str | None = None,
+    ref_logprob_fn: Callable[[list[int], list[int]], list[float]] | None = None,
+    show_progress: bool = False,
+    progress_desc: str | None = None,
+    compute_old_logprobs: bool = True,
+    compute_token_offsets: bool = True,
+    include_prompt_input_ids: bool = True,
+    prompt_instance_ids: list[str] | None = None,
+) -> list[Rollout]:
+    if vllm_rollout_client is None:
+        return generate_rollouts(
+            examples=examples,
+            policy_model=policy_model,
+            tokenizer=tokenizer,
+            gen_cfg=cfg.generation,
+            device=device,
+            ref_model=ref_model,
+            ref_device=ref_device,
+            ref_logprob_fn=ref_logprob_fn,
+            prompt_template=cfg.prompt.template,
+            show_progress=show_progress,
+            progress_desc=progress_desc,
+            compute_old_logprobs=compute_old_logprobs,
+            compute_token_offsets=compute_token_offsets,
+            include_prompt_input_ids=include_prompt_input_ids,
+            prompt_instance_ids=prompt_instance_ids,
+        )
+    return generate_rollouts_vllm(
+        examples=examples,
+        policy_model=policy_model,
+        tokenizer=tokenizer,
+        gen_cfg=cfg.generation,
+        device=device,
+        vllm_rollout_client=vllm_rollout_client,
+        ref_model=ref_model,
+        ref_device=ref_device,
+        ref_logprob_fn=ref_logprob_fn,
+        prompt_template=cfg.prompt.template,
+        show_progress=show_progress,
+        progress_desc=progress_desc,
+        compute_old_logprobs=compute_old_logprobs,
+        compute_token_offsets=compute_token_offsets,
+        include_prompt_input_ids=include_prompt_input_ids,
+        prompt_instance_ids=prompt_instance_ids,
+    )
+
+
+def _sync_vllm_rollout_adapter(
+    *,
+    update_idx: int,
+    vllm_rollout_client: LocalVLLMRolloutClient | None,
+    policy_model: Any,
+) -> None:
+    if vllm_rollout_client is None:
+        return
+    adapter_dir = vllm_rollout_client.adapter_dir
+    if _is_rank0():
+        logger.info("update=%s refreshing vLLM rollout adapter at %s", update_idx, adapter_dir)
+        vllm_rollout_client.unload_adapter()
+        if adapter_dir.exists():
+            shutil.rmtree(adapter_dir)
+        adapter_dir.parent.mkdir(parents=True, exist_ok=True)
+    _dist_barrier()
+    _save_pretrained_model(policy_model, adapter_dir)
+    _dist_barrier()
+    if _is_rank0():
+        vllm_rollout_client.load_adapter(adapter_dir)
+    _dist_barrier()
+
+
 def _prepare_training_batch_rollouts_and_advantages(
     *,
     batch_examples: list[Example],
@@ -3291,6 +3375,7 @@ def _prepare_training_batch_rollouts_and_advantages(
     xcomet_cache: dict[tuple[str, str, str], tuple[float, list[dict[str, Any]]]],
     mqm_cache: dict[tuple[str, str, str, str, str], tuple[float, list[dict[str, Any]], list[dict[str, Any]]]],
     esa_cache: dict[tuple[str, str, str, str, str], float],
+    vllm_rollout_client: LocalVLLMRolloutClient | None = None,
 ) -> tuple[list[Rollout], list[list[float]], dict[str, float], dict[str, float]]:
     if not batch_examples:
         return [], [], {}, {}
@@ -3307,16 +3392,16 @@ def _prepare_training_batch_rollouts_and_advantages(
         progress_desc = f"rollout u{update_idx}"
         if pipeline_enabled:
             progress_desc = f"{progress_desc} [{chunk_idx + 1}/{num_chunks}]"
-        return generate_rollouts(
+        return _generate_training_rollouts(
             examples=chunk_examples,
             policy_model=policy_model,
             tokenizer=tokenizer,
-            gen_cfg=cfg.generation,
+            cfg=cfg,
             device=device,
+            vllm_rollout_client=vllm_rollout_client,
             ref_model=None,
             ref_device=None,
             ref_logprob_fn=None,
-            prompt_template=cfg.prompt.template,
             show_progress=True,
             progress_desc=progress_desc,
             prompt_instance_ids=chunk_prompt_ids,
@@ -5265,6 +5350,30 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
             policy_runtime_mode,
         )
 
+    vllm_rollout_client: LocalVLLMRolloutClient | None = None
+    if _vllm_rollout_enabled(cfg):
+        vllm_base_model_source = _read_local_adapter_base_model_name_or_path(policy_source) or policy_source
+        vllm_rollout_client = LocalVLLMRolloutClient(
+            cfg=cfg.vllm,
+            base_model_name_or_path=vllm_base_model_source,
+            tokenizer_name_or_path=tokenizer_source,
+            lora_rank=int(cfg.model.lora.r),
+            trust_remote_code=bool(cfg.model.trust_remote_code),
+            dtype=cfg.misc.dtype,
+            log_path=output_dir / "vllm_server.log",
+            owns_server=bool(rank0),
+        )
+        if rank0:
+            logger.info(
+                "Starting local vLLM rollout server for LoRA training: base_model=%s tokenizer=%s tp=%s gpus=%s",
+                vllm_base_model_source,
+                tokenizer_source,
+                int(cfg.vllm.tensor_parallel_size or 1),
+                cfg.vllm.gpu_ids,
+            )
+            vllm_rollout_client.start()
+        _dist_barrier()
+
     ref_model: AutoModelForCausalLM | None = None
     ref_device: str | None = None
     ref_logprob_client: ReferenceLogprobClient | None = None
@@ -5919,6 +6028,11 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
         adv_stats: dict[str, float] = {}
         log_rollouts: list[Rollout] = rollouts
         log_advantages: list[list[float]] = advantages
+        _sync_vllm_rollout_adapter(
+            update_idx=update_idx,
+            vllm_rollout_client=vllm_rollout_client,
+            policy_model=policy_eval_model,
+        )
         if use_deepspeed and world_size > 1:
             per_rank_batches: list[list[int]] = []
             batch_direction = ""
@@ -5955,19 +6069,19 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
             ]
 
             _set_rollout_sampling_seed(cfg.misc.seed + update_idx + (rank * 1009))
-            local_rollouts = generate_rollouts(
+            local_rollouts = _generate_training_rollouts(
                 examples=local_examples,
                 policy_model=policy_eval_model,
                 tokenizer=tokenizer,
-                gen_cfg=cfg.generation,
+                cfg=cfg,
                 device=device,
+                vllm_rollout_client=vllm_rollout_client,
                 ref_model=None,
                 ref_device=None,
                 # In distributed mode we fill reference logprobs later in rank0 batch
                 # (`_fill_missing_reference_logprobs`). Avoid per-sample worker calls here,
                 # which are fragile under long-running CUDA workers.
                 ref_logprob_fn=None,
-                prompt_template=cfg.prompt.template,
                 show_progress=bool(rank0),
                 progress_desc=f"rollout u{update_idx}",
                 prompt_instance_ids=local_prompt_instance_ids,
@@ -6150,6 +6264,7 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
                 xcomet_cache=xcomet_cache,
                 mqm_cache=mqm_cache,
                 esa_cache=esa_cache,
+                vllm_rollout_client=vllm_rollout_client,
             )
             if rollouts:
                 if reference_kl_enabled:
@@ -6420,6 +6535,8 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
             artifacts["eval_output_path"] = str(eval_output_path)
     _dist_barrier()
 
+    if vllm_rollout_client is not None:
+        vllm_rollout_client.close()
     if ref_logprob_client is not None:
         ref_logprob_client.close()
     if async_eval_executor is not None:

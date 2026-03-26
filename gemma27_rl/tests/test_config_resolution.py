@@ -105,6 +105,109 @@ def test_remote_python_executable_resolution_becomes_project_relative(tmp_path: 
     assert cfg.reward.metricx.python_executable == ".venv_metricx/bin/python"
 
 
+def test_vllm_python_executable_and_default_adapter_root_dir_resolve_from_config(tmp_path: Path) -> None:
+    project_root = tmp_path / "project"
+    config_dir = project_root / "configs" / "exp"
+    config_dir.mkdir(parents=True)
+
+    fake_base_python = tmp_path / "python3.10"
+    fake_base_python.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+
+    venv_python = project_root / ".venv_vllm" / "bin" / "python"
+    venv_python.parent.mkdir(parents=True)
+    venv_python.symlink_to(fake_base_python)
+
+    cfg_path = config_dir / "train.yaml"
+    cfg_path.write_text(
+        "\n".join(
+            [
+                "data:",
+                "  hf_dataset_name: dummy/dataset",
+                "model:",
+                "  lora:",
+                "    enabled: true",
+                "reward:",
+                "  xcomet:",
+                "    enabled: false",
+                "  mqm:",
+                "    enabled: false",
+                "  esa:",
+                "    enabled: false",
+                "vllm:",
+                "  enabled: true",
+                "  gpu_ids: [6, 7]",
+                "  python_executable: ../../.venv_vllm/bin/python",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    cfg = load_config(cfg_path)
+    assert cfg.vllm.python_executable == str(venv_python)
+    assert cfg.vllm.adapter_root_dir == str((Path(cfg.logging.output_dir) / "vllm_adapters").resolve())
+
+
+def test_vllm_enabled_requires_lora(tmp_path: Path) -> None:
+    cfg_path = tmp_path / "train.yaml"
+    cfg_path.write_text(
+        "\n".join(
+            [
+                "data:",
+                "  hf_dataset_name: dummy/dataset",
+                "reward:",
+                "  xcomet:",
+                "    enabled: false",
+                "  mqm:",
+                "    enabled: false",
+                "  esa:",
+                "    enabled: false",
+                "vllm:",
+                "  enabled: true",
+                "  gpu_ids: [7]",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="vllm.enabled=true requires model.lora.enabled=true"):
+        _ = load_config(cfg_path)
+
+
+def test_vllm_gpu_ids_must_not_overlap_policy_gpu_ids(tmp_path: Path) -> None:
+    cfg_path = tmp_path / "train.yaml"
+    cfg_path.write_text(
+        "\n".join(
+            [
+                "data:",
+                "  hf_dataset_name: dummy/dataset",
+                "model:",
+                "  lora:",
+                "    enabled: true",
+                "  policy_gpu_ids: [2, 3]",
+                "reward:",
+                "  xcomet:",
+                "    enabled: false",
+                "  mqm:",
+                "    enabled: false",
+                "  esa:",
+                "    enabled: false",
+                "rl:",
+                "  backend: deepspeed",
+                "vllm:",
+                "  enabled: true",
+                "  gpu_ids: [3, 4]",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="vllm.gpu_ids must be disjoint from policy/reference GPU allocation"):
+        _ = load_config(cfg_path)
+
+
 def test_keep_last_n_checkpoints_must_be_non_negative(tmp_path: Path) -> None:
     cfg_path = tmp_path / "train.yaml"
     cfg_path.write_text(

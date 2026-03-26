@@ -371,6 +371,27 @@ class EvalConfig:
 
 
 @dataclass
+class VLLMConfig:
+    enabled: bool = False
+    host: str = "127.0.0.1"
+    port: int = 8000
+    gpu_ids: list[int] = field(default_factory=list)
+    tensor_parallel_size: int | None = None
+    served_model_name: str = "policy-base"
+    adapter_name: str = "policy-lora"
+    python_executable: str | None = None
+    startup_timeout_sec: float = 600.0
+    request_timeout_sec: float = 300.0
+    adapter_root_dir: str | None = None
+    gpu_memory_utilization: float = 0.9
+    max_model_len: int | None = None
+    max_num_seqs: int | None = None
+    max_num_batched_tokens: int | None = None
+    disable_log_requests: bool = True
+    enforce_eager: bool = False
+
+
+@dataclass
 class LoggingConfig:
     output_dir: str = "./outputs/gemma27-grpo"
     jsonl_name: str = "train_log.jsonl"
@@ -420,6 +441,7 @@ class RLPostTrainConfig:
     reward: RewardConfig = field(default_factory=RewardConfig)
     rl: RLConfig = field(default_factory=RLConfig)
     eval: EvalConfig = field(default_factory=EvalConfig)
+    vllm: VLLMConfig = field(default_factory=VLLMConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     misc: MiscConfig = field(default_factory=MiscConfig)
 
@@ -731,10 +753,35 @@ def _validate_config(cfg: RLPostTrainConfig) -> None:
         raise ValueError("generation.chat_template_kwargs must be a dict")
     if cfg.eval.generation_overrides is not None and not isinstance(cfg.eval.generation_overrides, dict):
         raise ValueError("eval.generation_overrides must be a dict")
+    if not isinstance(cfg.vllm.enabled, bool):
+        raise ValueError("vllm.enabled must be a bool")
     if not isinstance(cfg.eval.distributed_shard, bool):
         raise ValueError("eval.distributed_shard must be a bool")
     if not isinstance(cfg.eval.use_esa, bool):
         raise ValueError("eval.use_esa must be a bool")
+    if not str(cfg.vllm.host or "").strip():
+        raise ValueError("vllm.host must not be empty")
+    if int(cfg.vllm.port) <= 0 or int(cfg.vllm.port) > 65535:
+        raise ValueError("vllm.port must be in 1..65535")
+    if cfg.vllm.python_executable is not None and not str(cfg.vllm.python_executable).strip():
+        raise ValueError("vllm.python_executable must not be empty when set")
+    if float(cfg.vllm.startup_timeout_sec) <= 0:
+        raise ValueError("vllm.startup_timeout_sec must be > 0")
+    if float(cfg.vllm.request_timeout_sec) <= 0:
+        raise ValueError("vllm.request_timeout_sec must be > 0")
+    gpu_memory_utilization = float(cfg.vllm.gpu_memory_utilization)
+    if gpu_memory_utilization <= 0.0 or gpu_memory_utilization > 1.0:
+        raise ValueError("vllm.gpu_memory_utilization must be in (0, 1]")
+    if cfg.vllm.max_model_len is not None and int(cfg.vllm.max_model_len) <= 0:
+        raise ValueError("vllm.max_model_len must be > 0 when set")
+    if cfg.vllm.max_num_seqs is not None and int(cfg.vllm.max_num_seqs) <= 0:
+        raise ValueError("vllm.max_num_seqs must be > 0 when set")
+    if cfg.vllm.max_num_batched_tokens is not None and int(cfg.vllm.max_num_batched_tokens) <= 0:
+        raise ValueError("vllm.max_num_batched_tokens must be > 0 when set")
+    if not isinstance(cfg.vllm.disable_log_requests, bool):
+        raise ValueError("vllm.disable_log_requests must be a bool")
+    if not isinstance(cfg.vllm.enforce_eager, bool):
+        raise ValueError("vllm.enforce_eager must be a bool")
     if cfg.reward.overlap_policy not in {"any_overlap", "majority_overlap"}:
         raise ValueError("reward.overlap_policy must be any_overlap or majority_overlap")
     if cfg.reward.span_combine_policy not in {"sum", "min", "max"}:
@@ -983,6 +1030,14 @@ def _validate_config(cfg: RLPostTrainConfig) -> None:
 
     cfg.model.policy_gpu_ids = _normalize_gpu_ids(cfg.model.policy_gpu_ids, "model.policy_gpu_ids")
     cfg.model.reference_gpu_ids = _normalize_gpu_ids(cfg.model.reference_gpu_ids, "model.reference_gpu_ids")
+    cfg.vllm.gpu_ids = _normalize_gpu_ids(cfg.vllm.gpu_ids, "vllm.gpu_ids")
+    if cfg.vllm.tensor_parallel_size is None:
+        cfg.vllm.tensor_parallel_size = max(1, len(cfg.vllm.gpu_ids))
+    tp_size = int(cfg.vllm.tensor_parallel_size)
+    if tp_size <= 0:
+        raise ValueError("vllm.tensor_parallel_size must be > 0")
+    if cfg.vllm.gpu_ids and tp_size > len(cfg.vllm.gpu_ids):
+        raise ValueError("vllm.tensor_parallel_size must be <= len(vllm.gpu_ids)")
     reference_enabled = bool(cfg.model.use_reference_model and float(cfg.rl.kl_coef) > 0.0)
     reference_uses_colocated_policy = bool(reference_enabled and reference_runtime == "colocate")
 
@@ -997,6 +1052,13 @@ def _validate_config(cfg: RLPostTrainConfig) -> None:
                 "model.reference_runtime=colocate requires model.reference_name_or_path to be unset "
                 "or equal to model.policy_name_or_path."
             )
+    if cfg.vllm.enabled:
+        if not cfg.model.lora.enabled:
+            raise ValueError("vllm.enabled=true requires model.lora.enabled=true")
+        if policy_runtime_mode != "colocate":
+            raise ValueError("vllm.enabled=true requires model.policy_runtime_mode=colocate")
+        if not cfg.vllm.gpu_ids:
+            raise ValueError("vllm.enabled=true requires vllm.gpu_ids to be non-empty")
 
     reference_host = _effective_worker_host(cfg.model.reference_worker_host, cfg.misc.aux_worker_host)
     metricx_host = _effective_worker_host(cfg.reward.metricx.worker_host, cfg.misc.aux_worker_host)
@@ -1031,6 +1093,13 @@ def _validate_config(cfg: RLPostTrainConfig) -> None:
         )
 
     reserved = set(policy_set) | set(ref_set)
+    if cfg.vllm.enabled:
+        vllm_overlap = sorted(set(cfg.vllm.gpu_ids) & reserved)
+        if vllm_overlap:
+            raise ValueError(
+                "vllm.gpu_ids must be disjoint from policy/reference GPU allocation. "
+                f"overlap={vllm_overlap}"
+            )
     metricx_idx = _parse_cuda_index(cfg.reward.metricx.device if cfg.reward.metricx.enabled else None)
     xcomet_idx = _parse_cuda_index(cfg.reward.xcomet.device if cfg.reward.xcomet.enabled else None)
     reference_idx = None
@@ -1070,6 +1139,14 @@ def _validate_config(cfg: RLPostTrainConfig) -> None:
         and reference_host_label == xcomet_host_label
     ):
         raise ValueError("model.reference_gpu_ids/reference_device overlaps reward.xcomet.device on the same host.")
+    if cfg.vllm.enabled:
+        vllm_set = set(cfg.vllm.gpu_ids)
+        if metricx_host is None and metricx_idx is not None and metricx_idx in vllm_set:
+            raise ValueError("vllm.gpu_ids overlaps reward.metricx.device on the same host.")
+        if xcomet_host is None and xcomet_idx is not None and xcomet_idx in vllm_set:
+            raise ValueError("vllm.gpu_ids overlaps reward.xcomet.device on the same host.")
+        if reference_host is None and reference_idx is not None and reference_idx in vllm_set:
+            raise ValueError("vllm.gpu_ids overlaps model.reference_gpu_ids/reference_device on the same host.")
 
 
 def load_config(path: str | Path) -> RLPostTrainConfig:
@@ -1102,6 +1179,7 @@ def load_config(path: str | Path) -> RLPostTrainConfig:
     cfg.logging.tensorboard_dir = _resolve_optional_path(cfg.logging.tensorboard_dir, base_dir)
     cfg.misc.huggingface_cache_dir = _resolve_optional_path(cfg.misc.huggingface_cache_dir, base_dir)
     cfg.rl.deepspeed_config_path = _resolve_optional_path(cfg.rl.deepspeed_config_path, base_dir)
+    cfg.vllm.adapter_root_dir = _resolve_optional_path(cfg.vllm.adapter_root_dir, base_dir)
     cfg.data.train_glob = str(cfg.data.train_glob or "*.jsonl").strip() or "*.jsonl"
     cfg.data.eval_glob = _normalize_optional_text(cfg.data.eval_glob)
     cfg.data.batching_strategy = str(cfg.data.batching_strategy or "direction").strip().lower() or "direction"
@@ -1134,6 +1212,9 @@ def load_config(path: str | Path) -> RLPostTrainConfig:
         if reference_remote_host is not None
         else _resolve_command_or_path(cfg.model.reference_python_executable, base_dir)
     )
+    cfg.vllm.python_executable = _resolve_command_or_path(cfg.vllm.python_executable, base_dir)
+    if cfg.vllm.adapter_root_dir is None:
+        cfg.vllm.adapter_root_dir = str((Path(cfg.logging.output_dir) / "vllm_adapters").resolve())
 
     _validate_config(cfg)
     return cfg
