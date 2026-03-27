@@ -221,6 +221,7 @@ class LocalVLLMRolloutClient:
         python_executable = str(self._cfg.python_executable or "python").strip() or "python"
         prefer_disable_custom_all_reduce = bool(getattr(self._cfg, "disable_custom_all_reduce", False))
         self._disable_custom_all_reduce_active = prefer_disable_custom_all_reduce
+        self._reset_log_file_for_new_startup()
         try:
             self._launch_server_process(
                 python_executable=python_executable,
@@ -266,6 +267,15 @@ class LocalVLLMRolloutClient:
                 self._log_handle.close()
             finally:
                 self._log_handle = None
+
+    def _reset_log_file_for_new_startup(self) -> None:
+        if self._log_handle is not None:
+            try:
+                self._log_handle.close()
+            finally:
+                self._log_handle = None
+        self._log_path.parent.mkdir(parents=True, exist_ok=True)
+        self._log_path.write_text("", encoding="utf-8")
 
     def _wait_until_ready(self) -> None:
         deadline = time.time() + float(self._cfg.startup_timeout_sec)

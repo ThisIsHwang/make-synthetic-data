@@ -305,6 +305,267 @@ def test_async_eval_scoring_overlaps_next_train_rollout(monkeypatch, tmp_path) -
     assert events.index("save_ckpt_best") < events.index("update_policy_2")
 
 
+def test_separate_policy_runtime_syncs_eval_model_after_each_update(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    class _TrackingModel(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.tensor(1.0))
+
+        def save_pretrained(self, path: str | Path) -> None:
+            out_dir = Path(path)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            (out_dir / "weight.txt").write_text(f"{float(self.weight.item()):.1f}\n", encoding="utf-8")
+
+    cfg = RLPostTrainConfig()
+    cfg.logging.output_dir = str(tmp_path / "outputs")
+    cfg.logging.tensorboard_enabled = False
+    cfg.logging.wandb_enabled = False
+    cfg.logging.save_every_n_updates = 0
+    cfg.logging.save_rollouts = False
+    cfg.logging.save_eval_outputs = False
+    cfg.eval.run_before_train = False
+    cfg.eval.eval_every_n_updates = 0
+    cfg.rl.updates = 2
+    cfg.rl.batch_size = 1
+    cfg.rl.ppo_epochs = 1
+    cfg.rl.kl_coef = 0.0
+    cfg.model.use_reference_model = False
+    cfg.model.policy_runtime_mode = "separate"
+    cfg.reward.metricx.enabled = False
+    cfg.reward.xcomet.enabled = False
+    cfg.reward.mqm.enabled = False
+    cfg.reward.esa.enabled = False
+    cfg.reward.group_rank.enabled = False
+
+    train_examples = [_example("train-0"), _example("train-1")]
+    created_models: list[_TrackingModel] = []
+    rollout_eval_weights: list[float] = []
+
+    monkeypatch.setattr(trainer_mod, "set_seed", lambda seed: None)
+    monkeypatch.setattr(trainer_mod, "_configure_nccl_heartbeat_timeout", lambda cfg: None)
+    monkeypatch.setattr(trainer_mod, "_configure_cuda_allocator", lambda: None)
+    monkeypatch.setattr(trainer_mod, "resolve_huggingface_token", lambda explicit_token=None, token_env_name=None: None)
+    monkeypatch.setattr(trainer_mod, "configure_huggingface_cache", lambda cache_dir, token=None: None)
+    monkeypatch.setattr(trainer_mod, "_apply_aux_worker_defaults", lambda cfg: None)
+    monkeypatch.setattr(trainer_mod, "_assign_disjoint_gpu_devices", lambda cfg: None)
+    monkeypatch.setattr(trainer_mod, "resolve_device", lambda device: "cpu")
+    monkeypatch.setattr(trainer_mod, "_configure_policy_train_memory", lambda model: None)
+    monkeypatch.setattr(trainer_mod, "_dist_barrier", lambda: None)
+    monkeypatch.setattr(trainer_mod, "_distributed_rank", lambda: 0)
+    monkeypatch.setattr(trainer_mod, "_distributed_world_size", lambda: 1)
+    monkeypatch.setattr(trainer_mod, "_is_rank0", lambda: True)
+    monkeypatch.setattr(trainer_mod, "_AsyncJsonlWriter", _DummyAsyncJsonWriter)
+    monkeypatch.setattr(
+        trainer_mod,
+        "AutoTokenizer",
+        SimpleNamespace(from_pretrained=lambda *args, **kwargs: _DummyTokenizer()),
+    )
+
+    def _fake_load_policy_model(cfg, device=None, model_name_or_path=None):  # type: ignore[no-untyped-def]
+        del cfg, device, model_name_or_path
+        model = _TrackingModel()
+        created_models.append(model)
+        return model
+
+    monkeypatch.setattr(trainer_mod, "_load_policy_model", _fake_load_policy_model)
+
+    def _fake_load_examples(data_cfg, *, split: str, limit=None):  # type: ignore[no-untyped-def]
+        del data_cfg, limit
+        return list(train_examples if split == "train" else [])
+
+    monkeypatch.setattr(trainer_mod, "load_examples", _fake_load_examples)
+
+    def _fake_prepare_training_batch_rollouts_and_advantages(**kwargs):  # type: ignore[no-untyped-def]
+        policy_model = kwargs["policy_model"]
+        rollout_eval_weights.append(float(policy_model.weight.item()))
+        reward_stats = {
+            "metricx_score_mean": 0.0,
+            "metricx_score_std": 0.0,
+            "xcomet_score_mean": 0.0,
+            "xcomet_score_std": 0.0,
+            "mqm_score_mean": 0.0,
+            "mqm_score_std": 0.0,
+            "esa_score_mean": 0.0,
+            "esa_score_std": 0.0,
+            "token_rewards_non_zero_ratio": 0.0,
+        }
+        adv_stats = {
+            "raw_mean": 0.0,
+            "raw_std": 1.0,
+            "norm_mean": 0.0,
+            "norm_std": 1.0,
+        }
+        update_idx = int(kwargs["update_idx"])
+        return [_rollout(f"train-u{update_idx}")], [[0.1]], reward_stats, adv_stats
+
+    monkeypatch.setattr(
+        trainer_mod,
+        "_prepare_training_batch_rollouts_and_advantages",
+        _fake_prepare_training_batch_rollouts_and_advantages,
+    )
+
+    def _fake_update_policy(**kwargs):  # type: ignore[no-untyped-def]
+        policy_model = kwargs["policy_model"]
+        policy_model.weight.data.add_(1.0)
+        return SimpleNamespace(
+            policy_loss=0.1,
+            approx_kl=0.0,
+            clip_fraction=0.0,
+            entropy=0.0,
+            kl_to_reference=0.0,
+            token_count=1,
+        )
+
+    monkeypatch.setattr(trainer_mod, "update_policy", _fake_update_policy)
+
+    artifacts = trainer_mod.run_toy_rl(cfg)
+
+    assert rollout_eval_weights == [1.0, 2.0]
+    assert len(created_models) == 2
+    assert float(created_models[0].weight.item()) == pytest.approx(3.0)
+    assert float(created_models[1].weight.item()) == pytest.approx(3.0)
+    final_weight_path = Path(artifacts["final_model_dir"]) / "weight.txt"
+    assert final_weight_path.read_text(encoding="utf-8").strip() == "3.0"
+
+
+def test_run_toy_rl_cleans_up_resources_on_exception(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    class _TrackedClient:
+        def __init__(self, events: list[str], label: str) -> None:
+            self._events = events
+            self._label = label
+
+        def close(self) -> None:
+            self._events.append(f"{self._label}.close")
+
+    class _TrackedExecutor:
+        def __init__(self, events: list[str]) -> None:
+            self._events = events
+
+        def submit(self, fn, *args, **kwargs):  # type: ignore[no-untyped-def]
+            raise AssertionError("async eval should not submit work in this test")
+
+        def shutdown(self, wait: bool = True) -> None:
+            self._events.append(f"async_eval_executor.shutdown.{wait}")
+
+    class _TrackedWriter:
+        def __init__(self, events: list[str]) -> None:
+            self._events = events
+
+        def append_json(self, path, payload):  # type: ignore[no-untyped-def]
+            return
+
+        def append_rollouts(self, path, *, update_idx, rollouts, advantages, reward_stats):  # type: ignore[no-untyped-def]
+            return
+
+        def append_eval_rows(self, path, *, update_idx, eval_rows):  # type: ignore[no-untyped-def]
+            return
+
+        def flush(self) -> None:
+            return
+
+        def close(self) -> None:
+            self._events.append("async_json_writer.close")
+
+    class _TrackedTracker:
+        tensorboard_log_dir = None
+        wandb_run_id = None
+        wandb_url = None
+
+        def __init__(self, events: list[str]) -> None:
+            self._events = events
+
+        def log_metrics(self, *, prefix: str, payload: dict[str, object], step: int) -> None:
+            return
+
+        def close(self) -> None:
+            self._events.append("experiment_tracker.close")
+
+    cfg = RLPostTrainConfig()
+    cfg.logging.output_dir = str(tmp_path / "outputs")
+    cfg.logging.tensorboard_enabled = False
+    cfg.logging.wandb_enabled = False
+    cfg.logging.save_every_n_updates = 0
+    cfg.logging.save_rollouts = False
+    cfg.logging.save_eval_outputs = False
+    cfg.eval.run_before_train = False
+    cfg.eval.eval_every_n_updates = 0
+    cfg.rl.updates = 1
+    cfg.rl.batch_size = 1
+    cfg.rl.ppo_epochs = 1
+    cfg.rl.kl_coef = 0.1
+    cfg.model.reference_runtime = "worker"
+    cfg.model.use_reference_model = True
+    cfg.vllm.enabled = True
+    cfg.reward.metricx.enabled = False
+    cfg.reward.xcomet.enabled = False
+    cfg.reward.mqm.enabled = False
+    cfg.reward.esa.enabled = False
+    cfg.reward.group_rank.enabled = False
+
+    train_examples = [_example("train-0")]
+    cleanup_events: list[str] = []
+    fake_vllm_client = _TrackedClient(cleanup_events, "vllm_client")
+    fake_ref_client = _TrackedClient(cleanup_events, "ref_client")
+    fake_async_executor = _TrackedExecutor(cleanup_events)
+    fake_tracker = _TrackedTracker(cleanup_events)
+    fake_writer = _TrackedWriter(cleanup_events)
+
+    monkeypatch.setattr(trainer_mod, "set_seed", lambda seed: None)
+    monkeypatch.setattr(trainer_mod, "_configure_nccl_heartbeat_timeout", lambda cfg: None)
+    monkeypatch.setattr(trainer_mod, "_configure_cuda_allocator", lambda: None)
+    monkeypatch.setattr(trainer_mod, "resolve_huggingface_token", lambda explicit_token=None, token_env_name=None: None)
+    monkeypatch.setattr(trainer_mod, "configure_huggingface_cache", lambda cache_dir, token=None: None)
+    monkeypatch.setattr(trainer_mod, "_apply_aux_worker_defaults", lambda cfg: None)
+    monkeypatch.setattr(trainer_mod, "_assign_disjoint_gpu_devices", lambda cfg: None)
+    monkeypatch.setattr(trainer_mod, "resolve_device", lambda device: "cpu")
+    monkeypatch.setattr(trainer_mod, "_configure_policy_train_memory", lambda model: None)
+    monkeypatch.setattr(trainer_mod, "_dist_barrier", lambda: None)
+    monkeypatch.setattr(trainer_mod, "_distributed_rank", lambda: 0)
+    monkeypatch.setattr(trainer_mod, "_distributed_world_size", lambda: 1)
+    monkeypatch.setattr(trainer_mod, "_is_rank0", lambda: True)
+    monkeypatch.setattr(trainer_mod, "_AsyncJsonlWriter", lambda: fake_writer)
+    monkeypatch.setattr(trainer_mod, "_ExperimentTracker", lambda cfg, output_dir: fake_tracker)
+    monkeypatch.setattr(trainer_mod, "ThreadPoolExecutor", lambda max_workers=1, thread_name_prefix="": fake_async_executor)
+    monkeypatch.setattr(
+        trainer_mod,
+        "AutoTokenizer",
+        SimpleNamespace(from_pretrained=lambda *args, **kwargs: _DummyTokenizer()),
+    )
+    monkeypatch.setattr(trainer_mod, "_load_policy_model", lambda cfg, device=None, model_name_or_path=None: _DummyModel())
+    monkeypatch.setattr(trainer_mod, "_create_vllm_rollout_client", lambda **kwargs: fake_vllm_client)
+    monkeypatch.setattr(trainer_mod, "_sync_vllm_rollout_adapter", lambda **kwargs: None)
+    monkeypatch.setattr(trainer_mod, "_create_reference_logprob_client", lambda cfg, default_device=None: (fake_ref_client, "cpu"))
+    monkeypatch.setattr(trainer_mod, "_should_async_eval_scoring", lambda **kwargs: True)
+
+    def _fake_load_examples(data_cfg, *, split: str, limit=None):  # type: ignore[no-untyped-def]
+        del data_cfg, limit
+        return list(train_examples if split == "train" else [])
+
+    monkeypatch.setattr(trainer_mod, "load_examples", _fake_load_examples)
+    monkeypatch.setattr(
+        trainer_mod,
+        "_prepare_training_batch_rollouts_and_advantages",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("synthetic training failure")),
+    )
+
+    with pytest.raises(RuntimeError, match="synthetic training failure"):
+        trainer_mod.run_toy_rl(cfg)
+
+    assert cleanup_events == [
+        "vllm_client.close",
+        "ref_client.close",
+        "async_eval_executor.shutdown.True",
+        "experiment_tracker.close",
+        "async_json_writer.close",
+    ]
+
+
 def test_should_async_eval_scoring_only_allows_api_only_eval() -> None:
     cfg = RLPostTrainConfig()
     cfg.reward.metricx.enabled = False

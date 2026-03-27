@@ -13,6 +13,7 @@ torch = pytest.importorskip("torch")
 from torch import nn
 
 from gemma27_rl.config import RLPostTrainConfig
+from gemma27_rl.rl_types import Rollout
 from gemma27_rl import trainer as trainer_mod
 from gemma27_rl.trainer import (
     _build_zero3_peft_state_dict,
@@ -21,6 +22,7 @@ from gemma27_rl.trainer import (
     _is_deepspeed_resume_shard_mismatch_error,
     _load_policy_model,
     _read_local_adapter_lora_rank,
+    _save_deepspeed_checkpoint_to_dir,
     _resolve_vllm_server_lora_rank,
     _resolve_vllm_runtime_host,
     _resolve_vllm_current_adapter_target,
@@ -41,6 +43,30 @@ def _base_cfg() -> RLPostTrainConfig:
     cfg.reward.metricx.enabled = False
     cfg.reward.xcomet.enabled = False
     return cfg
+
+
+def _rollout(example_id: str, *, prompt_ids: list[int] | None = None, completion_ids: list[int] | None = None) -> Rollout:
+    prompt = list(prompt_ids or [1, 2])
+    completion = list(completion_ids or [3])
+    return Rollout(
+        example_id=example_id,
+        prompt_text=f"prompt::{example_id}",
+        prompt_input_ids=prompt,
+        completion_text=f"completion::{example_id}",
+        completion_token_ids=completion,
+        old_logprobs=[-0.1 for _ in completion],
+        ref_logprobs=None,
+        token_char_offsets=[(0, 1) for _ in completion],
+        src_text=f"src::{example_id}",
+        src_lang="English",
+        tgt_lang="Korean",
+        src_lang_code="en",
+        tgt_lang_code="ko",
+        ref_text=f"ref::{example_id}",
+        raw_completion_token_ids=list(completion),
+        completion_raw_text=f"completion::{example_id}",
+        completion_clean_text=f"completion::{example_id}",
+    )
 
 
 def test_deepspeed_partition_world_size_mismatch(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -263,9 +289,42 @@ def test_save_deepspeed_resume_checkpoint_wrapper_passes_hf_model(
 
     assert result == tmp_path / "resume_latest"
     assert captured["hf_model"] is hf_model
-    trainer_state = captured["trainer_state"]
-    assert isinstance(trainer_state, dict)
-    assert trainer_state["update_idx"] == 9
+
+
+def test_save_deepspeed_checkpoint_to_dir_preserves_previous_checkpoint_on_metadata_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    class _Engine:
+        def save_checkpoint(self, path: str, tag: str = "") -> None:
+            ckpt_path = Path(path)
+            ckpt_path.mkdir(parents=True, exist_ok=True)
+            (ckpt_path / f"{tag or 'state'}.txt").write_text("new-shard\n", encoding="utf-8")
+
+    class _Tokenizer:
+        def save_pretrained(self, path: Path) -> None:
+            raise RuntimeError("tokenizer failed")
+
+    ckpt_dir = tmp_path / "resume_latest"
+    ckpt_dir.mkdir()
+    (ckpt_dir / "sentinel.txt").write_text("old\n", encoding="utf-8")
+
+    monkeypatch.setattr(trainer_mod, "_is_rank0", lambda: True)
+    monkeypatch.setattr(trainer_mod, "_dist_barrier", lambda: None)
+    monkeypatch.setattr(trainer_mod, "_all_gather_object", lambda obj: [obj])
+    monkeypatch.setattr(trainer_mod, "_broadcast_object_list", lambda payload, src=0: payload)
+
+    with pytest.raises(RuntimeError, match="tokenizer failed"):
+        _save_deepspeed_checkpoint_to_dir(
+            ckpt_dir=ckpt_dir,
+            engine=_Engine(),
+            tokenizer=_Tokenizer(),
+            hf_model=None,
+            trainer_state=None,
+        )
+
+    assert (ckpt_dir / "sentinel.txt").read_text(encoding="utf-8") == "old\n"
+    assert not (ckpt_dir / "state.txt").exists()
 
 
 class _FakeColocatedPolicyModel(nn.Module):
@@ -599,6 +658,101 @@ def test_sync_vllm_rollout_adapter_raises_clear_error_when_candidate_rank_exceed
 
     with pytest.raises(RuntimeError, match="adapter_r=128 max_lora_rank=64"):
         _sync_vllm_rollout_adapter(update_idx=21, vllm_rollout_client=_FakeClient(), policy_model=object())
+
+
+def test_fill_missing_reference_logprobs_raises_when_batch_scoring_still_leaves_missing_kl() -> None:
+    cfg = RLPostTrainConfig()
+    cfg.model.use_reference_model = True
+    cfg.rl.kl_coef = 0.1
+    rollouts = [_rollout("ok"), _rollout("bad", prompt_ids=[9, 9])]
+
+    def _score(items):  # type: ignore[no-untyped-def]
+        if len(items) > 1:
+            raise RuntimeError("temporary batch failure")
+        prompt_ids, completion_ids = items[0]
+        if prompt_ids == [9, 9]:
+            raise RuntimeError("reference worker 500")
+        return [[-0.2 for _ in completion_ids]]
+
+    with pytest.raises(RuntimeError, match="refusing to skip KL"):
+        trainer_mod._fill_missing_reference_logprobs(
+            merged_rollouts=rollouts,
+            cfg=cfg,
+            update_idx=17,
+            ref_logprob_batch_fn=_score,
+            ref_logprob_client=None,
+            ref_model=None,
+            ref_device=None,
+            device="cpu",
+        )
+
+    assert rollouts[0].ref_logprobs == [-0.2]
+    assert rollouts[1].ref_logprobs is None
+
+
+def test_fill_missing_reference_logprobs_raises_when_token_count_mismatches_completion() -> None:
+    cfg = RLPostTrainConfig()
+    cfg.model.use_reference_model = True
+    cfg.rl.kl_coef = 0.1
+    rollouts = [_rollout("bad", completion_ids=[3, 4])]
+
+    with pytest.raises(RuntimeError, match="token count mismatch: expected=2 returned=1"):
+        trainer_mod._fill_missing_reference_logprobs(
+            merged_rollouts=rollouts,
+            cfg=cfg,
+            update_idx=19,
+            ref_logprob_batch_fn=lambda items: [[-0.2]],
+            ref_logprob_client=None,
+            ref_model=None,
+            ref_device=None,
+            device="cpu",
+        )
+
+    assert rollouts[0].ref_logprobs is None
+
+
+def test_fill_missing_reference_logprobs_distributed_colocate_raises_when_gathered_rows_are_incomplete(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = RLPostTrainConfig()
+    cfg.model.use_reference_model = True
+    cfg.model.reference_runtime = "colocate"
+    cfg.rl.kl_coef = 0.1
+    merged_rollouts = [_rollout("ok"), _rollout("bad")]
+    broadcast_payloads: list[list[object]] = []
+
+    def _fake_broadcast(payload, src=0):  # type: ignore[no-untyped-def]
+        del src
+        broadcast_payloads.append(list(payload))
+        return payload
+
+    monkeypatch.setattr(trainer_mod, "_is_rank0", lambda: True)
+    monkeypatch.setattr(trainer_mod, "_distributed_world_size", lambda: 1)
+    monkeypatch.setattr(trainer_mod, "_broadcast_object_list", _fake_broadcast)
+    monkeypatch.setattr(trainer_mod, "_scatter_object_from_rank0", lambda payload, rank=0: list((payload or [[]])[0]))
+    monkeypatch.setattr(
+        trainer_mod,
+        "_score_reference_requests_with_batch_fn",
+        lambda **kwargs: ({0: [-0.3]}, 1, 1, {1: "RuntimeError: reference worker 500"}),
+    )
+    monkeypatch.setattr(
+        trainer_mod,
+        "_gather_object_to_rank0",
+        lambda payload: [payload],
+    )
+
+    with pytest.raises(RuntimeError, match="refusing to skip KL"):
+        trainer_mod._fill_missing_reference_logprobs_distributed_colocate(
+            merged_rollouts=merged_rollouts,
+            cfg=cfg,
+            update_idx=18,
+            ref_logprob_batch_fn=lambda items: [],
+            rank=0,
+        )
+
+    assert merged_rollouts[0].ref_logprobs == [-0.3]
+    assert merged_rollouts[1].ref_logprobs is None
+    assert any("refusing to skip KL" in str(item[0]) for item in broadcast_payloads if item and item[0])
 
 
 def test_load_policy_model_falls_back_when_resume_adapter_artifacts_are_zero_sized(

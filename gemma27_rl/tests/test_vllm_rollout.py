@@ -485,6 +485,58 @@ def test_start_retries_with_disable_custom_all_reduce_when_startup_log_matches(
     assert "--disable-custom-all-reduce" in captured_cmds[1]
 
 
+def test_start_ignores_stale_custom_all_reduce_log_from_previous_run(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    captured_cmds: list[list[str]] = []
+
+    def _fake_popen(*args, **kwargs):  # type: ignore[no-untyped-def]
+        captured_cmds.append(list(args[0]))
+        return _FakeProc()
+
+    def _fake_wait(self):  # type: ignore[no-untyped-def]
+        self._log_path.write_text("fatal: unrelated startup failure\n", encoding="utf-8")
+        raise RuntimeError("startup failed")
+
+    log_path = tmp_path / "vllm.log"
+    log_path.write_text(
+        "stale: custom_all_reduce.cuh invalid argument from previous run\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(vllm_mod, "_detect_vllm_log_request_flag_style", lambda python_executable: "enable")
+    monkeypatch.setattr(vllm_mod, "_detect_vllm_custom_all_reduce_flag_style", lambda python_executable: "toggle")
+    monkeypatch.setattr(vllm_mod.subprocess, "Popen", _fake_popen)
+    monkeypatch.setattr(vllm_mod.LocalVLLMRolloutClient, "_wait_until_ready", _fake_wait)
+
+    cfg = VLLMConfig(
+        enabled=True,
+        gpu_ids=[6, 7],
+        tensor_parallel_size=2,
+        adapter_root_dir=str(tmp_path / "adapters"),
+        python_executable="python",
+    )
+    client = vllm_mod.LocalVLLMRolloutClient(
+        cfg=cfg,
+        base_model_name_or_path="google/gemma-3-27b-it",
+        tokenizer_name_or_path="google/gemma-3-27b-it",
+        lora_rank=64,
+        trust_remote_code=False,
+        dtype="bfloat16",
+        log_path=log_path,
+        owns_server=True,
+    )
+
+    with pytest.raises(RuntimeError, match="startup failed"):
+        client.start()
+
+    assert len(captured_cmds) == 1
+    assert "--no-disable-custom-all-reduce" in captured_cmds[0]
+    assert "--disable-custom-all-reduce" not in captured_cmds[0]
+    assert log_path.read_text(encoding="utf-8") == "fatal: unrelated startup failure\n"
+
+
 def test_start_prefers_disable_custom_all_reduce_when_configured(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

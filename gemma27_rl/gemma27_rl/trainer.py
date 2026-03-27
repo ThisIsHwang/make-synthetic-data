@@ -1709,6 +1709,19 @@ def _unwrap_for_generation(model: Any) -> Any:
     return module if module is not None else model
 
 
+def _sync_policy_eval_model_from_train_model(*, train_model: Any, policy_eval_model: Any) -> None:
+    source_model = _unwrap_for_generation(train_model)
+    if policy_eval_model is source_model:
+        return
+    try:
+        policy_eval_model.load_state_dict(source_model.state_dict(), strict=True)
+    except Exception as exc:
+        raise RuntimeError("Failed to synchronize separate policy_eval_model from train_model.") from exc
+    eval_method = getattr(policy_eval_model, "eval", None)
+    if callable(eval_method):
+        eval_method()
+
+
 def _parse_cuda_index(device: str | None) -> int | None:
     if not device:
         return None
@@ -2393,6 +2406,33 @@ class _ExperimentTracker:
             self._wandb_run = None
 
 
+def _cleanup_run_toy_rl_resources(
+    *,
+    vllm_rollout_client: LocalVLLMRolloutClient | None,
+    ref_logprob_client: ReferenceLogprobClient | None,
+    async_eval_executor: ThreadPoolExecutor | None,
+    experiment_tracker: _ExperimentTracker | None,
+    async_json_writer: _AsyncJsonlWriter | None,
+) -> None:
+    cleanup_steps: list[tuple[str, Callable[[], None]]] = []
+    if vllm_rollout_client is not None:
+        cleanup_steps.append(("vLLM rollout client", vllm_rollout_client.close))
+    if ref_logprob_client is not None:
+        cleanup_steps.append(("reference logprob client", ref_logprob_client.close))
+    if async_eval_executor is not None:
+        cleanup_steps.append(("async eval executor", lambda: async_eval_executor.shutdown(wait=True)))
+    if experiment_tracker is not None:
+        cleanup_steps.append(("experiment tracker", experiment_tracker.close))
+    if async_json_writer is not None:
+        cleanup_steps.append(("async JSONL writer", async_json_writer.close))
+
+    for label, action in cleanup_steps:
+        try:
+            action()
+        except Exception as exc:
+            logger.warning("run_toy_rl cleanup failed for %s: %s", label, exc, exc_info=True)
+
+
 @dataclass
 class _PendingAsyncEval:
     update_idx: int
@@ -2863,6 +2903,50 @@ def _remove_path(path: Path) -> None:
         shutil.rmtree(path)
 
 
+def _staged_directory_path(target_dir: Path) -> Path:
+    return target_dir.parent / f".{target_dir.name}.staging"
+
+
+def _backup_directory_path(target_dir: Path) -> Path:
+    return target_dir.parent / f".{target_dir.name}.backup"
+
+
+def _promote_staged_directory(*, staged_dir: Path, target_dir: Path) -> None:
+    if not staged_dir.exists():
+        raise RuntimeError(f"Staged directory is missing: {staged_dir}")
+    target_dir.parent.mkdir(parents=True, exist_ok=True)
+    backup_dir = _backup_directory_path(target_dir)
+    _remove_path(backup_dir)
+    replaced_existing = False
+    try:
+        if target_dir.exists() or target_dir.is_symlink():
+            os.replace(target_dir, backup_dir)
+            replaced_existing = True
+        os.replace(staged_dir, target_dir)
+    except Exception as exc:
+        if replaced_existing and backup_dir.exists() and (not target_dir.exists()):
+            try:
+                os.replace(backup_dir, target_dir)
+            except Exception:
+                logger.exception("Failed to restore previous directory after promote failure: %s", target_dir)
+        raise RuntimeError(f"Failed to promote staged directory {staged_dir} -> {target_dir}") from exc
+    if replaced_existing:
+        _remove_path(backup_dir)
+
+
+def _write_directory_atomically(target_dir: Path, writer: Callable[[Path], None]) -> Path:
+    staged_dir = _staged_directory_path(target_dir)
+    target_dir.parent.mkdir(parents=True, exist_ok=True)
+    _remove_path(staged_dir)
+    try:
+        writer(staged_dir)
+    except Exception:
+        _remove_path(staged_dir)
+        raise
+    _promote_staged_directory(staged_dir=staged_dir, target_dir=target_dir)
+    return target_dir
+
+
 def _resolve_vllm_current_adapter_target(current_path: Path) -> Path | None:
     if current_path.is_symlink():
         try:
@@ -3194,12 +3278,13 @@ def _score_reference_requests_with_batch_fn(
     ref_logprob_batch_fn: Callable[[list[tuple[list[int], list[int]]]], list[list[float]]],
     update_idx: int,
     source_label: str,
-) -> tuple[dict[int, list[float]], int, int]:
+) -> tuple[dict[int, list[float]], int, int, dict[int, str]]:
     if not requests:
-        return {}, 0, 1
+        return {}, 0, 1, {}
 
     batch_chunk = _env_int("GEMMA27_RL_REF_FILL_CHUNK", default=16, minimum=1)
     responses_by_idx: dict[int, list[float]] = {}
+    failures_by_idx: dict[int, str] = {}
     batch_calls = 0
     cursor = 0
     while cursor < len(requests):
@@ -3221,12 +3306,14 @@ def _score_reference_requests_with_batch_fn(
                 )
                 continue
             bad_idx = chunk[0][0]
+            error_text = f"{type(exc).__name__}: {exc}"
+            failures_by_idx[bad_idx] = error_text
             logger.error(
-                "%s failed for one rollout at update=%s idx=%s; skipping KL for this sample. error=%s",
+                "%s failed for one rollout at update=%s idx=%s; refusing to skip KL for this sample. error=%s",
                 source_label,
                 update_idx,
                 bad_idx,
-                exc,
+                error_text,
             )
             cursor += 1
             continue
@@ -3242,14 +3329,73 @@ def _score_reference_requests_with_batch_fn(
             if chunk_size > 1:
                 batch_chunk = max(1, chunk_size // 2)
                 continue
+            bad_idx = chunk[0][0]
+            failures_by_idx[bad_idx] = (
+                f"batch size mismatch: requested={len(chunk)} returned={len(chunk_rows)}"
+            )
             cursor += 1
             continue
 
-        for (rollout_idx, _), row in zip(chunk, chunk_rows):
-            responses_by_idx[rollout_idx] = [float(v) for v in row]
+        for (rollout_idx, (_, completion_ids)), row in zip(chunk, chunk_rows):
+            try:
+                row_values = [float(v) for v in row]
+            except Exception as exc:
+                failures_by_idx[rollout_idx] = f"invalid logprob row: {type(exc).__name__}: {exc}"
+                logger.error(
+                    "%s returned an invalid logprob row at update=%s idx=%s; refusing to skip KL for this sample. error=%s",
+                    source_label,
+                    update_idx,
+                    rollout_idx,
+                    failures_by_idx[rollout_idx],
+                )
+                continue
+            expected_len = len(completion_ids)
+            if len(row_values) != expected_len:
+                failures_by_idx[rollout_idx] = (
+                    f"token count mismatch: expected={expected_len} returned={len(row_values)}"
+                )
+                logger.error(
+                    "%s returned mismatched token count at update=%s idx=%s expected=%s got=%s; refusing to skip KL for this sample.",
+                    source_label,
+                    update_idx,
+                    rollout_idx,
+                    expected_len,
+                    len(row_values),
+                )
+                continue
+            responses_by_idx[rollout_idx] = row_values
         cursor += chunk_size
 
-    return responses_by_idx, batch_calls, batch_chunk
+    return responses_by_idx, batch_calls, batch_chunk, failures_by_idx
+
+
+def _describe_incomplete_reference_logprobs(
+    *,
+    rollouts: list[Rollout],
+    requested_idx: list[int],
+    update_idx: int,
+    source_label: str,
+    failures_by_idx: dict[int, str] | None = None,
+) -> str | None:
+    unresolved = [idx for idx in requested_idx if 0 <= idx < len(rollouts) and rollouts[idx].ref_logprobs is None]
+    if not unresolved:
+        return None
+
+    failure_lookup = failures_by_idx or {}
+    details: list[str] = []
+    for idx in unresolved[:5]:
+        rollout = rollouts[idx]
+        reason = failure_lookup.get(idx)
+        detail = f"idx={idx} example_id={rollout.example_id!r}"
+        if reason:
+            detail += f" reason={reason}"
+        details.append(detail)
+    if len(unresolved) > len(details):
+        details.append(f"... +{len(unresolved) - len(details)} more")
+    return (
+        f"{source_label} left reference logprobs missing for {len(unresolved)}/{len(requested_idx)} rollouts "
+        f"at update={update_idx}; refusing to skip KL. {'; '.join(details)}"
+    )
 
 
 def _fill_missing_reference_logprobs_distributed_colocate(
@@ -3264,17 +3410,18 @@ def _fill_missing_reference_logprobs_distributed_colocate(
         return 0
 
     requests_by_rank: list[list[tuple[int, tuple[list[int], list[int]]]]] | None = None
+    requested_idx: list[int] = []
     total_missing = 0
     if _is_rank0():
         assert merged_rollouts is not None
-        missing_idx = [i for i, rollout in enumerate(merged_rollouts) if rollout.ref_logprobs is None]
-        if missing_idx:
-            for idx in list(missing_idx):
+        requested_idx = [i for i, rollout in enumerate(merged_rollouts) if rollout.ref_logprobs is None]
+        if requested_idx:
+            for idx in list(requested_idx):
                 if merged_rollouts[idx].completion_token_ids:
                     continue
                 merged_rollouts[idx].ref_logprobs = []
-            missing_idx = [i for i in missing_idx if merged_rollouts[i].ref_logprobs is None]
-        total_missing = len(missing_idx)
+            requested_idx = [i for i in requested_idx if merged_rollouts[i].ref_logprobs is None]
+        total_missing = len(requested_idx)
         requests: list[tuple[int, tuple[list[int], list[int]]]] = [
             (
                 idx,
@@ -3283,7 +3430,7 @@ def _fill_missing_reference_logprobs_distributed_colocate(
                     merged_rollouts[idx].completion_token_ids,
                 ),
             )
-            for idx in missing_idx
+            for idx in requested_idx
         ]
         world_size = max(1, _distributed_world_size())
         requests_by_rank = [[] for _ in range(world_size)]
@@ -3296,7 +3443,7 @@ def _fill_missing_reference_logprobs_distributed_colocate(
     local_requests_raw = _scatter_object_from_rank0(requests_by_rank if _is_rank0() else None, rank=rank)
     local_requests = local_requests_raw if isinstance(local_requests_raw, list) else []
 
-    local_rows, local_batch_calls, local_chunk = _score_reference_requests_with_batch_fn(
+    local_rows, local_batch_calls, local_chunk, local_failures = _score_reference_requests_with_batch_fn(
         requests=[
             (int(idx), (list(prompt_ids), list(completion_ids)))
             for idx, (prompt_ids, completion_ids) in local_requests
@@ -3310,14 +3457,20 @@ def _fill_missing_reference_logprobs_distributed_colocate(
             "rows": local_rows,
             "batch_calls": int(local_batch_calls),
             "chunk": int(local_chunk),
+            "failures": {int(idx): str(reason) for idx, reason in local_failures.items()},
         }
     )
 
+    error_shared: list[Any] = [None]
     if not _is_rank0():
+        _broadcast_object_list(error_shared, src=0)
+        if error_shared[0]:
+            raise RuntimeError(str(error_shared[0]))
         return 0
 
     assert merged_rollouts is not None
     merged_rows: dict[int, list[float]] = {}
+    merged_failures: dict[int, str] = {}
     batch_calls_total = 0
     chunk_sizes: list[int] = []
     for payload in gathered or []:
@@ -3329,7 +3482,17 @@ def _fill_missing_reference_logprobs_distributed_colocate(
             chunk_sizes.append(chunk_raw)
         rows_payload = payload.get("rows")
         if not isinstance(rows_payload, dict):
-            continue
+            rows_payload = {}
+        failures_payload = payload.get("failures")
+        if isinstance(failures_payload, dict):
+            for idx_raw, reason_raw in failures_payload.items():
+                try:
+                    rollout_idx = int(idx_raw)
+                except Exception:
+                    continue
+                reason = str(reason_raw).strip()
+                if reason:
+                    merged_failures[rollout_idx] = reason
         for idx_raw, row in rows_payload.items():
             try:
                 rollout_idx = int(idx_raw)
@@ -3344,6 +3507,14 @@ def _fill_missing_reference_logprobs_distributed_colocate(
             merged_rollouts[idx].ref_logprobs = row
             filled += 1
 
+    error_shared[0] = _describe_incomplete_reference_logprobs(
+        rollouts=merged_rollouts,
+        requested_idx=requested_idx,
+        update_idx=update_idx,
+        source_label="Reference colocated score_batch",
+        failures_by_idx=merged_failures,
+    )
+
     logger.info(
         "Filled colocated reference logprobs on rank0 for %s/%s gathered rollouts at update=%s "
         "(distributed batch_calls=%s chunk_candidates=%s).",
@@ -3353,6 +3524,9 @@ def _fill_missing_reference_logprobs_distributed_colocate(
         batch_calls_total,
         sorted(set(chunk_sizes)),
     )
+    _broadcast_object_list(error_shared, src=0)
+    if error_shared[0]:
+        raise RuntimeError(str(error_shared[0]))
     return filled
 
 
@@ -5222,7 +5396,7 @@ def _fill_missing_reference_logprobs(
             for i in missing_idx
         ]
         source_label = "Reference colocated score_batch" if ref_logprob_batch_fn is not None else "Reference worker score_batch"
-        responses_by_idx, batch_calls, batch_chunk = _score_reference_requests_with_batch_fn(
+        responses_by_idx, batch_calls, batch_chunk, failures_by_idx = _score_reference_requests_with_batch_fn(
             requests=requests,
             ref_logprob_batch_fn=(
                 ref_logprob_batch_fn
@@ -5251,6 +5425,15 @@ def _fill_missing_reference_logprobs(
             batch_calls,
             batch_chunk,
         )
+        error_text = _describe_incomplete_reference_logprobs(
+            rollouts=merged_rollouts,
+            requested_idx=missing_idx,
+            update_idx=update_idx,
+            source_label=source_label,
+            failures_by_idx=failures_by_idx,
+        )
+        if error_text is not None:
+            raise RuntimeError(error_text)
         return filled
 
     if ref_model is not None:
@@ -5279,15 +5462,15 @@ def _save_checkpoint_to_dir(
     optimizer: torch.optim.Optimizer,
     trainer_state: dict[str, Any] | None = None,
 ) -> Path:
-    if ckpt_dir.exists():
-        shutil.rmtree(ckpt_dir)
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
-    model.save_pretrained(ckpt_dir)
-    tokenizer.save_pretrained(ckpt_dir)
-    torch.save(optimizer.state_dict(), ckpt_dir / "optimizer.pt")
-    if trainer_state:
-        _save_trainer_state(ckpt_dir, trainer_state)
-    return ckpt_dir
+    def _write(staged_dir: Path) -> None:
+        staged_dir.mkdir(parents=True, exist_ok=True)
+        model.save_pretrained(staged_dir)
+        tokenizer.save_pretrained(staged_dir)
+        torch.save(optimizer.state_dict(), staged_dir / "optimizer.pt")
+        if trainer_state:
+            _save_trainer_state(staged_dir, trainer_state)
+
+    return _write_directory_atomically(ckpt_dir, _write)
 
 
 def _resolve_peft_export_model(model: Any) -> Any | None:
@@ -5538,19 +5721,61 @@ def _save_deepspeed_checkpoint_to_dir(
     hf_model: AutoModelForCausalLM | None = None,
     trainer_state: dict[str, Any] | None = None,
 ) -> Path:
+    staged_dir = _staged_directory_path(ckpt_dir)
     if _is_rank0():
-        if ckpt_dir.exists():
-            shutil.rmtree(ckpt_dir)
-        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        _remove_path(staged_dir)
+        staged_dir.mkdir(parents=True, exist_ok=True)
     _dist_barrier()
-    engine.save_checkpoint(str(ckpt_dir), tag="state")
-    _dist_barrier()
+
+    save_error_text: str | None = None
+    try:
+        engine.save_checkpoint(str(staged_dir), tag="state")
+    except Exception as exc:
+        logger.exception("Failed to save DeepSpeed checkpoint shards to %s", staged_dir)
+        save_error_text = f"{type(exc).__name__}: {exc}"
+
+    save_errors = _all_gather_object(save_error_text)
+    first_save_error = next((str(err) for err in save_errors if err), None)
+    if first_save_error is not None:
+        if _is_rank0():
+            _remove_path(staged_dir)
+        _dist_barrier()
+        raise RuntimeError(f"Failed to save DeepSpeed checkpoint shards to {ckpt_dir}: {first_save_error}")
+
     if hf_model is not None:
-        _save_pretrained_model(hf_model, ckpt_dir)
+        _save_pretrained_model(hf_model, staged_dir)
+
+    metadata_error_text: str | None = None
     if _is_rank0():
-        tokenizer.save_pretrained(ckpt_dir)
-        if trainer_state:
-            _save_trainer_state(ckpt_dir, trainer_state)
+        try:
+            tokenizer.save_pretrained(staged_dir)
+            if trainer_state:
+                _save_trainer_state(staged_dir, trainer_state)
+        except Exception as exc:
+            logger.exception("Failed to save DeepSpeed checkpoint metadata to %s", staged_dir)
+            metadata_error_text = f"{type(exc).__name__}: {exc}"
+
+    metadata_shared: list[Any] = [metadata_error_text if _is_rank0() else None]
+    _broadcast_object_list(metadata_shared, src=0)
+    if metadata_shared[0]:
+        if _is_rank0():
+            _remove_path(staged_dir)
+        _dist_barrier()
+        raise RuntimeError(f"Failed to save DeepSpeed checkpoint metadata to {ckpt_dir}: {metadata_shared[0]}")
+
+    promote_error_text: str | None = None
+    if _is_rank0():
+        try:
+            _promote_staged_directory(staged_dir=staged_dir, target_dir=ckpt_dir)
+        except Exception as exc:
+            logger.exception("Failed to promote staged DeepSpeed checkpoint %s to %s", staged_dir, ckpt_dir)
+            promote_error_text = f"{type(exc).__name__}: {exc}"
+
+    promote_shared: list[Any] = [promote_error_text if _is_rank0() else None]
+    _broadcast_object_list(promote_shared, src=0)
+    if promote_shared[0]:
+        raise RuntimeError(f"Failed to promote DeepSpeed checkpoint to {ckpt_dir}: {promote_shared[0]}")
+
     _dist_barrier()
     return ckpt_dir
 
@@ -5860,881 +6085,915 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
     rank0 = _is_rank0()
     world_size = _distributed_world_size()
 
-    output_dir = Path(cfg.logging.output_dir)
-    if rank0:
-        output_dir.mkdir(parents=True, exist_ok=True)
-        dump_config(cfg, output_dir / "resolved_config.yaml")
-    _dist_barrier()
-
-    log_path = output_dir / cfg.logging.jsonl_name
-    rollout_log_path = output_dir / cfg.logging.rollout_jsonl_name
-    eval_output_path = output_dir / cfg.logging.eval_output_jsonl_name
-    experiment_tracker: _ExperimentTracker | None = _ExperimentTracker(cfg=cfg, output_dir=output_dir) if rank0 else None
-
-    resume_ckpt, resume_update_idx = _resolve_resume_checkpoint(cfg, output_dir)
-    resume_state = _load_trainer_state(resume_ckpt) if resume_ckpt is not None else None
-    if resume_state and "update_idx" in resume_state:
-        try:
-            resume_update_idx = int(resume_state["update_idx"])
-        except (TypeError, ValueError):
-            pass
-    is_resuming = resume_ckpt is not None
-    start_update = resume_update_idx + 1 if is_resuming else 1
-
-    if rank0:
-        if log_path.exists() and not is_resuming:
-            log_path.unlink()
-        if cfg.logging.save_rollouts and rollout_log_path.exists() and not is_resuming:
-            rollout_log_path.unlink()
-        if cfg.logging.save_eval_outputs and eval_output_path.exists() and not is_resuming:
-            eval_output_path.unlink()
-        if is_resuming:
-            _truncate_jsonl_by_update(log_path, resume_update_idx)
-            if cfg.logging.save_rollouts:
-                _truncate_jsonl_by_update(rollout_log_path, resume_update_idx)
-            if cfg.logging.save_eval_outputs:
-                _truncate_jsonl_by_update(eval_output_path, resume_update_idx)
-    _dist_barrier()
-
-    tokenizer_name = cfg.model.tokenizer_name_or_path or cfg.model.policy_name_or_path
-    tokenizer_source = (
-        str(resume_ckpt)
-        if resume_ckpt is not None and (resume_ckpt / "tokenizer_config.json").exists()
-        else tokenizer_name
-    )
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, use_fast=cfg.model.use_fast_tokenizer)
-    if tokenizer.pad_token is None and tokenizer.eos_token is not None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    resume_has_hf_artifacts = _checkpoint_has_model_artifacts(resume_ckpt)
-    if use_deepspeed:
-        # Prefer resume dir as model init when it includes HF artifacts (e.g., `best`).
-        # Optimizer/lr states are still restored through DeepSpeed shards when present.
-        policy_source = str(resume_ckpt) if resume_has_hf_artifacts else cfg.model.policy_name_or_path
-    else:
-        policy_source = str(resume_ckpt) if resume_ckpt is not None else cfg.model.policy_name_or_path
-    policy_model = _load_policy_model(cfg, device=device, model_name_or_path=policy_source)
-    _configure_policy_train_memory(policy_model)
-    train_model: Any = policy_model
-    optimizer: torch.optim.Optimizer | None = None
-    if use_deepspeed:
-        train_model, _ = _deepspeed_initialize(cfg, policy_model)
-    policy_runtime_mode = str(cfg.model.policy_runtime_mode or "colocate").strip().lower()
-    if policy_runtime_mode == "separate":
-        if use_deepspeed:
-            raise ValueError(
-                "model.policy_runtime_mode=separate is not supported with rl.backend=deepspeed. "
-                "Use model.policy_runtime_mode=colocate."
-            )
-        # Native-only: keep a dedicated rollout/eval policy copy detached from optimizer/backward.
-        policy_eval_model = _load_policy_model(cfg, device=device, model_name_or_path=policy_source)
-    else:
-        policy_eval_model = _unwrap_for_generation(train_model)
-
-    if rank0:
-        configured_attn = str(cfg.model.attn_implementation or "auto").strip() or "auto"
-        logger.info(
-            "Policy attention uses model.attn_implementation=%s (disable_policy_flash_attention=%s).",
-            configured_attn,
-            bool(cfg.model.disable_policy_flash_attention),
-        )
-        logger.info(
-            "Policy runtime mode=%s (colocate means single policy instance is shared for rollout/eval/update).",
-            policy_runtime_mode,
-        )
-
+    experiment_tracker: _ExperimentTracker | None = None
     vllm_rollout_client: LocalVLLMRolloutClient | None = None
-    if _vllm_rollout_enabled(cfg):
-        vllm_rollout_client = _create_vllm_rollout_client(
-            cfg=cfg,
-            policy_source=policy_source,
-            tokenizer_source=tokenizer_source,
-            output_dir=output_dir,
-            owns_server=bool(rank0),
-            startup_reason="LoRA training",
-        )
+    ref_logprob_client: ReferenceLogprobClient | None = None
+    async_eval_executor: ThreadPoolExecutor | None = None
+    async_json_writer: _AsyncJsonlWriter | None = None
+    try:
+        output_dir = Path(cfg.logging.output_dir)
+        if rank0:
+            output_dir.mkdir(parents=True, exist_ok=True)
+            dump_config(cfg, output_dir / "resolved_config.yaml")
         _dist_barrier()
 
-    ref_model: AutoModelForCausalLM | None = None
-    ref_device: str | None = None
-    ref_logprob_client: ReferenceLogprobClient | None = None
-    ref_logprob_batch_fn: Callable[[list[tuple[list[int], list[int]]]], list[list[float]]] | None = None
-    reference_kl_enabled = _reference_kl_enabled(cfg)
-    reference_runtime = str(cfg.model.reference_runtime or "worker").strip().lower()
-    if rank0 and (float(cfg.rl.kl_coef) > 0.0) and (not reference_kl_enabled):
-        logger.info(
-            "Reference model is disabled (model.use_reference_model=false); KL-to-reference term will be skipped."
-        )
-    if reference_kl_enabled and reference_runtime == "colocate":
-        ref_logprob_batch_fn, ref_device = _create_colocated_reference_logprob_batch_fn(
-            cfg,
-            policy_eval_model,
-            device=device,
-        )
-    elif (not use_deepspeed) or rank0:
-        if reference_kl_enabled:
-            if reference_runtime == "worker":
-                ref_logprob_client, ref_device = _create_reference_logprob_client(cfg, default_device=device)
-            elif reference_runtime == "cpu":
-                ref_model, ref_device = _load_reference_model(cfg, default_device="cpu")
-            else:
-                ref_model, ref_device = _load_reference_model(cfg, default_device=device)
+        log_path = output_dir / cfg.logging.jsonl_name
+        rollout_log_path = output_dir / cfg.logging.rollout_jsonl_name
+        eval_output_path = output_dir / cfg.logging.eval_output_jsonl_name
+        experiment_tracker: _ExperimentTracker | None = _ExperimentTracker(cfg=cfg, output_dir=output_dir) if rank0 else None
 
-    train_examples = load_examples(cfg.data, split="train", limit=cfg.data.limit)
-    if not train_examples:
-        raise ValueError(
-            "No train examples loaded. "
-            f"Check data fields and filters: "
-            f"src_text_field={cfg.data.src_text_field!r}, "
-            f"id_field={cfg.data.id_field!r}, "
-            f"skip_bad_source={cfg.data.skip_bad_source}, "
-            f"is_bad_source_field={cfg.data.is_bad_source_field!r}, "
-            f"limit={cfg.data.limit}, "
-            f"hf_dataset_name={cfg.data.hf_dataset_name!r}, "
-            f"hf_train_split={cfg.data.hf_train_split!r}, "
-            f"train_file={cfg.data.train_file!r}, "
-            f"train_dir={cfg.data.train_dir!r}."
-        )
-
-    batching_strategy = str(cfg.data.batching_strategy or "direction").strip().lower() or "direction"
-    train_prompt_token_lengths: list[int] | None = None
-    needs_train_prompt_lengths = (
-        batching_strategy == "direction_domain_length"
-        or cfg.data.max_prompt_tokens is not None
-    )
-    if needs_train_prompt_lengths:
-        train_prompt_token_lengths, _ = _prepare_split_prompt_token_lengths(
-            cfg=cfg,
-            split="train",
-            examples=train_examples,
-            tokenizer=tokenizer,
-            limit=cfg.data.limit,
-            log_reason=(
-                "bucketed batching and prompt filtering"
-                if batching_strategy == "direction_domain_length" and cfg.data.max_prompt_tokens is not None
-                else "bucketed batching"
-                if batching_strategy == "direction_domain_length"
-                else "prompt filtering"
-            ),
-            rank0=rank0,
-        )
-    if train_prompt_token_lengths is not None and cfg.data.max_prompt_tokens is not None:
-        train_examples, train_prompt_token_lengths, _ = _apply_max_prompt_token_filter(
-            cfg=cfg,
-            split="train",
-            examples=train_examples,
-            prompt_lengths=train_prompt_token_lengths,
-            rank0=rank0,
-        )
-        if not train_examples:
-            raise ValueError(
-                "No train examples remain after applying data.max_prompt_tokens="
-                f"{int(cfg.data.max_prompt_tokens)}."
-            )
-
-    eval_limit = cfg.eval.eval_limit if cfg.eval.eval_limit is not None else cfg.data.eval_limit
-    eval_examples = load_examples(cfg.data, split="eval", limit=eval_limit)
-    if eval_limit is not None and len(eval_examples) > int(eval_limit):
-        eval_examples = eval_examples[: int(eval_limit)]
-    if eval_examples and cfg.data.max_prompt_tokens is not None:
-        eval_prompt_token_lengths, _ = _prepare_split_prompt_token_lengths(
-            cfg=cfg,
-            split="eval",
-            examples=eval_examples,
-            tokenizer=tokenizer,
-            limit=eval_limit,
-            log_reason="prompt filtering",
-            rank0=rank0,
-        )
-        eval_examples, _, _ = _apply_max_prompt_token_filter(
-            cfg=cfg,
-            split="eval",
-            examples=eval_examples,
-            prompt_lengths=eval_prompt_token_lengths,
-            rank0=rank0,
-        )
-    logger.info(
-        "Prepared eval examples: requested_limit=%s loaded=%s eval_file=%s hf_eval_split=%s",
-        eval_limit,
-        len(eval_examples),
-        cfg.data.eval_file,
-        cfg.data.hf_eval_split,
-    )
-    if (
-        cfg.data.hf_dataset_name
-        and not cfg.data.eval_file
-        and (cfg.data.hf_eval_split or cfg.data.hf_train_split) == cfg.data.hf_train_split
-    ):
-        logger.warning(
-            "Eval is currently read from the same HF split as train (%s). "
-            "For SFT eval-set selection, set data.eval_file (recommended) or data.hf_eval_split to a distinct split.",
-            cfg.data.hf_train_split,
-        )
-
-    if not (cfg.reward.mqm.source_lang or "").strip():
-        cfg.reward.mqm.source_lang = cfg.data.default_src_lang
-    if not (cfg.reward.mqm.target_lang or "").strip():
-        cfg.reward.mqm.target_lang = cfg.data.default_tgt_lang
-    if not (cfg.reward.esa.source_lang or "").strip():
-        cfg.reward.esa.source_lang = cfg.data.default_src_lang
-    if not (cfg.reward.esa.target_lang or "").strip():
-        cfg.reward.esa.target_lang = cfg.data.default_tgt_lang
-
-    metricx_scorer = (
-        MetricXQEScorer(cfg.reward.metricx) if cfg.reward.metricx.enabled and ((not use_deepspeed) or rank0) else None
-    )
-    xcomet_runtime_enabled = _should_enable_xcomet_runtime(cfg)
-    xcomet_scorer = (
-        XCometXLScorer(cfg.reward.xcomet) if xcomet_runtime_enabled and ((not use_deepspeed) or rank0) else None
-    )
-    mqm_scorer = (
-        OpenAICompatibleMQMScorer(
-            cfg.reward.mqm,
-            parse_failure_log_path=output_dir / cfg.logging.mqm_parse_failure_jsonl_name,
-        )
-        if cfg.reward.mqm.enabled and ((not use_deepspeed) or rank0)
-        else None
-    )
-    esa_runtime_cfg = _effective_esa_runtime_cfg(cfg)
-    esa_runtime_enabled = bool(esa_runtime_cfg.enabled)
-    esa_scorer = (
-        OpenAICompatibleESAScorer(
-            esa_runtime_cfg,
-            parse_failure_log_path=output_dir / cfg.logging.esa_parse_failure_jsonl_name,
-        )
-        if esa_runtime_enabled and ((not use_deepspeed) or rank0)
-        else None
-    )
-    group_rank_scorer = (
-        OpenAICompatibleGroupRankScorer(
-            cfg.reward.group_rank,
-            parse_failure_log_path=output_dir / cfg.logging.group_rank_parse_failure_jsonl_name,
-        )
-        if cfg.reward.group_rank.enabled and ((not use_deepspeed) or rank0)
-        else None
-    )
-    if rank0:
-        effective_esa_weight = float(cfg.reward.w_esa_seq) * float(cfg.reward.esa_seq_scale)
-        effective_group_rank_weight = float(cfg.reward.w_group_rank_seq) * float(cfg.reward.group_rank_seq_scale)
-        logger.info(
-            "reward config: esa_enabled=%s esa_runtime=%s w_esa_seq=%.6f esa_seq_scale=%.6f "
-            "effective_esa_weight=%.6f score_range=[%.3f, %.3f] scale_to_unit_interval=%s error_policy=%s",
-            bool(esa_runtime_enabled),
-            bool(esa_scorer is not None),
-            float(cfg.reward.w_esa_seq),
-            float(cfg.reward.esa_seq_scale),
-            effective_esa_weight,
-            float(cfg.reward.esa.score_min),
-            float(cfg.reward.esa.score_max),
-            bool(cfg.reward.esa.scale_to_unit_interval),
-            str(cfg.reward.esa.error_policy),
-        )
-        if esa_runtime_enabled and abs(effective_esa_weight) <= 0.0:
-            logger.warning(
-                "ESA is enabled but effective sequence weight is 0.0 "
-                "(w_esa_seq * esa_seq_scale == 0). ESA score will not affect loss."
-            )
-        if esa_runtime_enabled and float(cfg.reward.esa.score_max) <= 0.0:
-            logger.warning(
-                "reward.esa.score_max <= 0.0. GEMBA-ESA usually returns 0..100, "
-                "so outputs may clip to 0.0. Recommended range is score_min=0, score_max=100."
-            )
-        if esa_runtime_enabled and str(cfg.reward.esa.error_policy).strip().lower() == "zero":
-            logger.warning(
-                "reward.esa.error_policy=zero: ESA API/parsing failures are converted to 0.0."
-            )
-        logger.info(
-            "reward config: group_rank_enabled=%s group_rank_runtime=%s w_group_rank_seq=%.6f "
-            "group_rank_seq_scale=%.6f effective_group_rank_weight=%.6f candidate_range=[%s, %s] "
-            "deduplicate_exact_candidates=%s duplicate_text_normalization=%s failure_policy=%s",
-            bool(cfg.reward.group_rank.enabled),
-            bool(group_rank_scorer is not None),
-            float(cfg.reward.w_group_rank_seq),
-            float(cfg.reward.group_rank_seq_scale),
-            effective_group_rank_weight,
-            int(cfg.reward.group_rank.candidate_min),
-            int(cfg.reward.group_rank.candidate_max),
-            bool(cfg.reward.group_rank.deduplicate_exact_candidates),
-            str(cfg.reward.group_rank.duplicate_text_normalization),
-            str(cfg.reward.group_rank.failure_policy),
-        )
-        if cfg.reward.group_rank.enabled and abs(effective_group_rank_weight) <= 0.0:
-            logger.warning(
-                "group rank is enabled but effective sequence weight is 0.0 "
-                "(w_group_rank_seq * group_rank_seq_scale == 0)."
-            )
-
-    if not use_deepspeed:
-        optimizer = torch.optim.AdamW(
-            [p for p in policy_model.parameters() if p.requires_grad],
-            lr=cfg.rl.lr,
-            weight_decay=cfg.rl.weight_decay,
-        )
-        if is_resuming:
-            optimizer_path = resume_ckpt / "optimizer.pt"
-            if optimizer_path.exists():
-                optimizer_state = torch.load(optimizer_path, map_location="cpu")
-                optimizer.load_state_dict(optimizer_state)
-            else:
-                logger.warning("Resume checkpoint has no optimizer.pt: %s", resume_ckpt)
-    elif is_resuming and resume_ckpt is not None:
-        if _is_deepspeed_checkpoint_dir(resume_ckpt):
-            ds_resume_failed = False
+        resume_ckpt, resume_update_idx = _resolve_resume_checkpoint(cfg, output_dir)
+        resume_state = _load_trainer_state(resume_ckpt) if resume_ckpt is not None else None
+        if resume_state and "update_idx" in resume_state:
             try:
-                load_path, _ = train_model.load_checkpoint(
-                    str(resume_ckpt),
-                    tag="state",
-                    load_optimizer_states=True,
-                    load_lr_scheduler_states=False,
-                )
-                if load_path is None and rank0:
-                    logger.warning("DeepSpeed resume checkpoint could not be loaded from %s", resume_ckpt)
-                    ds_resume_failed = True
-            except AssertionError as exc:
-                # DeepSpeed can assert on empty ckpt shard list when shard files are
-                # missing for current rank/world-size. In that case, keep model
-                # weights already loaded from `policy_source` and reset optimizer.
-                text = str(exc)
-                if _is_deepspeed_resume_shard_mismatch_error(exc):
-                    ds_resume_failed = True
-                    if rank0:
-                        logger.warning(
-                            "DeepSpeed optimizer-state resume failed from %s due to shard mismatch (%s). "
-                            "Continuing with model weights from %s and resetting optimizer state.",
-                            resume_ckpt,
-                            text or type(exc).__name__,
-                            policy_source,
-                        )
-                else:
-                    raise RuntimeError(f"Failed to load DeepSpeed checkpoint from {resume_ckpt}") from exc
-            except Exception as exc:
-                raise RuntimeError(f"Failed to load DeepSpeed checkpoint from {resume_ckpt}") from exc
-            if ds_resume_failed and rank0:
-                logger.warning(
-                    "DeepSpeed resume fallback active: start_update=%s (from trainer_state), "
-                    "but optimizer/momentum states were not restored.",
-                    start_update,
-                )
-        elif rank0:
-            logger.warning(
-                "Resume checkpoint has no DeepSpeed shard states: %s. "
-                "Continuing with model weights only from %s (optimizer state reset).",
-                resume_ckpt,
-                policy_source,
-            )
-
-    artifacts: dict[str, Any] = {
-        "output_dir": str(output_dir),
-        "checkpoints": [],
-    }
-    if is_resuming and resume_ckpt is not None:
-        artifacts["resumed_from"] = str(resume_ckpt)
-        artifacts["resume_update"] = resume_update_idx
-
-    async_json_writer: _AsyncJsonlWriter | None = _AsyncJsonlWriter() if ((not use_deepspeed) or rank0) else None
-
-    def _log_json_row(payload: dict[str, Any]) -> None:
-        if async_json_writer is not None:
-            async_json_writer.append_json(log_path, payload)
-        else:
-            _append_jsonl(log_path, payload)
-
-    def _log_monitor_metrics(*, prefix: str, payload: dict[str, Any], step: int) -> None:
-        if experiment_tracker is not None:
-            experiment_tracker.log_metrics(prefix=prefix, payload=payload, step=step)
-
-    def _log_rollout_rows(
-        *,
-        update_idx: int,
-        rollouts: list[Rollout],
-        advantages: list[list[float]],
-        reward_stats: dict[str, float],
-    ) -> None:
-        if async_json_writer is not None:
-            async_json_writer.append_rollouts(
-                path=rollout_log_path,
-                update_idx=update_idx,
-                rollouts=rollouts,
-                advantages=advantages,
-                reward_stats=reward_stats,
-            )
-        else:
-            _append_rollout_jsonl(
-                path=rollout_log_path,
-                update_idx=update_idx,
-                rollouts=rollouts,
-                advantages=advantages,
-                reward_stats=reward_stats,
-            )
-
-    def _log_eval_rows(*, update_idx: int, eval_rows: list[dict[str, Any]]) -> None:
-        if async_json_writer is not None:
-            async_json_writer.append_eval_rows(
-                path=eval_output_path,
-                update_idx=update_idx,
-                eval_rows=eval_rows,
-            )
-        else:
-            _append_eval_output_jsonl(eval_output_path, update_idx=update_idx, eval_rows=eval_rows)
-
-    best_dir = output_dir / "best"
-    best_eval_score = float("-inf")
-    best_eval_update: int | None = None
-
-    def _sync_and_save_best_checkpoint(candidate_score: float | None, *, update_idx: int) -> None:
-        nonlocal best_eval_score, best_eval_update
-
-        is_new_best_local = False
-        best_score_local: float | None = None
-        if rank0 and candidate_score is not None:
-            try:
-                parsed_score = float(candidate_score)
+                resume_update_idx = int(resume_state["update_idx"])
             except (TypeError, ValueError):
-                parsed_score = float("-inf")
-            if math.isfinite(parsed_score) and parsed_score > best_eval_score:
-                is_new_best_local = True
-                best_score_local = parsed_score
-
-        shared: list[Any] = [
-            {
-                "is_new_best": bool(is_new_best_local),
-                "update_idx": int(update_idx),
-                "score": best_score_local,
-            }
-            if rank0
-            else None
-        ]
-        _broadcast_object_list(shared, src=0)
-        payload = shared[0] if shared and isinstance(shared[0], dict) else {}
-        should_save = bool(payload.get("is_new_best", False))
-        if not should_save:
-            return
-
-        resolved_update_idx = int(payload.get("update_idx", update_idx))
-        score_raw = payload.get("score")
-        try:
-            resolved_score = float(score_raw)
-        except (TypeError, ValueError):
-            resolved_score = float("-inf")
-        if not math.isfinite(resolved_score):
-            return
-
-        trainer_state_payload = {
-            "update_idx": int(resolved_update_idx),
-            "best_eval_update": int(resolved_update_idx),
-            "best_eval_score": float(resolved_score),
-        }
-
-        if use_deepspeed:
-            _save_deepspeed_checkpoint_to_dir(
-                ckpt_dir=best_dir,
-                engine=train_model,
-                tokenizer=tokenizer,
-                hf_model=policy_eval_model,
-                trainer_state=trainer_state_payload,
-            )
-        elif rank0:
-            assert optimizer is not None
-            _save_checkpoint_to_dir(
-                ckpt_dir=best_dir,
-                model=policy_eval_model,
-                tokenizer=tokenizer,
-                optimizer=optimizer,
-                trainer_state=trainer_state_payload,
-            )
+                pass
+        is_resuming = resume_ckpt is not None
+        start_update = resume_update_idx + 1 if is_resuming else 1
 
         if rank0:
-            best_eval_score = resolved_score
-            best_eval_update = resolved_update_idx
-            logger.info("new best eval at update=%s score=%.6f", resolved_update_idx, resolved_score)
+            if log_path.exists() and not is_resuming:
+                log_path.unlink()
+            if cfg.logging.save_rollouts and rollout_log_path.exists() and not is_resuming:
+                rollout_log_path.unlink()
+            if cfg.logging.save_eval_outputs and eval_output_path.exists() and not is_resuming:
+                eval_output_path.unlink()
+            if is_resuming:
+                _truncate_jsonl_by_update(log_path, resume_update_idx)
+                if cfg.logging.save_rollouts:
+                    _truncate_jsonl_by_update(rollout_log_path, resume_update_idx)
+                if cfg.logging.save_eval_outputs:
+                    _truncate_jsonl_by_update(eval_output_path, resume_update_idx)
+        _dist_barrier()
 
-    if is_resuming:
-        best_eval_score, best_eval_update = _restore_best_eval_state_for_resume(
-            resume_state=resume_state,
-            log_path=log_path,
-            reset_best_eval_on_resume=bool(cfg.logging.reset_best_eval_on_resume),
+        tokenizer_name = cfg.model.tokenizer_name_or_path or cfg.model.policy_name_or_path
+        tokenizer_source = (
+            str(resume_ckpt)
+            if resume_ckpt is not None and (resume_ckpt / "tokenizer_config.json").exists()
+            else tokenizer_name
         )
-        if cfg.logging.reset_best_eval_on_resume:
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, use_fast=cfg.model.use_fast_tokenizer)
+        if tokenizer.pad_token is None and tokenizer.eos_token is not None:
+            tokenizer.pad_token = tokenizer.eos_token
+
+        resume_has_hf_artifacts = _checkpoint_has_model_artifacts(resume_ckpt)
+        if use_deepspeed:
+            # Prefer resume dir as model init when it includes HF artifacts (e.g., `best`).
+            # Optimizer/lr states are still restored through DeepSpeed shards when present.
+            policy_source = str(resume_ckpt) if resume_has_hf_artifacts else cfg.model.policy_name_or_path
+        else:
+            policy_source = str(resume_ckpt) if resume_ckpt is not None else cfg.model.policy_name_or_path
+        policy_model = _load_policy_model(cfg, device=device, model_name_or_path=policy_source)
+        _configure_policy_train_memory(policy_model)
+        train_model: Any = policy_model
+        optimizer: torch.optim.Optimizer | None = None
+        if use_deepspeed:
+            train_model, _ = _deepspeed_initialize(cfg, policy_model)
+        policy_runtime_mode = str(cfg.model.policy_runtime_mode or "colocate").strip().lower()
+        if policy_runtime_mode == "separate":
+            if use_deepspeed:
+                raise ValueError(
+                    "model.policy_runtime_mode=separate is not supported with rl.backend=deepspeed. "
+                    "Use model.policy_runtime_mode=colocate."
+                )
+            # Native-only: keep a dedicated rollout/eval policy copy detached from optimizer/backward.
+            policy_eval_model = _load_policy_model(cfg, device=device, model_name_or_path=policy_source)
+        else:
+            policy_eval_model = _unwrap_for_generation(train_model)
+
+        if rank0:
+            configured_attn = str(cfg.model.attn_implementation or "auto").strip() or "auto"
             logger.info(
-                "Resuming training from %s with logging.reset_best_eval_on_resume=true; "
-                "previous best_eval_score/update will be ignored.",
-                resume_ckpt,
+                "Policy attention uses model.attn_implementation=%s (disable_policy_flash_attention=%s).",
+                configured_attn,
+                bool(cfg.model.disable_policy_flash_attention),
+            )
+            logger.info(
+                "Policy runtime mode=%s (colocate means single policy instance is shared for rollout/eval/update).",
+                policy_runtime_mode,
             )
 
-        logger.info(
-            "Resuming training from %s (resume_update=%s, start_update=%s, best_eval_update=%s, best_eval_score=%s)",
-            resume_ckpt,
-            resume_update_idx,
-            start_update,
-            best_eval_update,
-            best_eval_score if math.isfinite(best_eval_score) else None,
-        )
+        vllm_rollout_client: LocalVLLMRolloutClient | None = None
+        if _vllm_rollout_enabled(cfg):
+            vllm_rollout_client = _create_vllm_rollout_client(
+                cfg=cfg,
+                policy_source=policy_source,
+                tokenizer_source=tokenizer_source,
+                output_dir=output_dir,
+                owns_server=bool(rank0),
+                startup_reason="LoRA training",
+            )
+            _dist_barrier()
 
-    if cfg.logging.save_only_best and cfg.logging.save_every_n_updates <= 0:
-        logger.warning(
-            "logging.save_only_best=true with logging.save_every_n_updates<=0: "
-            "resume checkpoints will not be written during training."
-        )
-    if rank0 and cfg.logging.keep_last_n_checkpoints > 0:
-        logger.info(
-            "Periodic checkpoint retention enabled: keep_last_n_checkpoints=%s (best checkpoint is managed separately).",
-            int(cfg.logging.keep_last_n_checkpoints),
-        )
+        ref_model: AutoModelForCausalLM | None = None
+        ref_device: str | None = None
+        ref_logprob_client: ReferenceLogprobClient | None = None
+        ref_logprob_batch_fn: Callable[[list[tuple[list[int], list[int]]]], list[list[float]]] | None = None
+        reference_kl_enabled = _reference_kl_enabled(cfg)
+        reference_runtime = str(cfg.model.reference_runtime or "worker").strip().lower()
+        if rank0 and (float(cfg.rl.kl_coef) > 0.0) and (not reference_kl_enabled):
+            logger.info(
+                "Reference model is disabled (model.use_reference_model=false); KL-to-reference term will be skipped."
+            )
+        if reference_kl_enabled and reference_runtime == "colocate":
+            ref_logprob_batch_fn, ref_device = _create_colocated_reference_logprob_batch_fn(
+                cfg,
+                policy_eval_model,
+                device=device,
+            )
+        elif (not use_deepspeed) or rank0:
+            if reference_kl_enabled:
+                if reference_runtime == "worker":
+                    ref_logprob_client, ref_device = _create_reference_logprob_client(cfg, default_device=device)
+                elif reference_runtime == "cpu":
+                    ref_model, ref_device = _load_reference_model(cfg, default_device="cpu")
+                else:
+                    ref_model, ref_device = _load_reference_model(cfg, default_device=device)
 
-    distributed_eval_shard = bool(use_deepspeed and world_size > 1 and cfg.eval.distributed_shard)
-    if use_deepspeed and world_size > 1 and (not distributed_eval_shard) and rank0:
-        logger.info(
-            "Eval distributed sharding is disabled; keeping all ranks in eval generation to avoid ZeRO/NCCL deadlock."
-        )
-    async_eval_enabled = _should_async_eval_scoring(
-        cfg=cfg,
-        distributed_eval_shard=distributed_eval_shard,
-        metricx_scorer=metricx_scorer,
-        xcomet_scorer=xcomet_scorer,
-        mqm_scorer=mqm_scorer,
-        esa_scorer=esa_scorer,
-    )
-    async_eval_executor: ThreadPoolExecutor | None = (
-        ThreadPoolExecutor(max_workers=1, thread_name_prefix="async-eval")
-        if async_eval_enabled and rank0
-        else None
-    )
-    pending_async_eval: _PendingAsyncEval | None = None
-    if async_eval_enabled and ((not use_deepspeed) or rank0):
-        logger.info(
-            "Async eval scoring enabled: eval rollout generation stays synchronous, "
-            "but MQM/ESA report scoring overlaps the next training rollout before policy update."
-        )
+        train_examples = load_examples(cfg.data, split="train", limit=cfg.data.limit)
+        if not train_examples:
+            raise ValueError(
+                "No train examples loaded. "
+                f"Check data fields and filters: "
+                f"src_text_field={cfg.data.src_text_field!r}, "
+                f"id_field={cfg.data.id_field!r}, "
+                f"skip_bad_source={cfg.data.skip_bad_source}, "
+                f"is_bad_source_field={cfg.data.is_bad_source_field!r}, "
+                f"limit={cfg.data.limit}, "
+                f"hf_dataset_name={cfg.data.hf_dataset_name!r}, "
+                f"hf_train_split={cfg.data.hf_train_split!r}, "
+                f"train_file={cfg.data.train_file!r}, "
+                f"train_dir={cfg.data.train_dir!r}."
+            )
 
-    def _run_eval_once(*, update_idx: int, collect_outputs: bool, show_progress: bool) -> dict[str, Any]:
-        _sync_vllm_rollout_adapter(
-            update_idx=update_idx,
-            vllm_rollout_client=vllm_rollout_client,
-            policy_model=policy_eval_model,
+        batching_strategy = str(cfg.data.batching_strategy or "direction").strip().lower() or "direction"
+        train_prompt_token_lengths: list[int] | None = None
+        needs_train_prompt_lengths = (
+            batching_strategy == "direction_domain_length"
+            or cfg.data.max_prompt_tokens is not None
         )
-        return evaluate_on_dataset(
-            examples=eval_examples,
-            policy_model=policy_eval_model,
-            tokenizer=tokenizer,
+        if needs_train_prompt_lengths:
+            train_prompt_token_lengths, _ = _prepare_split_prompt_token_lengths(
+                cfg=cfg,
+                split="train",
+                examples=train_examples,
+                tokenizer=tokenizer,
+                limit=cfg.data.limit,
+                log_reason=(
+                    "bucketed batching and prompt filtering"
+                    if batching_strategy == "direction_domain_length" and cfg.data.max_prompt_tokens is not None
+                    else "bucketed batching"
+                    if batching_strategy == "direction_domain_length"
+                    else "prompt filtering"
+                ),
+                rank0=rank0,
+            )
+        if train_prompt_token_lengths is not None and cfg.data.max_prompt_tokens is not None:
+            train_examples, train_prompt_token_lengths, _ = _apply_max_prompt_token_filter(
+                cfg=cfg,
+                split="train",
+                examples=train_examples,
+                prompt_lengths=train_prompt_token_lengths,
+                rank0=rank0,
+            )
+            if not train_examples:
+                raise ValueError(
+                    "No train examples remain after applying data.max_prompt_tokens="
+                    f"{int(cfg.data.max_prompt_tokens)}."
+                )
+
+        eval_limit = cfg.eval.eval_limit if cfg.eval.eval_limit is not None else cfg.data.eval_limit
+        eval_examples = load_examples(cfg.data, split="eval", limit=eval_limit)
+        if eval_limit is not None and len(eval_examples) > int(eval_limit):
+            eval_examples = eval_examples[: int(eval_limit)]
+        if eval_examples and cfg.data.max_prompt_tokens is not None:
+            eval_prompt_token_lengths, _ = _prepare_split_prompt_token_lengths(
+                cfg=cfg,
+                split="eval",
+                examples=eval_examples,
+                tokenizer=tokenizer,
+                limit=eval_limit,
+                log_reason="prompt filtering",
+                rank0=rank0,
+            )
+            eval_examples, _, _ = _apply_max_prompt_token_filter(
+                cfg=cfg,
+                split="eval",
+                examples=eval_examples,
+                prompt_lengths=eval_prompt_token_lengths,
+                rank0=rank0,
+            )
+        logger.info(
+            "Prepared eval examples: requested_limit=%s loaded=%s eval_file=%s hf_eval_split=%s",
+            eval_limit,
+            len(eval_examples),
+            cfg.data.eval_file,
+            cfg.data.hf_eval_split,
+        )
+        if (
+            cfg.data.hf_dataset_name
+            and not cfg.data.eval_file
+            and (cfg.data.hf_eval_split or cfg.data.hf_train_split) == cfg.data.hf_train_split
+        ):
+            logger.warning(
+                "Eval is currently read from the same HF split as train (%s). "
+                "For SFT eval-set selection, set data.eval_file (recommended) or data.hf_eval_split to a distinct split.",
+                cfg.data.hf_train_split,
+            )
+
+        if not (cfg.reward.mqm.source_lang or "").strip():
+            cfg.reward.mqm.source_lang = cfg.data.default_src_lang
+        if not (cfg.reward.mqm.target_lang or "").strip():
+            cfg.reward.mqm.target_lang = cfg.data.default_tgt_lang
+        if not (cfg.reward.esa.source_lang or "").strip():
+            cfg.reward.esa.source_lang = cfg.data.default_src_lang
+        if not (cfg.reward.esa.target_lang or "").strip():
+            cfg.reward.esa.target_lang = cfg.data.default_tgt_lang
+
+        metricx_scorer = (
+            MetricXQEScorer(cfg.reward.metricx) if cfg.reward.metricx.enabled and ((not use_deepspeed) or rank0) else None
+        )
+        xcomet_runtime_enabled = _should_enable_xcomet_runtime(cfg)
+        xcomet_scorer = (
+            XCometXLScorer(cfg.reward.xcomet) if xcomet_runtime_enabled and ((not use_deepspeed) or rank0) else None
+        )
+        mqm_scorer = (
+            OpenAICompatibleMQMScorer(
+                cfg.reward.mqm,
+                parse_failure_log_path=output_dir / cfg.logging.mqm_parse_failure_jsonl_name,
+            )
+            if cfg.reward.mqm.enabled and ((not use_deepspeed) or rank0)
+            else None
+        )
+        esa_runtime_cfg = _effective_esa_runtime_cfg(cfg)
+        esa_runtime_enabled = bool(esa_runtime_cfg.enabled)
+        esa_scorer = (
+            OpenAICompatibleESAScorer(
+                esa_runtime_cfg,
+                parse_failure_log_path=output_dir / cfg.logging.esa_parse_failure_jsonl_name,
+            )
+            if esa_runtime_enabled and ((not use_deepspeed) or rank0)
+            else None
+        )
+        group_rank_scorer = (
+            OpenAICompatibleGroupRankScorer(
+                cfg.reward.group_rank,
+                parse_failure_log_path=output_dir / cfg.logging.group_rank_parse_failure_jsonl_name,
+            )
+            if cfg.reward.group_rank.enabled and ((not use_deepspeed) or rank0)
+            else None
+        )
+        if rank0:
+            effective_esa_weight = float(cfg.reward.w_esa_seq) * float(cfg.reward.esa_seq_scale)
+            effective_group_rank_weight = float(cfg.reward.w_group_rank_seq) * float(cfg.reward.group_rank_seq_scale)
+            logger.info(
+                "reward config: esa_enabled=%s esa_runtime=%s w_esa_seq=%.6f esa_seq_scale=%.6f "
+                "effective_esa_weight=%.6f score_range=[%.3f, %.3f] scale_to_unit_interval=%s error_policy=%s",
+                bool(esa_runtime_enabled),
+                bool(esa_scorer is not None),
+                float(cfg.reward.w_esa_seq),
+                float(cfg.reward.esa_seq_scale),
+                effective_esa_weight,
+                float(cfg.reward.esa.score_min),
+                float(cfg.reward.esa.score_max),
+                bool(cfg.reward.esa.scale_to_unit_interval),
+                str(cfg.reward.esa.error_policy),
+            )
+            if esa_runtime_enabled and abs(effective_esa_weight) <= 0.0:
+                logger.warning(
+                    "ESA is enabled but effective sequence weight is 0.0 "
+                    "(w_esa_seq * esa_seq_scale == 0). ESA score will not affect loss."
+                )
+            if esa_runtime_enabled and float(cfg.reward.esa.score_max) <= 0.0:
+                logger.warning(
+                    "reward.esa.score_max <= 0.0. GEMBA-ESA usually returns 0..100, "
+                    "so outputs may clip to 0.0. Recommended range is score_min=0, score_max=100."
+                )
+            if esa_runtime_enabled and str(cfg.reward.esa.error_policy).strip().lower() == "zero":
+                logger.warning(
+                    "reward.esa.error_policy=zero: ESA API/parsing failures are converted to 0.0."
+                )
+            logger.info(
+                "reward config: group_rank_enabled=%s group_rank_runtime=%s w_group_rank_seq=%.6f "
+                "group_rank_seq_scale=%.6f effective_group_rank_weight=%.6f candidate_range=[%s, %s] "
+                "deduplicate_exact_candidates=%s duplicate_text_normalization=%s failure_policy=%s",
+                bool(cfg.reward.group_rank.enabled),
+                bool(group_rank_scorer is not None),
+                float(cfg.reward.w_group_rank_seq),
+                float(cfg.reward.group_rank_seq_scale),
+                effective_group_rank_weight,
+                int(cfg.reward.group_rank.candidate_min),
+                int(cfg.reward.group_rank.candidate_max),
+                bool(cfg.reward.group_rank.deduplicate_exact_candidates),
+                str(cfg.reward.group_rank.duplicate_text_normalization),
+                str(cfg.reward.group_rank.failure_policy),
+            )
+            if cfg.reward.group_rank.enabled and abs(effective_group_rank_weight) <= 0.0:
+                logger.warning(
+                    "group rank is enabled but effective sequence weight is 0.0 "
+                    "(w_group_rank_seq * group_rank_seq_scale == 0)."
+                )
+
+        if not use_deepspeed:
+            optimizer = torch.optim.AdamW(
+                [p for p in policy_model.parameters() if p.requires_grad],
+                lr=cfg.rl.lr,
+                weight_decay=cfg.rl.weight_decay,
+            )
+            if is_resuming:
+                optimizer_path = resume_ckpt / "optimizer.pt"
+                if optimizer_path.exists():
+                    optimizer_state = torch.load(optimizer_path, map_location="cpu")
+                    optimizer.load_state_dict(optimizer_state)
+                else:
+                    logger.warning("Resume checkpoint has no optimizer.pt: %s", resume_ckpt)
+        elif is_resuming and resume_ckpt is not None:
+            if _is_deepspeed_checkpoint_dir(resume_ckpt):
+                ds_resume_failed = False
+                try:
+                    load_path, _ = train_model.load_checkpoint(
+                        str(resume_ckpt),
+                        tag="state",
+                        load_optimizer_states=True,
+                        load_lr_scheduler_states=False,
+                    )
+                    if load_path is None and rank0:
+                        logger.warning("DeepSpeed resume checkpoint could not be loaded from %s", resume_ckpt)
+                        ds_resume_failed = True
+                except AssertionError as exc:
+                    # DeepSpeed can assert on empty ckpt shard list when shard files are
+                    # missing for current rank/world-size. In that case, keep model
+                    # weights already loaded from `policy_source` and reset optimizer.
+                    text = str(exc)
+                    if _is_deepspeed_resume_shard_mismatch_error(exc):
+                        ds_resume_failed = True
+                        if rank0:
+                            logger.warning(
+                                "DeepSpeed optimizer-state resume failed from %s due to shard mismatch (%s). "
+                                "Continuing with model weights from %s and resetting optimizer state.",
+                                resume_ckpt,
+                                text or type(exc).__name__,
+                                policy_source,
+                            )
+                    else:
+                        raise RuntimeError(f"Failed to load DeepSpeed checkpoint from {resume_ckpt}") from exc
+                except Exception as exc:
+                    raise RuntimeError(f"Failed to load DeepSpeed checkpoint from {resume_ckpt}") from exc
+                if ds_resume_failed and rank0:
+                    logger.warning(
+                        "DeepSpeed resume fallback active: start_update=%s (from trainer_state), "
+                        "but optimizer/momentum states were not restored.",
+                        start_update,
+                    )
+            elif rank0:
+                logger.warning(
+                    "Resume checkpoint has no DeepSpeed shard states: %s. "
+                    "Continuing with model weights only from %s (optimizer state reset).",
+                    resume_ckpt,
+                    policy_source,
+                )
+
+        artifacts: dict[str, Any] = {
+            "output_dir": str(output_dir),
+            "checkpoints": [],
+        }
+        if is_resuming and resume_ckpt is not None:
+            artifacts["resumed_from"] = str(resume_ckpt)
+            artifacts["resume_update"] = resume_update_idx
+
+        async_json_writer: _AsyncJsonlWriter | None = _AsyncJsonlWriter() if ((not use_deepspeed) or rank0) else None
+
+        def _log_json_row(payload: dict[str, Any]) -> None:
+            if async_json_writer is not None:
+                async_json_writer.append_json(log_path, payload)
+            else:
+                _append_jsonl(log_path, payload)
+
+        def _log_monitor_metrics(*, prefix: str, payload: dict[str, Any], step: int) -> None:
+            if experiment_tracker is not None:
+                experiment_tracker.log_metrics(prefix=prefix, payload=payload, step=step)
+
+        def _log_rollout_rows(
+            *,
+            update_idx: int,
+            rollouts: list[Rollout],
+            advantages: list[list[float]],
+            reward_stats: dict[str, float],
+        ) -> None:
+            if async_json_writer is not None:
+                async_json_writer.append_rollouts(
+                    path=rollout_log_path,
+                    update_idx=update_idx,
+                    rollouts=rollouts,
+                    advantages=advantages,
+                    reward_stats=reward_stats,
+                )
+            else:
+                _append_rollout_jsonl(
+                    path=rollout_log_path,
+                    update_idx=update_idx,
+                    rollouts=rollouts,
+                    advantages=advantages,
+                    reward_stats=reward_stats,
+                )
+
+        def _log_eval_rows(*, update_idx: int, eval_rows: list[dict[str, Any]]) -> None:
+            if async_json_writer is not None:
+                async_json_writer.append_eval_rows(
+                    path=eval_output_path,
+                    update_idx=update_idx,
+                    eval_rows=eval_rows,
+                )
+            else:
+                _append_eval_output_jsonl(eval_output_path, update_idx=update_idx, eval_rows=eval_rows)
+
+        best_dir = output_dir / "best"
+        best_eval_score = float("-inf")
+        best_eval_update: int | None = None
+
+        def _sync_and_save_best_checkpoint(candidate_score: float | None, *, update_idx: int) -> None:
+            nonlocal best_eval_score, best_eval_update
+
+            is_new_best_local = False
+            best_score_local: float | None = None
+            if rank0 and candidate_score is not None:
+                try:
+                    parsed_score = float(candidate_score)
+                except (TypeError, ValueError):
+                    parsed_score = float("-inf")
+                if math.isfinite(parsed_score) and parsed_score > best_eval_score:
+                    is_new_best_local = True
+                    best_score_local = parsed_score
+
+            shared: list[Any] = [
+                {
+                    "is_new_best": bool(is_new_best_local),
+                    "update_idx": int(update_idx),
+                    "score": best_score_local,
+                }
+                if rank0
+                else None
+            ]
+            _broadcast_object_list(shared, src=0)
+            payload = shared[0] if shared and isinstance(shared[0], dict) else {}
+            should_save = bool(payload.get("is_new_best", False))
+            if not should_save:
+                return
+
+            resolved_update_idx = int(payload.get("update_idx", update_idx))
+            score_raw = payload.get("score")
+            try:
+                resolved_score = float(score_raw)
+            except (TypeError, ValueError):
+                resolved_score = float("-inf")
+            if not math.isfinite(resolved_score):
+                return
+
+            trainer_state_payload = {
+                "update_idx": int(resolved_update_idx),
+                "best_eval_update": int(resolved_update_idx),
+                "best_eval_score": float(resolved_score),
+            }
+
+            if use_deepspeed:
+                _save_deepspeed_checkpoint_to_dir(
+                    ckpt_dir=best_dir,
+                    engine=train_model,
+                    tokenizer=tokenizer,
+                    hf_model=policy_eval_model,
+                    trainer_state=trainer_state_payload,
+                )
+            elif rank0:
+                assert optimizer is not None
+                _save_checkpoint_to_dir(
+                    ckpt_dir=best_dir,
+                    model=policy_eval_model,
+                    tokenizer=tokenizer,
+                    optimizer=optimizer,
+                    trainer_state=trainer_state_payload,
+                )
+
+            if rank0:
+                best_eval_score = resolved_score
+                best_eval_update = resolved_update_idx
+                logger.info("new best eval at update=%s score=%.6f", resolved_update_idx, resolved_score)
+
+        if is_resuming:
+            best_eval_score, best_eval_update = _restore_best_eval_state_for_resume(
+                resume_state=resume_state,
+                log_path=log_path,
+                reset_best_eval_on_resume=bool(cfg.logging.reset_best_eval_on_resume),
+            )
+            if cfg.logging.reset_best_eval_on_resume:
+                logger.info(
+                    "Resuming training from %s with logging.reset_best_eval_on_resume=true; "
+                    "previous best_eval_score/update will be ignored.",
+                    resume_ckpt,
+                )
+
+            logger.info(
+                "Resuming training from %s (resume_update=%s, start_update=%s, best_eval_update=%s, best_eval_score=%s)",
+                resume_ckpt,
+                resume_update_idx,
+                start_update,
+                best_eval_update,
+                best_eval_score if math.isfinite(best_eval_score) else None,
+            )
+
+        if cfg.logging.save_only_best and cfg.logging.save_every_n_updates <= 0:
+            logger.warning(
+                "logging.save_only_best=true with logging.save_every_n_updates<=0: "
+                "resume checkpoints will not be written during training."
+            )
+        if rank0 and cfg.logging.keep_last_n_checkpoints > 0:
+            logger.info(
+                "Periodic checkpoint retention enabled: keep_last_n_checkpoints=%s (best checkpoint is managed separately).",
+                int(cfg.logging.keep_last_n_checkpoints),
+            )
+
+        distributed_eval_shard = bool(use_deepspeed and world_size > 1 and cfg.eval.distributed_shard)
+        if use_deepspeed and world_size > 1 and (not distributed_eval_shard) and rank0:
+            logger.info(
+                "Eval distributed sharding is disabled; keeping all ranks in eval generation to avoid ZeRO/NCCL deadlock."
+            )
+        async_eval_enabled = _should_async_eval_scoring(
             cfg=cfg,
-            device=device,
-            vllm_rollout_client=vllm_rollout_client,
+            distributed_eval_shard=distributed_eval_shard,
             metricx_scorer=metricx_scorer,
             xcomet_scorer=xcomet_scorer,
             mqm_scorer=mqm_scorer,
             esa_scorer=esa_scorer,
-            collect_outputs=collect_outputs,
-            show_progress=show_progress,
-            distributed_eval_shard=distributed_eval_shard,
-            distributed_rank=rank,
-            distributed_world_size=world_size,
         )
-
-    def _finalize_eval_report(
-        *,
-        report: dict[str, Any] | None,
-        update_idx: int,
-        run_before_train: bool,
-    ) -> float | None:
-        eval_select_score: float | None = None
-        if (not use_deepspeed) or rank0:
-            assert report is not None
-            eval_select_score = _compute_eval_selection_score(report, cfg)
-            report_payload = dict(report)
-            report_payload["model_select_score"] = eval_select_score
-            eval_rows = report_payload.pop("eval_rows", [])
-            _log_json_row({"type": "eval", "update": update_idx, **report_payload})
-            _log_monitor_metrics(prefix="eval", payload=report_payload, step=update_idx)
-            if cfg.logging.save_eval_outputs:
-                _log_eval_rows(update_idx=update_idx, eval_rows=eval_rows)
-            stage_text = " (run_before_train)" if run_before_train else ""
+        async_eval_executor: ThreadPoolExecutor | None = (
+            ThreadPoolExecutor(max_workers=1, thread_name_prefix="async-eval")
+            if async_eval_enabled and rank0
+            else None
+        )
+        pending_async_eval: _PendingAsyncEval | None = None
+        if async_eval_enabled and ((not use_deepspeed) or rank0):
             logger.info(
-                "finished eval%s: update=%s model_select_score=%.6f metricx=%.4f xcomet=%.4f mqm=%.4f esa=%.4f",
-                stage_text,
-                update_idx,
-                float(eval_select_score),
-                float(report_payload.get("metricx_score_mean", 0.0)),
-                float(report_payload.get("xcomet_score_mean", 0.0)),
-                float(report_payload.get("mqm_score_mean", 0.0)),
-                float(report_payload.get("esa_score_mean", 0.0)),
-            )
-        _sync_and_save_best_checkpoint(eval_select_score if rank0 else None, update_idx=update_idx)
-        return eval_select_score
-
-    def _launch_async_eval(
-        *,
-        update_idx: int,
-        run_before_train: bool,
-        collect_outputs: bool,
-        show_progress: bool,
-    ) -> None:
-        nonlocal pending_async_eval
-        if pending_async_eval is not None:
-            _maybe_finalize_pending_async_eval(block=True)
-        _sync_vllm_rollout_adapter(
-            update_idx=update_idx,
-            vllm_rollout_client=vllm_rollout_client,
-            policy_model=policy_eval_model,
-        )
-        eval_rollouts = prepare_eval_rollouts(
-            examples=eval_examples,
-            policy_model=policy_eval_model,
-            tokenizer=tokenizer,
-            cfg=cfg,
-            device=device,
-            vllm_rollout_client=vllm_rollout_client,
-            show_progress=show_progress,
-            distributed_eval_shard=distributed_eval_shard,
-            distributed_rank=rank,
-            distributed_world_size=world_size,
-        )
-        future = None
-        if rank0:
-            assert async_eval_executor is not None
-            future = async_eval_executor.submit(
-                build_eval_report_from_rollouts,
-                rollouts=eval_rollouts,
-                tokenizer=tokenizer,
-                cfg=cfg,
-                metricx_scorer=metricx_scorer,
-                xcomet_scorer=xcomet_scorer,
-                mqm_scorer=mqm_scorer,
-                esa_scorer=esa_scorer,
-                collect_outputs=collect_outputs,
-            )
-        pending_async_eval = _PendingAsyncEval(
-            update_idx=update_idx,
-            run_before_train=run_before_train,
-            future=future,
-        )
-
-    def _maybe_finalize_pending_async_eval(*, block: bool) -> bool:
-        nonlocal pending_async_eval
-        if pending_async_eval is None:
-            return False
-
-        should_finalize_local = False
-        if rank0:
-            future = pending_async_eval.future
-            should_finalize_local = bool(block or future is None or future.done())
-        ready_shared: list[Any] = [should_finalize_local if rank0 else False]
-        _broadcast_object_list(ready_shared, src=0)
-        if not bool(ready_shared[0]):
-            return False
-
-        report: dict[str, Any] | None = None
-        error_text: str | None = None
-        pending = pending_async_eval
-        if rank0:
-            try:
-                if pending.future is None:
-                    raise RuntimeError("Pending async eval future is missing on rank0.")
-                report = pending.future.result()
-            except Exception as exc:
-                logger.exception("Async eval scoring failed at update=%s", pending.update_idx)
-                error_text = f"{type(exc).__name__}: {exc}"
-
-        error_shared: list[Any] = [error_text if rank0 else None]
-        _broadcast_object_list(error_shared, src=0)
-        pending_async_eval = None
-        if error_shared[0]:
-            raise RuntimeError(f"Async eval scoring failed at update={pending.update_idx}: {error_shared[0]}")
-
-        _finalize_eval_report(
-            report=report if rank0 else None,
-            update_idx=pending.update_idx,
-            run_before_train=pending.run_before_train,
-        )
-        return True
-
-    run_before_train_eval = _should_run_eval_before_train(
-        eval_enabled=bool(cfg.eval.run_before_train),
-        has_eval_examples=bool(eval_examples),
-        start_update=start_update,
-        reset_best_eval_on_resume=bool(cfg.logging.reset_best_eval_on_resume),
-    )
-    run_before_train_eval_update_idx = _resolve_run_before_train_eval_update_idx(
-        is_resuming=is_resuming,
-        resume_update_idx=resume_update_idx,
-        reset_best_eval_on_resume=bool(cfg.logging.reset_best_eval_on_resume),
-    )
-
-    if run_before_train_eval:
-        if (not use_deepspeed) or rank0:
-            logger.info(
-                "starting eval%s: update=%s examples=%s metricx=%s xcomet=%s mqm=%s esa=%s",
-                " async" if async_eval_enabled else " (run_before_train)",
-                run_before_train_eval_update_idx,
-                len(eval_examples),
-                bool(metricx_scorer is not None and cfg.reward.metricx.enabled),
-                bool(xcomet_scorer is not None and xcomet_runtime_enabled),
-                bool(mqm_scorer is not None and cfg.reward.mqm.enabled),
-                bool(esa_scorer is not None and cfg.reward.esa.enabled),
-            )
-        collect_eval_outputs = bool(cfg.logging.save_eval_outputs and ((not use_deepspeed) or rank0))
-        show_eval_progress = bool((not use_deepspeed) or rank0)
-        if async_eval_enabled:
-            _launch_async_eval(
-                update_idx=run_before_train_eval_update_idx,
-                run_before_train=True,
-                collect_outputs=collect_eval_outputs,
-                show_progress=show_eval_progress,
-            )
-        else:
-            report = _run_eval_once(
-                update_idx=run_before_train_eval_update_idx,
-                collect_outputs=collect_eval_outputs,
-                show_progress=show_eval_progress,
-            )
-            _finalize_eval_report(
-                report=report if ((not use_deepspeed) or rank0) else None,
-                update_idx=run_before_train_eval_update_idx,
-                run_before_train=True,
-            )
-            _dist_barrier()
-    elif cfg.eval.run_before_train and eval_examples and start_update > 1:
-        logger.info(
-            "Skipping run_before_train eval because training is resumed from update=%s.",
-            start_update - 1,
-        )
-
-    metricx_cache: dict[tuple[str, str, str], float] = {}
-    xcomet_cache: dict[tuple[str, str, str], tuple[float, list[dict[str, Any]]]] = {}
-    mqm_cache: dict[tuple[str, str, str, str, str], tuple[float, list[dict[str, Any]], list[dict[str, Any]]]] = {}
-    esa_cache: dict[tuple[str, str, str, str, str], float] = {}
-    rng = random.Random(cfg.misc.seed)
-    per_rank_batch_size = max(1, int(cfg.rl.batch_size))
-    effective_batch_size = per_rank_batch_size * (world_size if (use_deepspeed and world_size > 1) else 1)
-    if batching_strategy == "direction_domain_length":
-        if train_prompt_token_lengths is None:
-            raise RuntimeError("prompt token lengths must be prepared for direction_domain_length batching")
-        train_batch_sampler: _DirectionBatchSampler | _DirectionDomainLengthBatchSampler = (
-            _DirectionDomainLengthBatchSampler(
-                examples=train_examples,
-                prompt_token_lengths=train_prompt_token_lengths,
-                effective_batch_size=effective_batch_size,
-                rng=rng,
-            )
-        )
-    else:
-        train_batch_sampler = _DirectionBatchSampler(examples=train_examples, rng=rng)
-    updates_per_epoch = math.ceil(len(train_examples) / max(1, effective_batch_size))
-    if (not use_deepspeed) or rank0:
-        logger.info(
-            "train_examples=%s per_rank_batch_size=%s effective_batch_size=%s updates_per_epoch=%s configured_updates=%s",
-            len(train_examples),
-            per_rank_batch_size,
-            effective_batch_size,
-            updates_per_epoch,
-            cfg.rl.updates,
-        )
-        if batching_strategy == "direction_domain_length":
-            logger.info(
-                "Direction/domain/length train batching enabled: groups=%s effective_batch_size=%s",
-                len(train_batch_sampler.group_keys),
-                effective_batch_size,
-            )
-        elif len(train_batch_sampler.directions) > 1:
-            logger.info(
-                "Directional train batching enabled: each update uses a single direction. directions=%s",
-                train_batch_sampler.directions,
+                "Async eval scoring enabled: eval rollout generation stays synchronous, "
+                "but MQM/ESA report scoring overlaps the next training rollout before policy update."
             )
 
-    if start_update > cfg.rl.updates:
-        logger.info(
-            "Nothing to train: start_update=%s exceeds configured updates=%s.",
-            start_update,
-            cfg.rl.updates,
-        )
-
-    for update_idx in range(start_update, cfg.rl.updates + 1):
-        rollouts: list[Rollout] = []
-        advantages: list[list[float]] = []
-        reward_stats: dict[str, float] = {}
-        adv_stats: dict[str, float] = {}
-        log_rollouts: list[Rollout] = rollouts
-        log_advantages: list[list[float]] = advantages
-        _sync_vllm_rollout_adapter(
-            update_idx=update_idx,
-            vllm_rollout_client=vllm_rollout_client,
-            policy_model=policy_eval_model,
-        )
-        if use_deepspeed and world_size > 1:
-            per_rank_batches: list[list[int]] = []
-            batch_direction = ""
-            if rank0:
-                global_batch_size = per_rank_batch_size * world_size
-                batch_direction, global_indices = train_batch_sampler.next_batch(global_batch_size)
-                per_rank_batches = [
-                    global_indices[i * per_rank_batch_size : (i + 1) * per_rank_batch_size]
-                    for i in range(world_size)
-                ]
-
-            shared_batch: list[Any] = [per_rank_batches, batch_direction if rank0 else ""]
-            _broadcast_object_list(shared_batch, src=0)
-            per_rank_batches = shared_batch[0] or []
-            batch_direction = str(shared_batch[1] or "")
-            local_indices = (
-                [int(i) for i in per_rank_batches[rank]]
-                if rank < len(per_rank_batches)
-                else []
+        def _run_eval_once(*, update_idx: int, collect_outputs: bool, show_progress: bool) -> dict[str, Any]:
+            _sync_vllm_rollout_adapter(
+                update_idx=update_idx,
+                vllm_rollout_client=vllm_rollout_client,
+                policy_model=policy_eval_model,
             )
-            if not local_indices:
-                logger.warning("Rank %s has empty rollout shard at update=%s; skipping step.", rank, update_idx)
-            local_examples = [train_examples[i] for i in local_indices]
-            if local_examples and rank0:
-                _log_selected_training_batch(
-                    update_idx=update_idx,
-                    examples=train_examples,
-                    batch_indices=global_indices,
-                    prompt_token_lengths=train_prompt_token_lengths,
-                )
-            local_prompt_instance_ids = [
-                f"u{update_idx}:r{rank}:p{pos}:idx{int(local_indices[pos])}"
-                for pos in range(len(local_examples))
-            ]
-
-            _set_rollout_sampling_seed(cfg.misc.seed + update_idx + (rank * 1009))
-            local_rollouts = _generate_training_rollouts(
-                examples=local_examples,
+            return evaluate_on_dataset(
+                examples=eval_examples,
                 policy_model=policy_eval_model,
                 tokenizer=tokenizer,
                 cfg=cfg,
                 device=device,
                 vllm_rollout_client=vllm_rollout_client,
-                ref_model=None,
-                ref_device=None,
-                # In distributed mode we fill reference logprobs later in rank0 batch
-                # (`_fill_missing_reference_logprobs`). Avoid per-sample worker calls here,
-                # which are fragile under long-running CUDA workers.
-                ref_logprob_fn=None,
-                show_progress=bool(rank0),
-                progress_desc=f"rollout u{update_idx}",
-                prompt_instance_ids=local_prompt_instance_ids,
+                metricx_scorer=metricx_scorer,
+                xcomet_scorer=xcomet_scorer,
+                mqm_scorer=mqm_scorer,
+                esa_scorer=esa_scorer,
+                collect_outputs=collect_outputs,
+                show_progress=show_progress,
+                distributed_eval_shard=distributed_eval_shard,
+                distributed_rank=rank,
+                distributed_world_size=world_size,
             )
-            gathered_rollouts = _gather_object_to_rank0(local_rollouts)
-            per_rank_payload: list[Any] | None = None
-            shared_stats: list[Any] = [reward_stats if rank0 else {}, adv_stats if rank0 else {}]
-            per_rank_rollouts: list[list[Rollout]] = []
-            merged_rollouts: list[Rollout] = []
-            merged_advantages: list[list[float]] = []
+
+        def _finalize_eval_report(
+            *,
+            report: dict[str, Any] | None,
+            update_idx: int,
+            run_before_train: bool,
+        ) -> float | None:
+            eval_select_score: float | None = None
+            if (not use_deepspeed) or rank0:
+                assert report is not None
+                eval_select_score = _compute_eval_selection_score(report, cfg)
+                report_payload = dict(report)
+                report_payload["model_select_score"] = eval_select_score
+                eval_rows = report_payload.pop("eval_rows", [])
+                _log_json_row({"type": "eval", "update": update_idx, **report_payload})
+                _log_monitor_metrics(prefix="eval", payload=report_payload, step=update_idx)
+                if cfg.logging.save_eval_outputs:
+                    _log_eval_rows(update_idx=update_idx, eval_rows=eval_rows)
+                stage_text = " (run_before_train)" if run_before_train else ""
+                logger.info(
+                    "finished eval%s: update=%s model_select_score=%.6f metricx=%.4f xcomet=%.4f mqm=%.4f esa=%.4f",
+                    stage_text,
+                    update_idx,
+                    float(eval_select_score),
+                    float(report_payload.get("metricx_score_mean", 0.0)),
+                    float(report_payload.get("xcomet_score_mean", 0.0)),
+                    float(report_payload.get("mqm_score_mean", 0.0)),
+                    float(report_payload.get("esa_score_mean", 0.0)),
+                )
+            _sync_and_save_best_checkpoint(eval_select_score if rank0 else None, update_idx=update_idx)
+            return eval_select_score
+
+        def _launch_async_eval(
+            *,
+            update_idx: int,
+            run_before_train: bool,
+            collect_outputs: bool,
+            show_progress: bool,
+        ) -> None:
+            nonlocal pending_async_eval
+            if pending_async_eval is not None:
+                _maybe_finalize_pending_async_eval(block=True)
+            _sync_vllm_rollout_adapter(
+                update_idx=update_idx,
+                vllm_rollout_client=vllm_rollout_client,
+                policy_model=policy_eval_model,
+            )
+            eval_rollouts = prepare_eval_rollouts(
+                examples=eval_examples,
+                policy_model=policy_eval_model,
+                tokenizer=tokenizer,
+                cfg=cfg,
+                device=device,
+                vllm_rollout_client=vllm_rollout_client,
+                show_progress=show_progress,
+                distributed_eval_shard=distributed_eval_shard,
+                distributed_rank=rank,
+                distributed_world_size=world_size,
+            )
+            future = None
             if rank0:
-                for shard_idx in range(world_size):
-                    shard_rollouts: list[Rollout] = []
-                    if gathered_rollouts is not None and shard_idx < len(gathered_rollouts):
-                        raw_shard = gathered_rollouts[shard_idx]
-                        if isinstance(raw_shard, list):
-                            shard_rollouts = [r for r in raw_shard if isinstance(r, Rollout)]
-                    per_rank_rollouts.append(shard_rollouts)
+                assert async_eval_executor is not None
+                future = async_eval_executor.submit(
+                    build_eval_report_from_rollouts,
+                    rollouts=eval_rollouts,
+                    tokenizer=tokenizer,
+                    cfg=cfg,
+                    metricx_scorer=metricx_scorer,
+                    xcomet_scorer=xcomet_scorer,
+                    mqm_scorer=mqm_scorer,
+                    esa_scorer=esa_scorer,
+                    collect_outputs=collect_outputs,
+                )
+            pending_async_eval = _PendingAsyncEval(
+                update_idx=update_idx,
+                run_before_train=run_before_train,
+                future=future,
+            )
 
-                for shard_rollouts in per_rank_rollouts:
-                    merged_rollouts.extend(shard_rollouts)
+        def _maybe_finalize_pending_async_eval(*, block: bool) -> bool:
+            nonlocal pending_async_eval
+            if pending_async_eval is None:
+                return False
 
-                if merged_rollouts:
-                    if reference_kl_enabled and ref_logprob_batch_fn is None:
-                        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="rank0-step") as step_executor:
-                            reward_future = step_executor.submit(
-                                _prepare_rewards_and_advantages,
+            should_finalize_local = False
+            if rank0:
+                future = pending_async_eval.future
+                should_finalize_local = bool(block or future is None or future.done())
+            ready_shared: list[Any] = [should_finalize_local if rank0 else False]
+            _broadcast_object_list(ready_shared, src=0)
+            if not bool(ready_shared[0]):
+                return False
+
+            report: dict[str, Any] | None = None
+            error_text: str | None = None
+            pending = pending_async_eval
+            if rank0:
+                try:
+                    if pending.future is None:
+                        raise RuntimeError("Pending async eval future is missing on rank0.")
+                    report = pending.future.result()
+                except Exception as exc:
+                    logger.exception("Async eval scoring failed at update=%s", pending.update_idx)
+                    error_text = f"{type(exc).__name__}: {exc}"
+
+            error_shared: list[Any] = [error_text if rank0 else None]
+            _broadcast_object_list(error_shared, src=0)
+            pending_async_eval = None
+            if error_shared[0]:
+                raise RuntimeError(f"Async eval scoring failed at update={pending.update_idx}: {error_shared[0]}")
+
+            _finalize_eval_report(
+                report=report if rank0 else None,
+                update_idx=pending.update_idx,
+                run_before_train=pending.run_before_train,
+            )
+            return True
+
+        run_before_train_eval = _should_run_eval_before_train(
+            eval_enabled=bool(cfg.eval.run_before_train),
+            has_eval_examples=bool(eval_examples),
+            start_update=start_update,
+            reset_best_eval_on_resume=bool(cfg.logging.reset_best_eval_on_resume),
+        )
+        run_before_train_eval_update_idx = _resolve_run_before_train_eval_update_idx(
+            is_resuming=is_resuming,
+            resume_update_idx=resume_update_idx,
+            reset_best_eval_on_resume=bool(cfg.logging.reset_best_eval_on_resume),
+        )
+
+        if run_before_train_eval:
+            if (not use_deepspeed) or rank0:
+                logger.info(
+                    "starting eval%s: update=%s examples=%s metricx=%s xcomet=%s mqm=%s esa=%s",
+                    " async" if async_eval_enabled else " (run_before_train)",
+                    run_before_train_eval_update_idx,
+                    len(eval_examples),
+                    bool(metricx_scorer is not None and cfg.reward.metricx.enabled),
+                    bool(xcomet_scorer is not None and xcomet_runtime_enabled),
+                    bool(mqm_scorer is not None and cfg.reward.mqm.enabled),
+                    bool(esa_scorer is not None and cfg.reward.esa.enabled),
+                )
+            collect_eval_outputs = bool(cfg.logging.save_eval_outputs and ((not use_deepspeed) or rank0))
+            show_eval_progress = bool((not use_deepspeed) or rank0)
+            if async_eval_enabled:
+                _launch_async_eval(
+                    update_idx=run_before_train_eval_update_idx,
+                    run_before_train=True,
+                    collect_outputs=collect_eval_outputs,
+                    show_progress=show_eval_progress,
+                )
+            else:
+                report = _run_eval_once(
+                    update_idx=run_before_train_eval_update_idx,
+                    collect_outputs=collect_eval_outputs,
+                    show_progress=show_eval_progress,
+                )
+                _finalize_eval_report(
+                    report=report if ((not use_deepspeed) or rank0) else None,
+                    update_idx=run_before_train_eval_update_idx,
+                    run_before_train=True,
+                )
+                _dist_barrier()
+        elif cfg.eval.run_before_train and eval_examples and start_update > 1:
+            logger.info(
+                "Skipping run_before_train eval because training is resumed from update=%s.",
+                start_update - 1,
+            )
+
+        metricx_cache: dict[tuple[str, str, str], float] = {}
+        xcomet_cache: dict[tuple[str, str, str], tuple[float, list[dict[str, Any]]]] = {}
+        mqm_cache: dict[tuple[str, str, str, str, str], tuple[float, list[dict[str, Any]], list[dict[str, Any]]]] = {}
+        esa_cache: dict[tuple[str, str, str, str, str], float] = {}
+        rng = random.Random(cfg.misc.seed)
+        per_rank_batch_size = max(1, int(cfg.rl.batch_size))
+        effective_batch_size = per_rank_batch_size * (world_size if (use_deepspeed and world_size > 1) else 1)
+        if batching_strategy == "direction_domain_length":
+            if train_prompt_token_lengths is None:
+                raise RuntimeError("prompt token lengths must be prepared for direction_domain_length batching")
+            train_batch_sampler: _DirectionBatchSampler | _DirectionDomainLengthBatchSampler = (
+                _DirectionDomainLengthBatchSampler(
+                    examples=train_examples,
+                    prompt_token_lengths=train_prompt_token_lengths,
+                    effective_batch_size=effective_batch_size,
+                    rng=rng,
+                )
+            )
+        else:
+            train_batch_sampler = _DirectionBatchSampler(examples=train_examples, rng=rng)
+        updates_per_epoch = math.ceil(len(train_examples) / max(1, effective_batch_size))
+        if (not use_deepspeed) or rank0:
+            logger.info(
+                "train_examples=%s per_rank_batch_size=%s effective_batch_size=%s updates_per_epoch=%s configured_updates=%s",
+                len(train_examples),
+                per_rank_batch_size,
+                effective_batch_size,
+                updates_per_epoch,
+                cfg.rl.updates,
+            )
+            if batching_strategy == "direction_domain_length":
+                logger.info(
+                    "Direction/domain/length train batching enabled: groups=%s effective_batch_size=%s",
+                    len(train_batch_sampler.group_keys),
+                    effective_batch_size,
+                )
+            elif len(train_batch_sampler.directions) > 1:
+                logger.info(
+                    "Directional train batching enabled: each update uses a single direction. directions=%s",
+                    train_batch_sampler.directions,
+                )
+
+        if start_update > cfg.rl.updates:
+            logger.info(
+                "Nothing to train: start_update=%s exceeds configured updates=%s.",
+                start_update,
+                cfg.rl.updates,
+            )
+
+        for update_idx in range(start_update, cfg.rl.updates + 1):
+            rollouts: list[Rollout] = []
+            advantages: list[list[float]] = []
+            reward_stats: dict[str, float] = {}
+            adv_stats: dict[str, float] = {}
+            log_rollouts: list[Rollout] = rollouts
+            log_advantages: list[list[float]] = advantages
+            _sync_vllm_rollout_adapter(
+                update_idx=update_idx,
+                vllm_rollout_client=vllm_rollout_client,
+                policy_model=policy_eval_model,
+            )
+            if use_deepspeed and world_size > 1:
+                per_rank_batches: list[list[int]] = []
+                batch_direction = ""
+                if rank0:
+                    global_batch_size = per_rank_batch_size * world_size
+                    batch_direction, global_indices = train_batch_sampler.next_batch(global_batch_size)
+                    per_rank_batches = [
+                        global_indices[i * per_rank_batch_size : (i + 1) * per_rank_batch_size]
+                        for i in range(world_size)
+                    ]
+
+                shared_batch: list[Any] = [per_rank_batches, batch_direction if rank0 else ""]
+                _broadcast_object_list(shared_batch, src=0)
+                per_rank_batches = shared_batch[0] or []
+                batch_direction = str(shared_batch[1] or "")
+                local_indices = (
+                    [int(i) for i in per_rank_batches[rank]]
+                    if rank < len(per_rank_batches)
+                    else []
+                )
+                if not local_indices:
+                    logger.warning("Rank %s has empty rollout shard at update=%s; skipping step.", rank, update_idx)
+                local_examples = [train_examples[i] for i in local_indices]
+                if local_examples and rank0:
+                    _log_selected_training_batch(
+                        update_idx=update_idx,
+                        examples=train_examples,
+                        batch_indices=global_indices,
+                        prompt_token_lengths=train_prompt_token_lengths,
+                    )
+                local_prompt_instance_ids = [
+                    f"u{update_idx}:r{rank}:p{pos}:idx{int(local_indices[pos])}"
+                    for pos in range(len(local_examples))
+                ]
+
+                _set_rollout_sampling_seed(cfg.misc.seed + update_idx + (rank * 1009))
+                local_rollouts = _generate_training_rollouts(
+                    examples=local_examples,
+                    policy_model=policy_eval_model,
+                    tokenizer=tokenizer,
+                    cfg=cfg,
+                    device=device,
+                    vllm_rollout_client=vllm_rollout_client,
+                    ref_model=None,
+                    ref_device=None,
+                    # In distributed mode we fill reference logprobs later in rank0 batch
+                    # (`_fill_missing_reference_logprobs`). Avoid per-sample worker calls here,
+                    # which are fragile under long-running CUDA workers.
+                    ref_logprob_fn=None,
+                    show_progress=bool(rank0),
+                    progress_desc=f"rollout u{update_idx}",
+                    prompt_instance_ids=local_prompt_instance_ids,
+                )
+                gathered_rollouts = _gather_object_to_rank0(local_rollouts)
+                per_rank_payload: list[Any] | None = None
+                shared_stats: list[Any] = [reward_stats if rank0 else {}, adv_stats if rank0 else {}]
+                per_rank_rollouts: list[list[Rollout]] = []
+                merged_rollouts: list[Rollout] = []
+                merged_advantages: list[list[float]] = []
+                if rank0:
+                    for shard_idx in range(world_size):
+                        shard_rollouts: list[Rollout] = []
+                        if gathered_rollouts is not None and shard_idx < len(gathered_rollouts):
+                            raw_shard = gathered_rollouts[shard_idx]
+                            if isinstance(raw_shard, list):
+                                shard_rollouts = [r for r in raw_shard if isinstance(r, Rollout)]
+                        per_rank_rollouts.append(shard_rollouts)
+
+                    for shard_rollouts in per_rank_rollouts:
+                        merged_rollouts.extend(shard_rollouts)
+
+                    if merged_rollouts:
+                        if reference_kl_enabled and ref_logprob_batch_fn is None:
+                            with ThreadPoolExecutor(max_workers=2, thread_name_prefix="rank0-step") as step_executor:
+                                reward_future = step_executor.submit(
+                                    _prepare_rewards_and_advantages,
+                                    rollouts=merged_rollouts,
+                                    cfg=cfg,
+                                    metricx_scorer=metricx_scorer,
+                                    xcomet_scorer=xcomet_scorer,
+                                    mqm_scorer=mqm_scorer,
+                                    esa_scorer=esa_scorer,
+                                    group_rank_scorer=group_rank_scorer,
+                                    metricx_cache=metricx_cache,
+                                    xcomet_cache=xcomet_cache,
+                                    mqm_cache=mqm_cache,
+                                    esa_cache=esa_cache,
+                                    tokenizer=tokenizer,
+                                )
+                                ref_fill_future = step_executor.submit(
+                                    _fill_missing_reference_logprobs,
+                                    merged_rollouts=merged_rollouts,
+                                    cfg=cfg,
+                                    update_idx=update_idx,
+                                    ref_logprob_batch_fn=ref_logprob_batch_fn,
+                                    ref_logprob_client=ref_logprob_client,
+                                    ref_model=ref_model,
+                                    ref_device=ref_device,
+                                    device=device,
+                                )
+                                merged_rollouts, merged_advantages, reward_stats, adv_stats = reward_future.result()
+                                ref_fill_future.result()
+                        else:
+                            merged_rollouts, merged_advantages, reward_stats, adv_stats = _prepare_rewards_and_advantages(
                                 rollouts=merged_rollouts,
                                 cfg=cfg,
                                 metricx_scorer=metricx_scorer,
@@ -6748,268 +7007,284 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
                                 esa_cache=esa_cache,
                                 tokenizer=tokenizer,
                             )
-                            ref_fill_future = step_executor.submit(
-                                _fill_missing_reference_logprobs,
-                                merged_rollouts=merged_rollouts,
-                                cfg=cfg,
-                                update_idx=update_idx,
-                                ref_logprob_batch_fn=ref_logprob_batch_fn,
-                                ref_logprob_client=ref_logprob_client,
-                                ref_model=ref_model,
-                                ref_device=ref_device,
-                                device=device,
-                            )
-                            merged_rollouts, merged_advantages, reward_stats, adv_stats = reward_future.result()
-                            ref_fill_future.result()
                     else:
-                        merged_rollouts, merged_advantages, reward_stats, adv_stats = _prepare_rewards_and_advantages(
-                            rollouts=merged_rollouts,
-                            cfg=cfg,
-                            metricx_scorer=metricx_scorer,
-                            xcomet_scorer=xcomet_scorer,
-                            mqm_scorer=mqm_scorer,
-                            esa_scorer=esa_scorer,
-                            group_rank_scorer=group_rank_scorer,
-                            metricx_cache=metricx_cache,
-                            xcomet_cache=xcomet_cache,
-                            mqm_cache=mqm_cache,
-                            esa_cache=esa_cache,
-                            tokenizer=tokenizer,
-                        )
-                else:
-                    logger.warning("No rollouts generated at update=%s; skipping step.", update_idx)
+                        logger.warning("No rollouts generated at update=%s; skipping step.", update_idx)
 
-            if reference_kl_enabled and ref_logprob_batch_fn is not None:
-                _ = _fill_missing_reference_logprobs_distributed_colocate(
-                    merged_rollouts=merged_rollouts if rank0 else None,
-                    cfg=cfg,
-                    update_idx=update_idx,
-                    ref_logprob_batch_fn=ref_logprob_batch_fn,
-                    rank=rank,
-                )
-
-            if rank0:
-                shard_sizes = [len(shard) for shard in per_rank_rollouts]
-                shard_token_counts = [_count_rollout_completion_tokens(shard) for shard in per_rank_rollouts]
-                can_shard_update, shard_update_reason = _should_use_per_rank_policy_update_shards(
-                    per_rank_rollouts=per_rank_rollouts,
-                    merged_rollouts=merged_rollouts,
-                    merged_advantages=merged_advantages,
-                    reward_stats=reward_stats,
-                )
-                if can_shard_update:
-                    logger.info(
-                        "Using per-rank policy update shards at update=%s shard_size=%s merged_rollouts=%s shard_token_count=%s.",
-                        update_idx,
-                        shard_sizes[0] if shard_sizes else 0,
-                        len(merged_rollouts),
-                        shard_token_counts[0] if shard_token_counts else 0,
-                    )
-                    per_rank_advantages: list[list[list[float]]] = []
-                    cursor = 0
-                    for shard_rollouts in per_rank_rollouts:
-                        take = len(shard_rollouts)
-                        per_rank_advantages.append(merged_advantages[cursor:cursor + take])
-                        cursor += take
-                    per_rank_payload = [
-                        {"rollouts": per_rank_rollouts[i], "advantages": per_rank_advantages[i]}
-                        for i in range(world_size)
-                    ]
-                else:
-                    if shard_update_reason == "dropped_rollouts":
-                        logger.warning(
-                            "Skipped MQM/ESA rollouts forced replicated policy update at update=%s; dropped_rollouts=%s",
-                            update_idx,
-                            int(float(reward_stats.get("grpo_dropped_rollouts_count", 0.0))),
-                        )
-                    elif shard_update_reason == "uneven_shard_sizes":
-                        logger.warning(
-                            "Uneven rollout shard sizes at update=%s; falling back to replicated policy update this step. shard_sizes=%s",
-                            update_idx,
-                            shard_sizes,
-                        )
-                    elif shard_update_reason == "zero_token_shard":
-                        logger.warning(
-                            "Zero-token rollout shard detected at update=%s; falling back to replicated policy update this step. "
-                            "shard_sizes=%s shard_token_counts=%s",
-                            update_idx,
-                            shard_sizes,
-                            shard_token_counts,
-                        )
-                    per_rank_payload = [
-                        {"rollouts": merged_rollouts, "advantages": merged_advantages}
-                        for _ in range(world_size)
-                    ]
-
-                shared_stats = [reward_stats, adv_stats]
-                log_rollouts = merged_rollouts
-                log_advantages = merged_advantages
-
-            local_payload = _scatter_object_from_rank0(per_rank_payload if rank0 else None, rank=rank)
-            if isinstance(local_payload, dict):
-                rollouts = list(local_payload.get("rollouts") or [])
-                advantages = list(local_payload.get("advantages") or [])
-            else:
-                rollouts = []
-                advantages = []
-
-            _broadcast_object_list(shared_stats, src=0)
-            reward_stats = shared_stats[0] or {}
-            adv_stats = shared_stats[1] or {}
-            if not rank0:
-                log_rollouts = rollouts
-                log_advantages = advantages
-        elif (not use_deepspeed) or rank0:
-            batch_direction, batch_indices = train_batch_sampler.next_batch(max(1, cfg.rl.batch_size))
-            batch_examples = [train_examples[i] for i in batch_indices]
-            if batch_examples:
-                _log_selected_training_batch(
-                    update_idx=update_idx,
-                    examples=train_examples,
-                    batch_indices=batch_indices,
-                    prompt_token_lengths=train_prompt_token_lengths,
-                )
-            prompt_instance_ids = [
-                f"u{update_idx}:r{rank}:p{pos}:idx{int(batch_indices[pos])}"
-                for pos in range(len(batch_examples))
-            ]
-            rollouts, advantages, reward_stats, adv_stats = _prepare_training_batch_rollouts_and_advantages(
-                batch_examples=batch_examples,
-                prompt_instance_ids=prompt_instance_ids,
-                update_idx=update_idx,
-                policy_model=policy_eval_model,
-                tokenizer=tokenizer,
-                cfg=cfg,
-                device=device,
-                metricx_scorer=metricx_scorer,
-                xcomet_scorer=xcomet_scorer,
-                mqm_scorer=mqm_scorer,
-                esa_scorer=esa_scorer,
-                group_rank_scorer=group_rank_scorer,
-                metricx_cache=metricx_cache,
-                xcomet_cache=xcomet_cache,
-                mqm_cache=mqm_cache,
-                esa_cache=esa_cache,
-                vllm_rollout_client=vllm_rollout_client,
-            )
-            if rollouts:
-                if reference_kl_enabled:
-                    _ = _fill_missing_reference_logprobs(
-                        merged_rollouts=rollouts,
+                if reference_kl_enabled and ref_logprob_batch_fn is not None:
+                    _ = _fill_missing_reference_logprobs_distributed_colocate(
+                        merged_rollouts=merged_rollouts if rank0 else None,
                         cfg=cfg,
                         update_idx=update_idx,
                         ref_logprob_batch_fn=ref_logprob_batch_fn,
-                        ref_logprob_client=ref_logprob_client,
-                        ref_model=ref_model,
-                        ref_device=ref_device,
-                        device=device,
+                        rank=rank,
                     )
-            else:
-                logger.warning("No rollouts generated at update=%s; skipping step.", update_idx)
-            log_rollouts = rollouts
-            log_advantages = advantages
 
-        if not rollouts:
-            _dist_barrier()
-            continue
-        local_completion_token_count = _count_rollout_completion_tokens(rollouts)
-        if local_completion_token_count <= 0:
-            logger.warning(
-                "No sampled completion tokens at update=%s on rank=%s across %s rollouts; skipping policy update.",
-                update_idx,
-                rank,
-                len(rollouts),
-            )
-            _dist_barrier()
-            continue
+                if rank0:
+                    shard_sizes = [len(shard) for shard in per_rank_rollouts]
+                    shard_token_counts = [_count_rollout_completion_tokens(shard) for shard in per_rank_rollouts]
+                    can_shard_update, shard_update_reason = _should_use_per_rank_policy_update_shards(
+                        per_rank_rollouts=per_rank_rollouts,
+                        merged_rollouts=merged_rollouts,
+                        merged_advantages=merged_advantages,
+                        reward_stats=reward_stats,
+                    )
+                    if can_shard_update:
+                        logger.info(
+                            "Using per-rank policy update shards at update=%s shard_size=%s merged_rollouts=%s shard_token_count=%s.",
+                            update_idx,
+                            shard_sizes[0] if shard_sizes else 0,
+                            len(merged_rollouts),
+                            shard_token_counts[0] if shard_token_counts else 0,
+                        )
+                        per_rank_advantages: list[list[list[float]]] = []
+                        cursor = 0
+                        for shard_rollouts in per_rank_rollouts:
+                            take = len(shard_rollouts)
+                            per_rank_advantages.append(merged_advantages[cursor:cursor + take])
+                            cursor += take
+                        per_rank_payload = [
+                            {"rollouts": per_rank_rollouts[i], "advantages": per_rank_advantages[i]}
+                            for i in range(world_size)
+                        ]
+                    else:
+                        if shard_update_reason == "dropped_rollouts":
+                            logger.warning(
+                                "Skipped MQM/ESA rollouts forced replicated policy update at update=%s; dropped_rollouts=%s",
+                                update_idx,
+                                int(float(reward_stats.get("grpo_dropped_rollouts_count", 0.0))),
+                            )
+                        elif shard_update_reason == "uneven_shard_sizes":
+                            logger.warning(
+                                "Uneven rollout shard sizes at update=%s; falling back to replicated policy update this step. shard_sizes=%s",
+                                update_idx,
+                                shard_sizes,
+                            )
+                        elif shard_update_reason == "zero_token_shard":
+                            logger.warning(
+                                "Zero-token rollout shard detected at update=%s; falling back to replicated policy update this step. "
+                                "shard_sizes=%s shard_token_counts=%s",
+                                update_idx,
+                                shard_sizes,
+                                shard_token_counts,
+                            )
+                        per_rank_payload = [
+                            {"rollouts": merged_rollouts, "advantages": merged_advantages}
+                            for _ in range(world_size)
+                        ]
 
-        if pending_async_eval is not None:
-            _maybe_finalize_pending_async_eval(block=True)
+                    shared_stats = [reward_stats, adv_stats]
+                    log_rollouts = merged_rollouts
+                    log_advantages = merged_advantages
 
-        step_stats = []
-        for _ in range(max(1, cfg.rl.ppo_epochs)):
-            step_stats.append(
-                update_policy(
-                    rollouts=rollouts,
-                    advantages=advantages,
-                    policy_model=train_model,
-                    optimizer=optimizer,
-                    rl_cfg=cfg.rl,
-                    device=device,
-                    tokenizer=tokenizer,
-                )
-            )
-        train_stats = step_stats[-1]
+                local_payload = _scatter_object_from_rank0(per_rank_payload if rank0 else None, rank=rank)
+                if isinstance(local_payload, dict):
+                    rollouts = list(local_payload.get("rollouts") or [])
+                    advantages = list(local_payload.get("advantages") or [])
+                else:
+                    rollouts = []
+                    advantages = []
 
-        completion_lens = [len(r.completion_token_ids) for r in log_rollouts]
-        payload = {
-            "type": "train",
-            "update": update_idx,
-            "rollout_avg_completion_len": float(mean(completion_lens) if completion_lens else 0.0),
-            "adv_raw_mean": adv_stats["raw_mean"],
-            "adv_raw_std": adv_stats["raw_std"],
-            "adv_norm_mean": adv_stats["norm_mean"],
-            "adv_norm_std": adv_stats["norm_std"],
-            "policy_loss": train_stats.policy_loss,
-            "approx_kl": train_stats.approx_kl,
-            "clip_fraction": train_stats.clip_fraction,
-            "entropy": train_stats.entropy,
-            "kl_to_reference": train_stats.kl_to_reference,
-            "token_count": train_stats.token_count,
-            **reward_stats,
-        }
-        if (not use_deepspeed) or rank0:
-            _log_json_row(payload)
-            _log_monitor_metrics(prefix="train", payload=payload, step=update_idx)
-            if cfg.logging.save_rollouts:
-                _log_rollout_rows(
-                    update_idx=update_idx,
-                    rollouts=log_rollouts,
-                    advantages=log_advantages,
-                    reward_stats=reward_stats,
-                )
-
-            logger.info(
-                "update=%s loss=%.6f len=%.2f metricx=%.4f±%.4f xcomet=%.4f±%.4f mqm=%.4f±%.4f esa=%.4f±%.4f token_nonzero=%.4f A(raw)=%.4f/%.4f A(norm)=%.4f/%.4f",
-                update_idx,
-                train_stats.policy_loss,
-                payload["rollout_avg_completion_len"],
-                payload["metricx_score_mean"],
-                payload["metricx_score_std"],
-                payload["xcomet_score_mean"],
-                payload["xcomet_score_std"],
-                payload["mqm_score_mean"],
-                payload["mqm_score_std"],
-                payload["esa_score_mean"],
-                payload["esa_score_std"],
-                payload["token_rewards_non_zero_ratio"],
-                payload["adv_raw_mean"],
-                payload["adv_raw_std"],
-                payload["adv_norm_mean"],
-                payload["adv_norm_std"],
-            )
-
-        trainer_state_payload = {
-            "update_idx": int(update_idx),
-            "best_eval_update": int(best_eval_update) if best_eval_update is not None else None,
-            "best_eval_score": float(best_eval_score) if math.isfinite(best_eval_score) else None,
-        }
-
-        if cfg.logging.save_every_n_updates > 0 and update_idx % cfg.logging.save_every_n_updates == 0:
-            keep_recent_n = int(cfg.logging.keep_last_n_checkpoints)
-            save_periodic_checkpoint = bool(keep_recent_n > 0 or (not cfg.logging.save_only_best))
-            if use_deepspeed:
-                hf_checkpoint_model = policy_eval_model if _lora_enabled(cfg) else None
-                if save_periodic_checkpoint:
-                    ckpt = _save_deepspeed_checkpoint(
-                        output_dir=output_dir,
+                _broadcast_object_list(shared_stats, src=0)
+                reward_stats = shared_stats[0] or {}
+                adv_stats = shared_stats[1] or {}
+                if not rank0:
+                    log_rollouts = rollouts
+                    log_advantages = advantages
+            elif (not use_deepspeed) or rank0:
+                batch_direction, batch_indices = train_batch_sampler.next_batch(max(1, cfg.rl.batch_size))
+                batch_examples = [train_examples[i] for i in batch_indices]
+                if batch_examples:
+                    _log_selected_training_batch(
                         update_idx=update_idx,
-                        engine=train_model,
-                        tokenizer=tokenizer,
-                        hf_model=hf_checkpoint_model,
-                        trainer_state=trainer_state_payload,
+                        examples=train_examples,
+                        batch_indices=batch_indices,
+                        prompt_token_lengths=train_prompt_token_lengths,
                     )
-                    if rank0:
+                prompt_instance_ids = [
+                    f"u{update_idx}:r{rank}:p{pos}:idx{int(batch_indices[pos])}"
+                    for pos in range(len(batch_examples))
+                ]
+                rollouts, advantages, reward_stats, adv_stats = _prepare_training_batch_rollouts_and_advantages(
+                    batch_examples=batch_examples,
+                    prompt_instance_ids=prompt_instance_ids,
+                    update_idx=update_idx,
+                    policy_model=policy_eval_model,
+                    tokenizer=tokenizer,
+                    cfg=cfg,
+                    device=device,
+                    metricx_scorer=metricx_scorer,
+                    xcomet_scorer=xcomet_scorer,
+                    mqm_scorer=mqm_scorer,
+                    esa_scorer=esa_scorer,
+                    group_rank_scorer=group_rank_scorer,
+                    metricx_cache=metricx_cache,
+                    xcomet_cache=xcomet_cache,
+                    mqm_cache=mqm_cache,
+                    esa_cache=esa_cache,
+                    vllm_rollout_client=vllm_rollout_client,
+                )
+                if rollouts:
+                    if reference_kl_enabled:
+                        _ = _fill_missing_reference_logprobs(
+                            merged_rollouts=rollouts,
+                            cfg=cfg,
+                            update_idx=update_idx,
+                            ref_logprob_batch_fn=ref_logprob_batch_fn,
+                            ref_logprob_client=ref_logprob_client,
+                            ref_model=ref_model,
+                            ref_device=ref_device,
+                            device=device,
+                        )
+                else:
+                    logger.warning("No rollouts generated at update=%s; skipping step.", update_idx)
+                log_rollouts = rollouts
+                log_advantages = advantages
+
+            if not rollouts:
+                _dist_barrier()
+                continue
+            local_completion_token_count = _count_rollout_completion_tokens(rollouts)
+            if local_completion_token_count <= 0:
+                logger.warning(
+                    "No sampled completion tokens at update=%s on rank=%s across %s rollouts; skipping policy update.",
+                    update_idx,
+                    rank,
+                    len(rollouts),
+                )
+                _dist_barrier()
+                continue
+
+            if pending_async_eval is not None:
+                _maybe_finalize_pending_async_eval(block=True)
+
+            step_stats = []
+            for _ in range(max(1, cfg.rl.ppo_epochs)):
+                step_stats.append(
+                    update_policy(
+                        rollouts=rollouts,
+                        advantages=advantages,
+                        policy_model=train_model,
+                        optimizer=optimizer,
+                        rl_cfg=cfg.rl,
+                        device=device,
+                        tokenizer=tokenizer,
+                    )
+                )
+            train_stats = step_stats[-1]
+            if policy_runtime_mode == "separate":
+                _sync_policy_eval_model_from_train_model(
+                    train_model=train_model,
+                    policy_eval_model=policy_eval_model,
+                )
+
+            completion_lens = [len(r.completion_token_ids) for r in log_rollouts]
+            payload = {
+                "type": "train",
+                "update": update_idx,
+                "rollout_avg_completion_len": float(mean(completion_lens) if completion_lens else 0.0),
+                "adv_raw_mean": adv_stats["raw_mean"],
+                "adv_raw_std": adv_stats["raw_std"],
+                "adv_norm_mean": adv_stats["norm_mean"],
+                "adv_norm_std": adv_stats["norm_std"],
+                "policy_loss": train_stats.policy_loss,
+                "approx_kl": train_stats.approx_kl,
+                "clip_fraction": train_stats.clip_fraction,
+                "entropy": train_stats.entropy,
+                "kl_to_reference": train_stats.kl_to_reference,
+                "token_count": train_stats.token_count,
+                **reward_stats,
+            }
+            if (not use_deepspeed) or rank0:
+                _log_json_row(payload)
+                _log_monitor_metrics(prefix="train", payload=payload, step=update_idx)
+                if cfg.logging.save_rollouts:
+                    _log_rollout_rows(
+                        update_idx=update_idx,
+                        rollouts=log_rollouts,
+                        advantages=log_advantages,
+                        reward_stats=reward_stats,
+                    )
+
+                logger.info(
+                    "update=%s loss=%.6f len=%.2f metricx=%.4f±%.4f xcomet=%.4f±%.4f mqm=%.4f±%.4f esa=%.4f±%.4f token_nonzero=%.4f A(raw)=%.4f/%.4f A(norm)=%.4f/%.4f",
+                    update_idx,
+                    train_stats.policy_loss,
+                    payload["rollout_avg_completion_len"],
+                    payload["metricx_score_mean"],
+                    payload["metricx_score_std"],
+                    payload["xcomet_score_mean"],
+                    payload["xcomet_score_std"],
+                    payload["mqm_score_mean"],
+                    payload["mqm_score_std"],
+                    payload["esa_score_mean"],
+                    payload["esa_score_std"],
+                    payload["token_rewards_non_zero_ratio"],
+                    payload["adv_raw_mean"],
+                    payload["adv_raw_std"],
+                    payload["adv_norm_mean"],
+                    payload["adv_norm_std"],
+                )
+
+            trainer_state_payload = {
+                "update_idx": int(update_idx),
+                "best_eval_update": int(best_eval_update) if best_eval_update is not None else None,
+                "best_eval_score": float(best_eval_score) if math.isfinite(best_eval_score) else None,
+            }
+
+            if cfg.logging.save_every_n_updates > 0 and update_idx % cfg.logging.save_every_n_updates == 0:
+                keep_recent_n = int(cfg.logging.keep_last_n_checkpoints)
+                save_periodic_checkpoint = bool(keep_recent_n > 0 or (not cfg.logging.save_only_best))
+                if use_deepspeed:
+                    hf_checkpoint_model = policy_eval_model if _lora_enabled(cfg) else None
+                    if save_periodic_checkpoint:
+                        ckpt = _save_deepspeed_checkpoint(
+                            output_dir=output_dir,
+                            update_idx=update_idx,
+                            engine=train_model,
+                            tokenizer=tokenizer,
+                            hf_model=hf_checkpoint_model,
+                            trainer_state=trainer_state_payload,
+                        )
+                        if rank0:
+                            artifacts["checkpoints"].append(str(ckpt))
+                            if cfg.logging.save_only_best:
+                                artifacts["resume_checkpoint"] = str(ckpt)
+                            if keep_recent_n > 0:
+                                removed = _prune_old_checkpoints(output_dir, keep_recent_n)
+                                if removed:
+                                    removed_set = {str(path) for path in removed}
+                                    artifacts["checkpoints"] = [
+                                        path for path in artifacts["checkpoints"] if path not in removed_set
+                                    ]
+                                    logger.info(
+                                        "Pruned %s old checkpoints; keeping latest %s periodic checkpoints.",
+                                        len(removed),
+                                        keep_recent_n,
+                                    )
+                    else:
+                        resume_path = _save_deepspeed_resume_checkpoint(
+                            output_dir=output_dir,
+                            update_idx=update_idx,
+                            engine=train_model,
+                            tokenizer=tokenizer,
+                            hf_model=hf_checkpoint_model,
+                            trainer_state=trainer_state_payload,
+                        )
+                        if rank0:
+                            artifacts["resume_checkpoint"] = str(resume_path)
+                    if keep_recent_n > 0:
+                        _dist_barrier()
+                elif rank0:
+                    if save_periodic_checkpoint:
+                        assert optimizer is not None
+                        ckpt = _save_checkpoint(
+                            output_dir=output_dir,
+                            update_idx=update_idx,
+                            model=policy_eval_model,
+                            tokenizer=tokenizer,
+                            optimizer=optimizer,
+                            trainer_state=trainer_state_payload,
+                        )
                         artifacts["checkpoints"].append(str(ckpt))
                         if cfg.logging.save_only_best:
                             artifacts["resume_checkpoint"] = str(ckpt)
@@ -7025,159 +7300,145 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
                                     len(removed),
                                     keep_recent_n,
                                 )
-                else:
-                    resume_path = _save_deepspeed_resume_checkpoint(
-                        output_dir=output_dir,
-                        update_idx=update_idx,
-                        engine=train_model,
-                        tokenizer=tokenizer,
-                        hf_model=hf_checkpoint_model,
-                        trainer_state=trainer_state_payload,
-                    )
-                    if rank0:
+                    else:
+                        assert optimizer is not None
+                        resume_path = _save_resume_checkpoint(
+                            output_dir=output_dir,
+                            update_idx=update_idx,
+                            model=policy_eval_model,
+                            tokenizer=tokenizer,
+                            optimizer=optimizer,
+                            trainer_state=trainer_state_payload,
+                        )
                         artifacts["resume_checkpoint"] = str(resume_path)
-                if keep_recent_n > 0:
-                    _dist_barrier()
-            elif rank0:
-                if save_periodic_checkpoint:
-                    assert optimizer is not None
-                    ckpt = _save_checkpoint(
-                        output_dir=output_dir,
-                        update_idx=update_idx,
-                        model=policy_eval_model,
-                        tokenizer=tokenizer,
-                        optimizer=optimizer,
-                        trainer_state=trainer_state_payload,
+
+            if (
+                cfg.eval.eval_every_n_updates > 0
+                and eval_examples
+                and update_idx % cfg.eval.eval_every_n_updates == 0
+            ):
+                if (not use_deepspeed) or rank0:
+                    logger.info(
+                        "starting eval%s: update=%s examples=%s metricx=%s xcomet=%s mqm=%s esa=%s",
+                        " async" if async_eval_enabled else "",
+                        update_idx,
+                        len(eval_examples),
+                        bool(metricx_scorer is not None and cfg.reward.metricx.enabled),
+                        bool(xcomet_scorer is not None and xcomet_runtime_enabled),
+                        bool(mqm_scorer is not None and cfg.reward.mqm.enabled),
+                        bool(esa_scorer is not None and cfg.reward.esa.enabled),
                     )
-                    artifacts["checkpoints"].append(str(ckpt))
-                    if cfg.logging.save_only_best:
-                        artifacts["resume_checkpoint"] = str(ckpt)
-                    if keep_recent_n > 0:
-                        removed = _prune_old_checkpoints(output_dir, keep_recent_n)
-                        if removed:
-                            removed_set = {str(path) for path in removed}
-                            artifacts["checkpoints"] = [
-                                path for path in artifacts["checkpoints"] if path not in removed_set
-                            ]
-                            logger.info(
-                                "Pruned %s old checkpoints; keeping latest %s periodic checkpoints.",
-                                len(removed),
-                                keep_recent_n,
-                            )
+                collect_eval_outputs = bool(cfg.logging.save_eval_outputs and ((not use_deepspeed) or rank0))
+                show_eval_progress = bool((not use_deepspeed) or rank0)
+                if async_eval_enabled:
+                    if pending_async_eval is not None:
+                        _maybe_finalize_pending_async_eval(block=True)
+                    _launch_async_eval(
+                        update_idx=update_idx,
+                        run_before_train=False,
+                        collect_outputs=collect_eval_outputs,
+                        show_progress=show_eval_progress,
+                    )
                 else:
-                    assert optimizer is not None
-                    resume_path = _save_resume_checkpoint(
-                        output_dir=output_dir,
+                    report = _run_eval_once(
                         update_idx=update_idx,
-                        model=policy_eval_model,
-                        tokenizer=tokenizer,
-                        optimizer=optimizer,
-                        trainer_state=trainer_state_payload,
+                        collect_outputs=collect_eval_outputs,
+                        show_progress=show_eval_progress,
                     )
-                    artifacts["resume_checkpoint"] = str(resume_path)
+                    _finalize_eval_report(
+                        report=report if ((not use_deepspeed) or rank0) else None,
+                        update_idx=update_idx,
+                        run_before_train=False,
+                    )
 
-        if (
-            cfg.eval.eval_every_n_updates > 0
-            and eval_examples
-            and update_idx % cfg.eval.eval_every_n_updates == 0
-        ):
-            if (not use_deepspeed) or rank0:
-                logger.info(
-                    "starting eval%s: update=%s examples=%s metricx=%s xcomet=%s mqm=%s esa=%s",
-                    " async" if async_eval_enabled else "",
-                    update_idx,
-                    len(eval_examples),
-                    bool(metricx_scorer is not None and cfg.reward.metricx.enabled),
-                    bool(xcomet_scorer is not None and xcomet_runtime_enabled),
-                    bool(mqm_scorer is not None and cfg.reward.mqm.enabled),
-                    bool(esa_scorer is not None and cfg.reward.esa.enabled),
-                )
-            collect_eval_outputs = bool(cfg.logging.save_eval_outputs and ((not use_deepspeed) or rank0))
-            show_eval_progress = bool((not use_deepspeed) or rank0)
-            if async_eval_enabled:
-                if pending_async_eval is not None:
-                    _maybe_finalize_pending_async_eval(block=True)
-                _launch_async_eval(
-                    update_idx=update_idx,
-                    run_before_train=False,
-                    collect_outputs=collect_eval_outputs,
-                    show_progress=show_eval_progress,
-                )
-            else:
-                report = _run_eval_once(
-                    update_idx=update_idx,
-                    collect_outputs=collect_eval_outputs,
-                    show_progress=show_eval_progress,
-                )
-                _finalize_eval_report(
-                    report=report if ((not use_deepspeed) or rank0) else None,
-                    update_idx=update_idx,
-                    run_before_train=False,
-                )
+            # Early-stop guard for divergence in toy runs.
+            if not math.isfinite(train_stats.policy_loss):
+                raise RuntimeError(f"Non-finite loss at update {update_idx}")
+            _dist_barrier()
 
-        # Early-stop guard for divergence in toy runs.
-        if not math.isfinite(train_stats.policy_loss):
-            raise RuntimeError(f"Non-finite loss at update {update_idx}")
-        _dist_barrier()
+        if pending_async_eval is not None:
+            _maybe_finalize_pending_async_eval(block=True)
 
-    if pending_async_eval is not None:
-        _maybe_finalize_pending_async_eval(block=True)
+        if async_json_writer is not None:
+            async_json_writer.flush()
 
-    if async_json_writer is not None:
-        async_json_writer.flush()
-
-    final_dir = output_dir / "final"
-    if rank0 and final_dir.exists():
-        shutil.rmtree(final_dir)
-    _dist_barrier()
-    if best_eval_update is not None and best_dir.exists():
-        if rank0:
-            shutil.copytree(best_dir, final_dir)
-    else:
-        if rank0:
-            final_dir.mkdir(parents=True, exist_ok=True)
-        _dist_barrier()
-        if use_deepspeed:
-            _save_pretrained_model(policy_eval_model, final_dir)
+        final_dir = output_dir / "final"
+        if best_eval_update is not None and best_dir.exists():
+            final_copy_error_text: str | None = None
             if rank0:
-                tokenizer.save_pretrained(final_dir)
-        elif rank0:
-            policy_eval_model.save_pretrained(final_dir)
-            tokenizer.save_pretrained(final_dir)
-    if (not use_deepspeed) or rank0:
-        artifacts["final_model_dir"] = str(final_dir)
-        artifacts["best_model_dir"] = str(best_dir) if best_eval_update is not None and best_dir.exists() else None
-        artifacts["best_eval_update"] = best_eval_update
-        artifacts["best_eval_score"] = best_eval_score if best_eval_update is not None else None
-        artifacts["log_path"] = str(log_path)
-        if experiment_tracker is not None and experiment_tracker.tensorboard_log_dir is not None:
-            artifacts["tensorboard_log_dir"] = str(experiment_tracker.tensorboard_log_dir)
-        if experiment_tracker is not None and experiment_tracker.wandb_run_id is not None:
-            artifacts["wandb_run_id"] = str(experiment_tracker.wandb_run_id)
-        if experiment_tracker is not None and experiment_tracker.wandb_url is not None:
-            artifacts["wandb_run_url"] = str(experiment_tracker.wandb_url)
-        if cfg.logging.save_rollouts:
-            artifacts["rollout_log_path"] = str(rollout_log_path)
-        if cfg.logging.save_eval_outputs:
-            artifacts["eval_output_path"] = str(eval_output_path)
-    _dist_barrier()
+                try:
+                    _write_directory_atomically(final_dir, lambda staged_dir: shutil.copytree(best_dir, staged_dir))
+                except Exception as exc:
+                    logger.exception("Failed to materialize final model from best checkpoint %s", best_dir)
+                    final_copy_error_text = f"{type(exc).__name__}: {exc}"
+            if use_deepspeed:
+                final_copy_shared: list[Any] = [final_copy_error_text if rank0 else None]
+                _broadcast_object_list(final_copy_shared, src=0)
+                if final_copy_shared[0]:
+                    raise RuntimeError(f"Failed to materialize final model from best checkpoint: {final_copy_shared[0]}")
+            elif final_copy_error_text is not None:
+                raise RuntimeError(f"Failed to materialize final model from best checkpoint: {final_copy_error_text}")
+        else:
+            if use_deepspeed:
+                staged_final_dir = _staged_directory_path(final_dir)
+                if rank0:
+                    _remove_path(staged_final_dir)
+                    staged_final_dir.mkdir(parents=True, exist_ok=True)
+                _dist_barrier()
+                _save_pretrained_model(policy_eval_model, staged_final_dir)
+                final_promote_error_text: str | None = None
+                if rank0:
+                    try:
+                        tokenizer.save_pretrained(staged_final_dir)
+                        _promote_staged_directory(staged_dir=staged_final_dir, target_dir=final_dir)
+                    except Exception as exc:
+                        logger.exception("Failed to finalize staged final model at %s", staged_final_dir)
+                        final_promote_error_text = f"{type(exc).__name__}: {exc}"
+                        _remove_path(staged_final_dir)
+                final_promote_shared: list[Any] = [final_promote_error_text if rank0 else None]
+                _broadcast_object_list(final_promote_shared, src=0)
+                if final_promote_shared[0]:
+                    raise RuntimeError(f"Failed to save final model to {final_dir}: {final_promote_shared[0]}")
+                _dist_barrier()
+            elif rank0:
+                def _write_final_model(staged_dir: Path) -> None:
+                    staged_dir.mkdir(parents=True, exist_ok=True)
+                    policy_eval_model.save_pretrained(staged_dir)
+                    tokenizer.save_pretrained(staged_dir)
 
-    if vllm_rollout_client is not None:
-        vllm_rollout_client.close()
-    if ref_logprob_client is not None:
-        ref_logprob_client.close()
-    if async_eval_executor is not None:
-        async_eval_executor.shutdown(wait=True)
-    if experiment_tracker is not None:
-        experiment_tracker.close()
-    if async_json_writer is not None:
-        async_json_writer.close()
+                _write_directory_atomically(final_dir, _write_final_model)
+        if (not use_deepspeed) or rank0:
+            artifacts["final_model_dir"] = str(final_dir)
+            artifacts["best_model_dir"] = str(best_dir) if best_eval_update is not None and best_dir.exists() else None
+            artifacts["best_eval_update"] = best_eval_update
+            artifacts["best_eval_score"] = best_eval_score if best_eval_update is not None else None
+            artifacts["log_path"] = str(log_path)
+            if experiment_tracker is not None and experiment_tracker.tensorboard_log_dir is not None:
+                artifacts["tensorboard_log_dir"] = str(experiment_tracker.tensorboard_log_dir)
+            if experiment_tracker is not None and experiment_tracker.wandb_run_id is not None:
+                artifacts["wandb_run_id"] = str(experiment_tracker.wandb_run_id)
+            if experiment_tracker is not None and experiment_tracker.wandb_url is not None:
+                artifacts["wandb_run_url"] = str(experiment_tracker.wandb_url)
+            if cfg.logging.save_rollouts:
+                artifacts["rollout_log_path"] = str(rollout_log_path)
+            if cfg.logging.save_eval_outputs:
+                artifacts["eval_output_path"] = str(eval_output_path)
+        _dist_barrier()
 
-    if use_deepspeed and (not rank0):
-        return {
-            "output_dir": str(output_dir),
-            "worker_rank": _distributed_rank(),
-            "status": "ok",
-        }
+        if use_deepspeed and (not rank0):
+            return {
+                "output_dir": str(output_dir),
+                "worker_rank": _distributed_rank(),
+                "status": "ok",
+            }
 
-    return artifacts
+        return artifacts
+
+    finally:
+        _cleanup_run_toy_rl_resources(
+            vllm_rollout_client=vllm_rollout_client,
+            ref_logprob_client=ref_logprob_client,
+            async_eval_executor=async_eval_executor,
+            experiment_tracker=experiment_tracker,
+            async_json_writer=async_json_writer,
+        )

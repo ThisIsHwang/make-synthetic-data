@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 pytest.importorskip("torch")
 
+import torch
+
+from gemma27_rl import trainer as trainer_mod
 from gemma27_rl.config import RLPostTrainConfig
 from gemma27_rl.trainer import (
     _is_deepspeed_checkpoint_dir,
@@ -11,8 +16,10 @@ from gemma27_rl.trainer import (
     _restore_best_eval_state_for_resume,
     _resolve_run_before_train_eval_update_idx,
     _resolve_resume_checkpoint,
+    _save_checkpoint_to_dir,
     _save_trainer_state,
     _should_run_eval_before_train,
+    _write_directory_atomically,
 )
 
 
@@ -156,3 +163,62 @@ def test_resolve_run_before_train_eval_update_idx_uses_resume_update_when_resett
         resume_update_idx=12,
         reset_best_eval_on_resume=True,
     ) == 12
+
+
+def test_save_checkpoint_to_dir_preserves_previous_checkpoint_on_write_failure(tmp_path: Path) -> None:
+    class _Model:
+        def save_pretrained(self, path: Path) -> None:
+            path.mkdir(parents=True, exist_ok=True)
+            (path / "weights.bin").write_bytes(b"new")
+
+    class _Tokenizer:
+        def save_pretrained(self, path: Path) -> None:
+            raise RuntimeError("tokenizer failed")
+
+    ckpt_dir = tmp_path / "checkpoint-1"
+    ckpt_dir.mkdir()
+    (ckpt_dir / "sentinel.txt").write_text("old\n", encoding="utf-8")
+    param = torch.nn.Parameter(torch.tensor(0.0))
+    optimizer = torch.optim.SGD([param], lr=0.1)
+
+    with pytest.raises(RuntimeError, match="tokenizer failed"):
+        _save_checkpoint_to_dir(
+            ckpt_dir=ckpt_dir,
+            model=_Model(),  # type: ignore[arg-type]
+            tokenizer=_Tokenizer(),
+            optimizer=optimizer,
+        )
+
+    assert (ckpt_dir / "sentinel.txt").read_text(encoding="utf-8") == "old\n"
+    assert not (ckpt_dir / "weights.bin").exists()
+
+
+def test_write_directory_atomically_restores_previous_dir_when_promote_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    target_dir = tmp_path / "final"
+    target_dir.mkdir()
+    (target_dir / "sentinel.txt").write_text("old\n", encoding="utf-8")
+
+    original_replace = trainer_mod.os.replace
+
+    def _fake_replace(src, dst):  # type: ignore[no-untyped-def]
+        src_path = Path(src)
+        dst_path = Path(dst)
+        if src_path.name.endswith(".staging") and dst_path == target_dir:
+            raise OSError("rename failed")
+        return original_replace(src, dst)
+
+    monkeypatch.setattr(trainer_mod.os, "replace", _fake_replace)
+
+    with pytest.raises(RuntimeError, match="Failed to promote staged directory"):
+        _write_directory_atomically(
+            target_dir,
+            lambda staged_dir: (
+                staged_dir.mkdir(parents=True, exist_ok=True),
+                (staged_dir / "sentinel.txt").write_text("new\n", encoding="utf-8"),
+            ),
+        )
+
+    assert (target_dir / "sentinel.txt").read_text(encoding="utf-8") == "old\n"
