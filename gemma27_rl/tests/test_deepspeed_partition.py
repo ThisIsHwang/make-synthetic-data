@@ -445,7 +445,7 @@ def test_rewrite_peft_state_dict_for_vllm_raises_when_gemma3_multimodal_adapter_
         _rewrite_peft_state_dict_for_vllm(model, state_dict)
 
 
-def test_rewrite_peft_adapter_config_for_vllm_packs_gemma3_target_modules(tmp_path) -> None:  # type: ignore[no-untyped-def]
+def test_rewrite_peft_adapter_config_for_vllm_keeps_gemma3_target_modules_unchanged(tmp_path) -> None:  # type: ignore[no-untyped-def]
     model = SimpleNamespace(config=SimpleNamespace(model_type="gemma3"))
     cfg_path = tmp_path / "adapter_config.json"
     cfg_path.write_text(
@@ -459,7 +459,7 @@ def test_rewrite_peft_adapter_config_for_vllm_packs_gemma3_target_modules(tmp_pa
     _rewrite_peft_adapter_config_for_vllm(model, tmp_path)
 
     payload = json.loads(cfg_path.read_text(encoding="utf-8"))
-    assert payload["target_modules"] == ["down_proj", "qkv_proj", "gate_up_proj", "o_proj"]
+    assert payload["target_modules"] == ["down_proj", "v_proj", "gate_proj", "q_proj", "o_proj", "k_proj", "up_proj"]
 
 
 def test_build_zero3_peft_state_dict_gathers_trainable_params(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -510,6 +510,34 @@ def test_validate_exported_vllm_adapter_dir_requires_weight_artifact(tmp_path: P
         _validate_exported_vllm_adapter_dir(tmp_path)
 
 
+def test_validate_exported_vllm_adapter_dir_requires_lora_tensor_keys(tmp_path: Path) -> None:
+    (tmp_path / "adapter_config.json").write_text(
+        '{"base_model_name_or_path": "base", "target_modules": ["q_proj"]}',
+        encoding="utf-8",
+    )
+    torch.save({"base_model.model.model.layers.0.self_attn.q_proj.weight": torch.ones(1)}, tmp_path / "adapter_model.bin")
+
+    with pytest.raises(RuntimeError, match="contains no LoRA tensors"):
+        _validate_exported_vllm_adapter_dir(tmp_path)
+
+
+def test_validate_exported_vllm_adapter_dir_rejects_target_module_mismatch(tmp_path: Path) -> None:
+    (tmp_path / "adapter_config.json").write_text(
+        '{"base_model_name_or_path": "base", "target_modules": ["qkv_proj", "gate_up_proj"]}',
+        encoding="utf-8",
+    )
+    torch.save(
+        {
+            "base_model.model.model.language_model.layers.0.self_attn.q_proj.lora_A.weight": torch.ones(1),
+            "base_model.model.model.language_model.layers.0.self_attn.q_proj.lora_B.weight": torch.ones(1),
+        },
+        tmp_path / "adapter_model.bin",
+    )
+
+    with pytest.raises(RuntimeError, match="target_modules do not match saved LoRA tensors"):
+        _validate_exported_vllm_adapter_dir(tmp_path)
+
+
 def test_read_local_adapter_lora_rank_reads_rank_from_adapter_config(tmp_path: Path) -> None:
     (tmp_path / "adapter_config.json").write_text('{"base_model_name_or_path": "base", "r": 96}', encoding="utf-8")
 
@@ -555,7 +583,13 @@ def test_sync_vllm_rollout_adapter_promotes_candidate_after_success(
         saved_paths.append(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         (output_dir / "adapter_config.json").write_text('{"base_model_name_or_path": "base"}', encoding="utf-8")
-        (output_dir / "adapter_model.safetensors").write_text("new", encoding="utf-8")
+        torch.save(
+            {
+                "base_model.model.model.language_model.layers.0.self_attn.q_proj.lora_A.weight": torch.ones(1),
+                "base_model.model.model.language_model.layers.0.self_attn.q_proj.lora_B.weight": torch.ones(1),
+            },
+            output_dir / "adapter_model.bin",
+        )
 
     monkeypatch.setattr(trainer_mod, "_save_pretrained_model", _fake_save)
     monkeypatch.setattr(trainer_mod, "_dist_barrier", lambda: None)
@@ -604,7 +638,13 @@ def test_sync_vllm_rollout_adapter_restores_previous_candidate_on_load_failure(
         assert require_peft_adapter is True
         output_dir.mkdir(parents=True, exist_ok=True)
         (output_dir / "adapter_config.json").write_text('{"base_model_name_or_path": "base"}', encoding="utf-8")
-        (output_dir / "adapter_model.safetensors").write_text("new", encoding="utf-8")
+        torch.save(
+            {
+                "base_model.model.model.language_model.layers.0.self_attn.q_proj.lora_A.weight": torch.ones(1),
+                "base_model.model.model.language_model.layers.0.self_attn.q_proj.lora_B.weight": torch.ones(1),
+            },
+            output_dir / "adapter_model.bin",
+        )
 
     monkeypatch.setattr(trainer_mod, "_save_pretrained_model", _fake_save)
     monkeypatch.setattr(trainer_mod, "_dist_barrier", lambda: None)
@@ -649,7 +689,13 @@ def test_sync_vllm_rollout_adapter_raises_clear_error_when_candidate_rank_exceed
         assert require_peft_adapter is True
         output_dir.mkdir(parents=True, exist_ok=True)
         (output_dir / "adapter_config.json").write_text('{"base_model_name_or_path": "base", "r": 128}', encoding="utf-8")
-        (output_dir / "adapter_model.safetensors").write_text("new", encoding="utf-8")
+        torch.save(
+            {
+                "base_model.model.model.language_model.layers.0.self_attn.q_proj.lora_A.weight": torch.ones(1),
+                "base_model.model.model.language_model.layers.0.self_attn.q_proj.lora_B.weight": torch.ones(1),
+            },
+            output_dir / "adapter_model.bin",
+        )
 
     monkeypatch.setattr(trainer_mod, "_save_pretrained_model", _fake_save)
     monkeypatch.setattr(trainer_mod, "_dist_barrier", lambda: None)

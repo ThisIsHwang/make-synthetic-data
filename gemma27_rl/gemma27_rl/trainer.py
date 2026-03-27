@@ -2982,6 +2982,78 @@ def _validate_exported_vllm_adapter_dir(adapter_path: Path) -> None:
             f"at {adapter_path} (expected patterns={_VLLM_ADAPTER_WEIGHT_PATTERNS})."
         )
 
+    weight_keys = _read_exported_vllm_adapter_weight_keys(weight_files)
+    lora_keys = [key for key in weight_keys if ".lora_" in key]
+    if not lora_keys:
+        raise RuntimeError(
+            f"Exported vLLM adapter contains no LoRA tensors: {adapter_path}"
+        )
+
+    target_modules_raw = json.loads(cfg_path.read_text(encoding="utf-8")).get("target_modules")
+    if isinstance(target_modules_raw, str):
+        target_modules = {target_modules_raw.strip()} if target_modules_raw.strip() else set()
+    elif isinstance(target_modules_raw, list):
+        target_modules = {str(name).strip() for name in target_modules_raw if str(name).strip()}
+    else:
+        target_modules = set()
+
+    actual_modules = {
+        module_name
+        for key in lora_keys
+        if (module_name := _extract_lora_target_module_name(key)) is not None
+    }
+    if not actual_modules:
+        raise RuntimeError(
+            f"Exported vLLM adapter LoRA tensor names are not recognizable: {adapter_path}"
+        )
+    if target_modules and not (actual_modules & target_modules):
+        raise RuntimeError(
+            "Exported vLLM adapter target_modules do not match saved LoRA tensors: "
+            f"target_modules={sorted(target_modules)} actual_modules={sorted(actual_modules)} "
+            f"adapter_dir={adapter_path}"
+        )
+
+
+def _read_exported_vllm_adapter_weight_keys(weight_files: list[Path]) -> list[str]:
+    keys: list[str] = []
+    for weight_path in weight_files:
+        suffixes = tuple(weight_path.suffixes)
+        if suffixes and suffixes[-1] == ".safetensors":
+            try:
+                from safetensors import safe_open
+            except Exception as exc:
+                raise RuntimeError(
+                    f"safetensors is required to inspect exported vLLM adapter weights: {weight_path}"
+                ) from exc
+            try:
+                with safe_open(str(weight_path), framework="pt", device="cpu") as handle:
+                    keys.extend(str(key) for key in handle.keys())
+            except Exception as exc:
+                raise RuntimeError(f"Failed to read exported vLLM adapter weights: {weight_path}") from exc
+            continue
+
+        try:
+            payload = torch.load(weight_path, map_location="cpu")
+        except Exception as exc:
+            raise RuntimeError(f"Failed to read exported vLLM adapter weights: {weight_path}") from exc
+        if not isinstance(payload, dict):
+            raise RuntimeError(
+                f"Exported vLLM adapter weights must be a state_dict mapping: {weight_path}"
+            )
+        keys.extend(str(key) for key in payload.keys())
+    return keys
+
+
+def _extract_lora_target_module_name(weight_key: str) -> str | None:
+    parts = [part for part in str(weight_key).split(".") if part]
+    for idx, part in enumerate(parts):
+        if not part.startswith("lora_"):
+            continue
+        if idx <= 0:
+            return None
+        return parts[idx - 1]
+    return None
+
 
 def _promote_vllm_adapter_candidate(*, current_path: Path, candidate_path: Path) -> None:
     cleanup_target = _resolve_vllm_current_adapter_target(current_path)
@@ -5564,54 +5636,7 @@ def _rewrite_peft_state_dict_for_vllm(model: Any, state_dict: dict[str, Any]) ->
 
 
 def _rewrite_peft_adapter_config_for_vllm(model: Any, output_dir: Path) -> None:
-    config = getattr(model, "config", None)
-    model_type = str(getattr(config, "model_type", "") or "").strip().lower()
-    if model_type != "gemma3":
-        return
-
-    cfg_path = output_dir / _ADAPTER_CONFIG_FILENAME
-    if not cfg_path.exists():
-        return
-
-    try:
-        payload = json.loads(cfg_path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        raise RuntimeError(f"Failed to read PEFT adapter config for vLLM export: {cfg_path}") from exc
-
-    raw_target_modules = payload.get("target_modules")
-    if isinstance(raw_target_modules, str):
-        target_modules = [raw_target_modules]
-    elif isinstance(raw_target_modules, list):
-        target_modules = [str(name).strip() for name in raw_target_modules if str(name).strip()]
-    else:
-        return
-
-    replacements = {
-        "q_proj": "qkv_proj",
-        "k_proj": "qkv_proj",
-        "v_proj": "qkv_proj",
-        "gate_proj": "gate_up_proj",
-        "up_proj": "gate_up_proj",
-    }
-    rewritten: list[str] = []
-    seen: set[str] = set()
-    for name in target_modules:
-        mapped = replacements.get(name, name)
-        if mapped in seen:
-            continue
-        seen.add(mapped)
-        rewritten.append(mapped)
-
-    if rewritten == target_modules:
-        return
-
-    payload["target_modules"] = rewritten
-    cfg_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    logger.info(
-        "Rewrote Gemma3 PEFT adapter target_modules for vLLM compatibility: %s -> %s",
-        target_modules,
-        rewritten,
-    )
+    del model, output_dir
 
 
 def _build_zero3_peft_state_dict(model: Any) -> dict[str, Any] | None:
