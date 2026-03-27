@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import threading
 
@@ -429,7 +430,7 @@ def test_openai_esa_request_omits_reasoning_parser(monkeypatch: pytest.MonkeyPat
             captured["payload"] = json.loads(req.data.decode("utf-8"))
             return _FakeResponse()
 
-    monkeypatch.setattr(rewards_mod, "_temporarily_unset_proxy_env", lambda: (lambda: None))
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.local:8443")
     monkeypatch.setattr(rewards_mod.urllib_request, "build_opener", lambda *args, **kwargs: _FakeOpener())
 
     scorer = OpenAICompatibleESAScorer(
@@ -449,6 +450,7 @@ def test_openai_esa_request_omits_reasoning_parser(monkeypatch: pytest.MonkeyPat
     assert captured["timeout"] == 120.0
     assert "reasoning_parser" not in captured["payload"]
     assert captured["payload"]["chat_template_kwargs"] == {"enable_thinking": True}
+    assert os.environ["HTTPS_PROXY"] == "http://proxy.local:8443"
 
 
 def test_openai_esa_accepts_message_content_text_parts(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -478,7 +480,6 @@ def test_openai_esa_accepts_message_content_text_parts(monkeypatch: pytest.Monke
         def open(self, req, timeout=None):
             return _FakeResponse()
 
-    monkeypatch.setattr(rewards_mod, "_temporarily_unset_proxy_env", lambda: (lambda: None))
     monkeypatch.setattr(rewards_mod.urllib_request, "build_opener", lambda *args, **kwargs: _FakeOpener())
 
     scorer = OpenAICompatibleESAScorer(
@@ -570,7 +571,6 @@ def test_openai_esa_rejects_non_message_content_fallbacks(monkeypatch: pytest.Mo
         def open(self, req, timeout=None):
             return _FakeResponse()
 
-    monkeypatch.setattr(rewards_mod, "_temporarily_unset_proxy_env", lambda: (lambda: None))
     monkeypatch.setattr(rewards_mod.urllib_request, "build_opener", lambda *args, **kwargs: _FakeOpener())
 
     scorer = OpenAICompatibleESAScorer(

@@ -8,7 +8,7 @@ import os
 from pathlib import Path
 import subprocess
 import time
-from typing import Any, Callable
+from typing import Any
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 
@@ -62,27 +62,6 @@ _VLLM_CUSTOM_ALL_REDUCE_FLAG_STYLE_CACHE: dict[str, str] = {}
 class _VLLMChoice:
     text: str
     token_ids: list[int]
-
-
-def _temporarily_unset_proxy_env() -> Callable[[], None]:
-    keys = (
-        "HTTP_PROXY",
-        "HTTPS_PROXY",
-        "http_proxy",
-        "https_proxy",
-        "ALL_PROXY",
-        "all_proxy",
-    )
-    backup: dict[str, str] = {}
-    for key in keys:
-        if key in os.environ:
-            backup[key] = os.environ.pop(key)
-
-    def _restore() -> None:
-        for key, value in backup.items():
-            os.environ[key] = value
-
-    return _restore
 
 
 def _extract_text_content(value: Any) -> str:
@@ -198,7 +177,13 @@ class LocalVLLMRolloutClient:
 
     @property
     def adapter_dir(self) -> Path:
-        return Path(self._cfg.adapter_root_dir or "").resolve() / "current"
+        adapter_root_dir = str(self._cfg.adapter_root_dir or "").strip()
+        if not adapter_root_dir:
+            raise ValueError("vllm.adapter_root_dir must be a non-empty absolute path.")
+        adapter_root = Path(adapter_root_dir).expanduser()
+        if not adapter_root.is_absolute():
+            raise ValueError("vllm.adapter_root_dir must be a non-empty absolute path.")
+        return adapter_root.resolve() / "current"
 
     @property
     def server_base_url(self) -> str:
@@ -207,6 +192,10 @@ class LocalVLLMRolloutClient:
     @property
     def adapter_name(self) -> str:
         return str(self._cfg.adapter_name or "policy-lora").strip() or "policy-lora"
+
+    @property
+    def max_lora_rank(self) -> int:
+        return int(self._lora_rank)
 
     def start(self) -> None:
         if not self._owns_server:
@@ -411,8 +400,8 @@ class LocalVLLMRolloutClient:
             headers={"Content-Type": "application/json"},
             method=method,
         )
-        restore_proxy_env = _temporarily_unset_proxy_env()
         try:
+            # Bypass proxy env per-request without mutating process-global os.environ.
             opener = urllib_request.build_opener(urllib_request.ProxyHandler({}))
             with opener.open(req, timeout=float(self._cfg.request_timeout_sec)) as resp:
                 body = resp.read().decode("utf-8")
@@ -421,8 +410,6 @@ class LocalVLLMRolloutClient:
             raise RuntimeError(f"vLLM request failed status={exc.code} path={path} body={body}") from exc
         except urllib_error.URLError as exc:
             raise RuntimeError(f"vLLM request failed path={path}: {exc}") from exc
-        finally:
-            restore_proxy_env()
         try:
             return json.loads(body)
         except Exception:
@@ -455,14 +442,17 @@ class LocalVLLMRolloutClient:
     def _generate_one_prompt(
         self,
         *,
-        rendered_prompt_text: str,
+        prompt_token_ids: list[int],
         gen_cfg: GenerationConfig,
         stop_token_ids: list[int],
     ) -> list[_VLLMChoice]:
         do_sample = bool(gen_cfg.do_sample and gen_cfg.temperature > 0)
+        normalized_prompt_token_ids = [int(tok) for tok in prompt_token_ids]
         payload: dict[str, Any] = {
             "model": self.adapter_name,
-            "prompt": rendered_prompt_text,
+            # Submit prompt token ids directly so vLLM generation is conditioned on
+            # the exact same prefix used later for local policy/reference logprobs.
+            "prompt": normalized_prompt_token_ids,
             "max_tokens": int(gen_cfg.max_new_tokens),
             "n": max(1, int(gen_cfg.num_samples_per_prompt)),
             "stream": False,
@@ -486,6 +476,14 @@ class LocalVLLMRolloutClient:
         for raw_choice in choices:
             if not isinstance(raw_choice, dict):
                 raise RuntimeError(f"vLLM response contains invalid choice: {raw_choice!r}")
+            prompt_token_ids_raw = raw_choice.get("prompt_token_ids")
+            if isinstance(prompt_token_ids_raw, list):
+                echoed_prompt_token_ids = [int(tok) for tok in prompt_token_ids_raw]
+                if echoed_prompt_token_ids != normalized_prompt_token_ids:
+                    raise RuntimeError(
+                        "vLLM prompt token ids mismatch: "
+                        f"submitted={normalized_prompt_token_ids} echoed={echoed_prompt_token_ids}"
+                    )
             token_ids_raw = raw_choice.get("token_ids")
             token_ids: list[int] = []
             if isinstance(token_ids_raw, list):
@@ -506,22 +504,22 @@ class LocalVLLMRolloutClient:
     def generate_choices(
         self,
         *,
-        rendered_prompt_texts: list[str],
+        prompt_token_id_rows: list[list[int]],
         gen_cfg: GenerationConfig,
         stop_token_ids: list[int],
         show_progress: bool = False,
         progress_desc: str | None = None,
     ) -> list[list[_VLLMChoice]]:
-        if not rendered_prompt_texts:
+        if not prompt_token_id_rows:
             return []
-        max_workers = max(1, min(len(rendered_prompt_texts), int(self._cfg.max_num_seqs or 8), 8))
-        results: list[list[_VLLMChoice] | None] = [None] * len(rendered_prompt_texts)
+        max_workers = max(1, min(len(prompt_token_id_rows), int(self._cfg.max_num_seqs or 8), 8))
+        results: list[list[_VLLMChoice] | None] = [None] * len(prompt_token_id_rows)
 
-        iterable = list(enumerate(rendered_prompt_texts))
+        iterable = list(enumerate(prompt_token_id_rows))
         bar = None
         if show_progress and tqdm is not None:
             bar = tqdm(
-                total=len(rendered_prompt_texts),
+                total=len(prompt_token_id_rows),
                 desc=progress_desc or "vllm rollout",
                 leave=False,
                 mininterval=2.0,
@@ -532,11 +530,11 @@ class LocalVLLMRolloutClient:
                 futures = {
                     executor.submit(
                         self._generate_one_prompt,
-                        rendered_prompt_text=prompt_text,
+                        prompt_token_ids=prompt_token_ids,
                         gen_cfg=gen_cfg,
                         stop_token_ids=stop_token_ids,
                     ): idx
-                    for idx, prompt_text in iterable
+                    for idx, prompt_token_ids in iterable
                 }
                 for future in as_completed(futures):
                     idx = futures[future]
@@ -626,15 +624,6 @@ def generate_rollouts_vllm(
         gen_cfg=gen_cfg,
         pad_token_id=pad_token_id,
     )
-    rendered_prompt_texts = [
-        tokenizer.decode(
-            prompt_ids,
-            skip_special_tokens=False,
-            clean_up_tokenization_spaces=False,
-        )
-        for prompt_ids in prompt_id_rows
-    ]
-
     if should_log_raw_io:
         for ex_idx, ex in enumerate(examples):
             if raw_io_max_rows > 0 and ex_idx >= raw_io_max_rows:
@@ -642,15 +631,13 @@ def generate_rollouts_vllm(
             prompt_ids = prompt_id_rows[ex_idx] if ex_idx < len(prompt_id_rows) else []
             prompt_tokens = _safe_convert_ids_to_tokens(tokenizer, prompt_ids)
             prompt_decoded_with_specials = _safe_decode_ids_with_specials(tokenizer, prompt_ids)
-            rendered_prompt = rendered_prompt_texts[ex_idx] if ex_idx < len(rendered_prompt_texts) else ""
             logger.info(
-                "[raw-io][%s][input] ex_idx=%s example_id=%s prompt=%r rendered_prompt=%r prompt_ids=%s prompt_tokens=%s "
+                "[raw-io][%s][input] ex_idx=%s example_id=%s prompt=%r prompt_ids=%s prompt_tokens=%s "
                 "prompt_decoded_with_specials=%r",
                 raw_phase,
                 ex_idx,
                 ex.example_id,
                 _truncate_for_log(prompt_texts[ex_idx], raw_io_max_chars),
-                _truncate_for_log(rendered_prompt, raw_io_max_chars),
                 _truncate_for_log(json.dumps(prompt_ids, ensure_ascii=False), raw_io_max_chars),
                 _truncate_for_log(json.dumps(prompt_tokens, ensure_ascii=False), raw_io_max_chars),
                 _truncate_for_log(prompt_decoded_with_specials, raw_io_max_chars),
@@ -664,7 +651,7 @@ def generate_rollouts_vllm(
         )
 
     completion_rows = vllm_rollout_client.generate_choices(
-        rendered_prompt_texts=rendered_prompt_texts,
+        prompt_token_id_rows=prompt_id_rows,
         gen_cfg=gen_cfg,
         stop_token_ids=eos_token_ids,
         show_progress=show_progress,

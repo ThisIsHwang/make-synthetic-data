@@ -221,27 +221,6 @@ def _extract_openai_response_text(
     return content
 
 
-def _temporarily_unset_proxy_env() -> Callable[[], None]:
-    keys = (
-        "HTTP_PROXY",
-        "HTTPS_PROXY",
-        "http_proxy",
-        "https_proxy",
-        "ALL_PROXY",
-        "all_proxy",
-    )
-    backup: dict[str, str] = {}
-    for key in keys:
-        if key in os.environ:
-            backup[key] = os.environ.pop(key)
-
-    def _restore() -> None:
-        for key, value in backup.items():
-            os.environ[key] = value
-
-    return _restore
-
-
 class _ScorerSubprocessClient:
     def __init__(
         self,
@@ -3131,13 +3110,10 @@ class OpenAICompatibleGroupRankScorer:
 
         try:
             timeout = float(self.cfg.timeout_s or self.cfg.timeout_sec)
-            restore_proxy_env = _temporarily_unset_proxy_env()
-            try:
-                opener = urllib_request.build_opener(urllib_request.ProxyHandler({}))
-                with opener.open(req, timeout=timeout) as resp:
-                    resp_body = resp.read().decode("utf-8")
-            finally:
-                restore_proxy_env()
+            # Bypass proxy env per-request without mutating process-global os.environ.
+            opener = urllib_request.build_opener(urllib_request.ProxyHandler({}))
+            with opener.open(req, timeout=timeout) as resp:
+                resp_body = resp.read().decode("utf-8")
         except urllib_error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
             raise RuntimeError(f"group rank API HTTPError status={exc.code} body={detail}") from exc
@@ -4182,18 +4158,14 @@ class OpenAICompatibleMQMScorer:
 
         try:
             timeout = float(self.cfg.timeout_s or self.cfg.timeout_sec)
-            restore_proxy_env = _temporarily_unset_proxy_env()
-            try:
-                opener = urllib_request.build_opener(urllib_request.ProxyHandler({}))
-                with opener.open(req, timeout=timeout) as resp:
-                    resp_body = resp.read().decode("utf-8")
-                    if log_io:
-                        logger.info(
-                            "[mqm-io] response_body=%s",
-                            _truncate_for_log(resp_body, log_max_chars),
-                        )
-            finally:
-                restore_proxy_env()
+            opener = urllib_request.build_opener(urllib_request.ProxyHandler({}))
+            with opener.open(req, timeout=timeout) as resp:
+                resp_body = resp.read().decode("utf-8")
+                if log_io:
+                    logger.info(
+                        "[mqm-io] response_body=%s",
+                        _truncate_for_log(resp_body, log_max_chars),
+                    )
         except urllib_error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
             if log_io:
@@ -4521,18 +4493,14 @@ class OpenAICompatibleESAScorer:
 
         try:
             timeout = float(self.cfg.timeout_s or self.cfg.timeout_sec)
-            restore_proxy_env = _temporarily_unset_proxy_env()
-            try:
-                opener = urllib_request.build_opener(urllib_request.ProxyHandler({}))
-                with opener.open(req, timeout=timeout) as resp:
-                    resp_body = resp.read().decode("utf-8")
-                    if log_io:
-                        logger.info(
-                            "[esa-io] response_body=%s",
-                            _truncate_for_log(resp_body, log_max_chars),
-                        )
-            finally:
-                restore_proxy_env()
+            opener = urllib_request.build_opener(urllib_request.ProxyHandler({}))
+            with opener.open(req, timeout=timeout) as resp:
+                resp_body = resp.read().decode("utf-8")
+                if log_io:
+                    logger.info(
+                        "[esa-io] response_body=%s",
+                        _truncate_for_log(resp_body, log_max_chars),
+                    )
         except urllib_error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
             if log_io:

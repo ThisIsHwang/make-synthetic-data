@@ -9,7 +9,12 @@ from pathlib import Path
 import sys
 from typing import Any
 
-from transformers import AutoTokenizer
+_TRANSFORMERS_IMPORT_ERROR: Exception | None = None
+try:
+    from transformers import AutoTokenizer
+except Exception as exc:  # pragma: no cover - optional during lightweight tests
+    _TRANSFORMERS_IMPORT_ERROR = exc
+    AutoTokenizer = None  # type: ignore[assignment]
 
 from .cli import _install_exception_logging, _setup_logging
 from .config import DataConfig, GenerationConfig, RLPostTrainConfig, load_config
@@ -21,6 +26,19 @@ from .utils import configure_huggingface_cache, resolve_huggingface_token
 
 logger = logging.getLogger(__name__)
 _PROMPT_LENGTH_CACHE_VERSION = 1
+
+
+def _require_transformers_import(context: str) -> None:
+    if _TRANSFORMERS_IMPORT_ERROR is None and AutoTokenizer is not None:
+        return
+    detail = (
+        f"{type(_TRANSFORMERS_IMPORT_ERROR).__name__}: {_TRANSFORMERS_IMPORT_ERROR}"
+        if _TRANSFORMERS_IMPORT_ERROR is not None
+        else "transformers import is unavailable"
+    )
+    raise RuntimeError(
+        f"{context} requires the `transformers` package, but it could not be imported. {detail}"
+    )
 
 
 @dataclass(frozen=True)
@@ -316,6 +334,7 @@ def _should_prepare_prompt_lengths(cfg: RLPostTrainConfig, *, force_prompt_lengt
 
 
 def load_preprocess_tokenizer(cfg: RLPostTrainConfig) -> Any:
+    _require_transformers_import("load_preprocess_tokenizer")
     tokenizer_name = cfg.model.tokenizer_name_or_path or cfg.model.policy_name_or_path
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=cfg.model.use_fast_tokenizer)
     if tokenizer.pad_token is None and tokenizer.eos_token is not None:

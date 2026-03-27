@@ -10,6 +10,7 @@ pytest.importorskip("torch")
 import torch
 
 from gemma27_rl.config import RLPostTrainConfig
+from gemma27_rl import preprocess as preprocess_mod
 from gemma27_rl.preprocess import (
     filter_examples_by_max_prompt_tokens,
     prepare_dataset_artifacts,
@@ -145,6 +146,17 @@ def test_filter_examples_by_max_prompt_tokens_filters_long_examples() -> None:
     assert [example.example_id for example in filtered_examples] == ["ex-0"]
     assert filtered_lengths == [100]
     assert dropped == 1
+
+
+def test_load_preprocess_tokenizer_raises_clear_error_when_transformers_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = RLPostTrainConfig()
+    monkeypatch.setattr(preprocess_mod, "AutoTokenizer", None)
+    monkeypatch.setattr(preprocess_mod, "_TRANSFORMERS_IMPORT_ERROR", ModuleNotFoundError("transformers"))
+
+    with pytest.raises(RuntimeError, match="load_preprocess_tokenizer requires the `transformers` package"):
+        preprocess_mod.load_preprocess_tokenizer(cfg)
 
 
 def test_compute_prompt_token_lengths_chunks_batches() -> None:

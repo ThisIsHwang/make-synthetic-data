@@ -4,6 +4,7 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, replace
 import datetime
+import ipaddress
 import json
 import logging
 import math
@@ -22,7 +23,13 @@ from typing import Any, Callable
 
 import torch
 import yaml
-from transformers import AutoModelForCausalLM, AutoTokenizer
+_TRANSFORMERS_IMPORT_ERROR: Exception | None = None
+try:
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+except Exception as exc:  # pragma: no cover - optional during lightweight tests
+    _TRANSFORMERS_IMPORT_ERROR = exc
+    AutoModelForCausalLM = None  # type: ignore[assignment]
+    AutoTokenizer = None  # type: ignore[assignment]
 
 try:
     import deepspeed
@@ -95,6 +102,19 @@ _DEFAULT_NGRAM_TOKEN_PENALTY = -1.0
 _DEFAULT_NGRAM_SEQUENCE_PENALTY = -0.5
 _DEFAULT_SPECIAL_TOKEN_PENALTY = -50.0
 _DEFAULT_SPECIAL_SEQUENCE_PENALTY = -10.0
+
+
+def _require_transformers_import(context: str) -> None:
+    if _TRANSFORMERS_IMPORT_ERROR is None and AutoModelForCausalLM is not None and AutoTokenizer is not None:
+        return
+    detail = (
+        f"{type(_TRANSFORMERS_IMPORT_ERROR).__name__}: {_TRANSFORMERS_IMPORT_ERROR}"
+        if _TRANSFORMERS_IMPORT_ERROR is not None
+        else "transformers import is unavailable"
+    )
+    raise RuntimeError(
+        f"{context} requires the `transformers` package, but it could not be imported. {detail}"
+    )
 
 
 def _effective_esa_runtime_cfg(cfg: RLPostTrainConfig) -> Any:
@@ -1276,6 +1296,20 @@ def _broadcast_object_list(payload: list[Any], src: int = 0) -> list[Any]:
     if _is_distributed_initialized():
         torch.distributed.broadcast_object_list(payload, src=src)
     return payload
+
+
+def _all_gather_object(local_obj: Any) -> list[Any]:
+    if not _is_distributed_initialized():
+        return [local_obj]
+    world_size = _distributed_world_size()
+    gathered: list[Any] = [None for _ in range(world_size)]
+    # NCCL collectives used by all_gather_object require the current CUDA device
+    # to match this process local rank.
+    local_rank_raw = os.environ.get("LOCAL_RANK")
+    if torch.cuda.is_available() and local_rank_raw and local_rank_raw.isdigit():
+        torch.cuda.set_device(int(local_rank_raw))
+    torch.distributed.all_gather_object(gathered, local_obj)
+    return gathered
 
 
 def _gather_object_to_rank0(local_obj: Any) -> list[Any] | None:
@@ -2739,6 +2773,7 @@ def _resolve_reference_attn_implementation(
 
 
 _ADAPTER_CONFIG_FILENAME = "adapter_config.json"
+_VLLM_ADAPTER_WEIGHT_PATTERNS: tuple[str, ...] = ("adapter_model*.safetensors", "adapter_model*.bin")
 
 
 def _lora_enabled(cfg: RLPostTrainConfig) -> bool:
@@ -2771,10 +2806,110 @@ def _read_local_adapter_base_model_name_or_path(model_name_or_path: str) -> str 
     return base_source or None
 
 
+def _read_local_adapter_lora_rank(model_name_or_path: str | Path | None) -> int | None:
+    if model_name_or_path is None:
+        return None
+    path = Path(str(model_name_or_path)).expanduser()
+    cfg_path = path / _ADAPTER_CONFIG_FILENAME
+    if not cfg_path.exists():
+        return None
+    try:
+        payload = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise RuntimeError(f"Failed to read LoRA adapter config: {cfg_path}") from exc
+    raw_rank = payload.get("r")
+    if raw_rank is None:
+        return None
+    try:
+        rank = int(raw_rank)
+    except Exception as exc:
+        raise RuntimeError(f"Invalid LoRA adapter rank in {cfg_path}: r={raw_rank!r}") from exc
+    if rank <= 0:
+        raise RuntimeError(f"Invalid LoRA adapter rank in {cfg_path}: r={rank}")
+    return rank
+
+
+def _resolve_vllm_server_lora_rank(cfg: RLPostTrainConfig, policy_source: str) -> int:
+    configured_rank = max(1, int(cfg.model.lora.r))
+    adapter_rank = _read_local_adapter_lora_rank(policy_source)
+    if adapter_rank is None:
+        return configured_rank
+    resolved_rank = max(configured_rank, adapter_rank)
+    if adapter_rank != configured_rank:
+        logger.warning(
+            "Resolved vLLM max_lora_rank=%s from config rank=%s and adapter rank=%s at %s.",
+            resolved_rank,
+            configured_rank,
+            adapter_rank,
+            policy_source,
+        )
+    return resolved_rank
+
+
 def _checkpoint_has_model_artifacts(path: Path | None) -> bool:
     if path is None or (not path.is_dir()):
         return False
     return (path / "config.json").exists() or (path / _ADAPTER_CONFIG_FILENAME).exists()
+
+
+def _remove_path(path: Path) -> None:
+    if path.is_symlink() or path.is_file():
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        return
+    if path.exists():
+        shutil.rmtree(path)
+
+
+def _resolve_vllm_current_adapter_target(current_path: Path) -> Path | None:
+    if current_path.is_symlink():
+        try:
+            return current_path.resolve(strict=False)
+        except OSError:
+            return None
+    if current_path.exists():
+        return current_path
+    return None
+
+
+def _validate_exported_vllm_adapter_dir(adapter_path: Path) -> None:
+    if not adapter_path.is_dir():
+        raise RuntimeError(f"Exported vLLM adapter directory is missing: {adapter_path}")
+
+    cfg_path = adapter_path / _ADAPTER_CONFIG_FILENAME
+    if not cfg_path.is_file():
+        raise RuntimeError(f"Exported vLLM adapter is missing {cfg_path.name}: {adapter_path}")
+    try:
+        json.loads(cfg_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise RuntimeError(f"Exported vLLM adapter config is unreadable: {cfg_path}") from exc
+
+    weight_files = [
+        path
+        for pattern in _VLLM_ADAPTER_WEIGHT_PATTERNS
+        for path in adapter_path.glob(pattern)
+        if path.is_file()
+    ]
+    if not weight_files:
+        raise RuntimeError(
+            "Exported vLLM adapter is missing adapter weights "
+            f"at {adapter_path} (expected patterns={_VLLM_ADAPTER_WEIGHT_PATTERNS})."
+        )
+
+
+def _promote_vllm_adapter_candidate(*, current_path: Path, candidate_path: Path) -> None:
+    cleanup_target = _resolve_vllm_current_adapter_target(current_path)
+    if cleanup_target == current_path or cleanup_target == candidate_path:
+        cleanup_target = None
+
+    _remove_path(current_path)
+    current_path.parent.mkdir(parents=True, exist_ok=True)
+    current_path.symlink_to(candidate_path, target_is_directory=True)
+
+    if cleanup_target is not None:
+        _remove_path(cleanup_target)
 
 
 def _build_lora_config(cfg: RLPostTrainConfig) -> Any:
@@ -2831,6 +2966,7 @@ def _load_causal_lm(
     gpu_ids: list[int],
     component_name: str,
 ) -> AutoModelForCausalLM:
+    _require_transformers_import(f"Loading the {component_name} model")
     explicit_gpu_ids = _normalize_gpu_id_list(gpu_ids)
     if len(explicit_gpu_ids) <= 1:
         model = AutoModelForCausalLM.from_pretrained(model_name_or_path, **kwargs)
@@ -3336,6 +3472,59 @@ def _vllm_rollout_enabled(cfg: RLPostTrainConfig) -> bool:
     return bool(getattr(getattr(cfg, "vllm", None), "enabled", False))
 
 
+def _is_loopback_or_unspecified_host(host: str | None) -> bool:
+    text = str(host or "").strip()
+    if not text:
+        return True
+    normalized = text.strip().strip("[]")
+    lowered = normalized.lower()
+    if lowered == "localhost":
+        return True
+    try:
+        parsed = ipaddress.ip_address(normalized)
+    except ValueError:
+        return False
+    return bool(parsed.is_loopback or parsed.is_unspecified)
+
+
+def _is_multinode_deepspeed_runtime(cfg: RLPostTrainConfig) -> bool:
+    if str(cfg.rl.backend).strip().lower() != "deepspeed":
+        return False
+    world_size = _distributed_world_size()
+    if world_size <= 1:
+        return False
+    raw_local_world_size = os.environ.get("LOCAL_WORLD_SIZE")
+    if raw_local_world_size and raw_local_world_size.isdigit():
+        local_world_size = int(raw_local_world_size)
+    else:
+        local_world_size = len(_normalize_gpu_id_list(cfg.model.policy_gpu_ids))
+    return local_world_size > 0 and world_size > local_world_size
+
+
+def _resolve_vllm_runtime_host(cfg: RLPostTrainConfig) -> str:
+    configured_host = str(cfg.vllm.host or "").strip()
+    if not _is_multinode_deepspeed_runtime(cfg):
+        return configured_host
+    if not _is_loopback_or_unspecified_host(configured_host):
+        return configured_host
+
+    master_addr = str(os.environ.get("MASTER_ADDR") or "").strip()
+    if master_addr and not _is_loopback_or_unspecified_host(master_addr):
+        if _is_rank0():
+            logger.warning(
+                "Resolved vLLM host from loopback/unspecified %r to MASTER_ADDR=%r for multi-node DeepSpeed.",
+                configured_host,
+                master_addr,
+            )
+        return master_addr
+
+    raise ValueError(
+        "Multi-node DeepSpeed with vLLM requires vllm.host to be reachable from non-rank0 nodes. "
+        f"Configured host={configured_host!r} master_addr={master_addr!r}. "
+        "Set vllm.host to rank0's externally reachable hostname/IP or provide a non-loopback MASTER_ADDR."
+    )
+
+
 def _create_vllm_rollout_client(
     *,
     cfg: RLPostTrainConfig,
@@ -3346,11 +3535,14 @@ def _create_vllm_rollout_client(
     startup_reason: str,
 ) -> LocalVLLMRolloutClient:
     vllm_base_model_source = _read_local_adapter_base_model_name_or_path(policy_source) or policy_source
+    vllm_lora_rank = _resolve_vllm_server_lora_rank(cfg, policy_source)
+    effective_vllm_host = _resolve_vllm_runtime_host(cfg)
+    vllm_cfg = replace(cfg.vllm, host=effective_vllm_host) if effective_vllm_host != cfg.vllm.host else cfg.vllm
     client = LocalVLLMRolloutClient(
-        cfg=cfg.vllm,
+        cfg=vllm_cfg,
         base_model_name_or_path=vllm_base_model_source,
         tokenizer_name_or_path=tokenizer_source,
-        lora_rank=int(cfg.model.lora.r),
+        lora_rank=vllm_lora_rank,
         trust_remote_code=bool(cfg.model.trust_remote_code),
         dtype=cfg.misc.dtype,
         log_path=output_dir / "vllm_server.log",
@@ -3358,12 +3550,13 @@ def _create_vllm_rollout_client(
     )
     if owns_server:
         logger.info(
-            "Starting local vLLM rollout server for %s: base_model=%s tokenizer=%s tp=%s gpus=%s",
+            "Starting local vLLM rollout server for %s: base_model=%s tokenizer=%s tp=%s gpus=%s max_lora_rank=%s",
             startup_reason,
             vllm_base_model_source,
             tokenizer_source,
-            int(cfg.vllm.tensor_parallel_size or 1),
-            cfg.vllm.gpu_ids,
+            int(vllm_cfg.tensor_parallel_size or 1),
+            vllm_cfg.gpu_ids,
+            vllm_lora_rank,
         )
         client.start()
     return client
@@ -3434,18 +3627,85 @@ def _sync_vllm_rollout_adapter(
     if vllm_rollout_client is None:
         return
     adapter_dir = vllm_rollout_client.adapter_dir
+    adapter_root = adapter_dir.parent
+    candidate_dir = adapter_root / f"candidate-{update_idx}"
     if _is_rank0():
-        logger.info("update=%s refreshing vLLM rollout adapter at %s", update_idx, adapter_dir)
-        vllm_rollout_client.unload_adapter()
-        if adapter_dir.exists():
-            shutil.rmtree(adapter_dir)
-        adapter_dir.parent.mkdir(parents=True, exist_ok=True)
+        logger.info(
+            "update=%s staging vLLM rollout adapter candidate at %s (current=%s)",
+            update_idx,
+            candidate_dir,
+            adapter_dir,
+        )
+        adapter_root.mkdir(parents=True, exist_ok=True)
+        _remove_path(candidate_dir)
     _dist_barrier()
-    _save_pretrained_model(policy_model, adapter_dir, require_peft_adapter=True)
-    _dist_barrier()
+
+    _save_pretrained_model(policy_model, candidate_dir, require_peft_adapter=True)
+
+    load_error_text: str | None = None
     if _is_rank0():
-        vllm_rollout_client.load_adapter(adapter_dir)
-    _dist_barrier()
+        rollback_target = _resolve_vllm_current_adapter_target(adapter_dir)
+        try:
+            _validate_exported_vllm_adapter_dir(candidate_dir)
+            candidate_lora_rank = _read_local_adapter_lora_rank(candidate_dir)
+            if candidate_lora_rank is not None and candidate_lora_rank > vllm_rollout_client.max_lora_rank:
+                raise RuntimeError(
+                    "Exported vLLM adapter rank exceeds server max_lora_rank: "
+                    f"adapter_r={candidate_lora_rank} max_lora_rank={vllm_rollout_client.max_lora_rank} "
+                    f"adapter_dir={candidate_dir}"
+                )
+            vllm_rollout_client.unload_adapter()
+            vllm_rollout_client.load_adapter(candidate_dir)
+        except Exception as exc:
+            logger.exception(
+                "update=%s failed to load staged vLLM rollout adapter from %s",
+                update_idx,
+                candidate_dir,
+            )
+            rollback_error_text: str | None = None
+            if rollback_target is not None and rollback_target.exists():
+                try:
+                    vllm_rollout_client.load_adapter(rollback_target)
+                    logger.warning(
+                        "update=%s restored previous vLLM rollout adapter from %s after failure.",
+                        update_idx,
+                        rollback_target,
+                    )
+                except Exception as rollback_exc:
+                    logger.exception(
+                        "update=%s failed to restore previous vLLM rollout adapter from %s",
+                        update_idx,
+                        rollback_target,
+                    )
+                    rollback_error_text = f"{type(rollback_exc).__name__}: {rollback_exc}"
+            load_error_text = f"{type(exc).__name__}: {exc}"
+            if rollback_error_text is not None:
+                load_error_text = f"{load_error_text}; rollback={rollback_error_text}"
+
+    load_shared: list[Any] = [load_error_text if _is_rank0() else None]
+    _broadcast_object_list(load_shared, src=0)
+    if load_shared[0]:
+        raise RuntimeError(f"update={update_idx} failed to refresh vLLM rollout adapter: {load_shared[0]}")
+
+    promote_error_text: str | None = None
+    if _is_rank0():
+        try:
+            _promote_vllm_adapter_candidate(current_path=adapter_dir, candidate_path=candidate_dir)
+        except Exception as exc:
+            logger.exception(
+                "update=%s failed to promote staged vLLM rollout adapter from %s to %s",
+                update_idx,
+                candidate_dir,
+                adapter_dir,
+            )
+            promote_error_text = f"{type(exc).__name__}: {exc}"
+
+    promote_shared: list[Any] = [promote_error_text if _is_rank0() else None]
+    _broadcast_object_list(promote_shared, src=0)
+    if promote_shared[0]:
+        raise RuntimeError(
+            f"update={update_idx} loaded vLLM rollout adapter but failed to promote it: {promote_shared[0]}"
+        )
 
 
 def _prepare_training_batch_rollouts_and_advantages(
@@ -5219,36 +5479,56 @@ def _build_zero3_peft_state_dict(model: Any) -> dict[str, Any] | None:
 
 def _save_pretrained_model(model: Any, output_dir: Path, *, require_peft_adapter: bool = False) -> None:
     export_model = _resolve_peft_export_model(model)
-    zero3_state_dict = _build_zero3_peft_state_dict(model)
-    _dist_barrier()
+    zero3_state_dict: dict[str, Any] | None = None
+    build_error_text: str | None = None
+    try:
+        zero3_state_dict = _build_zero3_peft_state_dict(model)
+    except Exception as exc:
+        logger.exception("Failed to build export state dict for %s", output_dir)
+        build_error_text = f"{type(exc).__name__}: {exc}"
+
+    build_errors = _all_gather_object(build_error_text)
+    first_build_error = next((str(err) for err in build_errors if err), None)
+    if first_build_error is not None:
+        raise RuntimeError(f"Failed to build export state dict for {output_dir}: {first_build_error}")
+
+    save_error_text: str | None = None
     if _is_rank0():
-        if export_model is not None:
-            if zero3_state_dict is None:
-                raise RuntimeError(
-                    f"Failed to build PEFT adapter state dict for export to {output_dir}."
+        try:
+            if export_model is not None:
+                if zero3_state_dict is None:
+                    raise RuntimeError(
+                        f"Failed to build PEFT adapter state dict for export to {output_dir}."
+                    )
+                if not zero3_state_dict:
+                    raise RuntimeError(
+                        f"Refusing to export an empty LoRA adapter for vLLM at {output_dir}."
+                    )
+                if require_peft_adapter:
+                    zero3_state_dict = _rewrite_peft_state_dict_for_vllm(export_model, zero3_state_dict)
+                logger.info(
+                    "Exporting PEFT adapter to %s with %s tensor(s); sample_keys=%s",
+                    output_dir,
+                    len(zero3_state_dict),
+                    list(zero3_state_dict.keys())[:5],
                 )
-            if not zero3_state_dict:
-                raise RuntimeError(
-                    f"Refusing to export an empty LoRA adapter for vLLM at {output_dir}."
-                )
-            if require_peft_adapter:
-                zero3_state_dict = _rewrite_peft_state_dict_for_vllm(export_model, zero3_state_dict)
-            logger.info(
-                "Exporting PEFT adapter to %s with %s tensor(s); sample_keys=%s",
-                output_dir,
-                len(zero3_state_dict),
-                list(zero3_state_dict.keys())[:5],
-            )
-            export_model.save_pretrained(output_dir, state_dict=zero3_state_dict)
-            if require_peft_adapter:
-                _rewrite_peft_adapter_config_for_vllm(export_model, output_dir)
-        else:
-            if require_peft_adapter:
-                raise RuntimeError(
-                    "vLLM rollout requires a PEFT policy model, but no PeftModel wrapper was found during export."
-                )
-            model.save_pretrained(output_dir)
-    _dist_barrier()
+                export_model.save_pretrained(output_dir, state_dict=zero3_state_dict)
+                if require_peft_adapter:
+                    _rewrite_peft_adapter_config_for_vllm(export_model, output_dir)
+            else:
+                if require_peft_adapter:
+                    raise RuntimeError(
+                        "vLLM rollout requires a PEFT policy model, but no PeftModel wrapper was found during export."
+                    )
+                model.save_pretrained(output_dir)
+        except Exception as exc:
+            logger.exception("Failed to export pretrained model to %s", output_dir)
+            save_error_text = f"{type(exc).__name__}: {exc}"
+
+    save_shared: list[Any] = [save_error_text if _is_rank0() else None]
+    _broadcast_object_list(save_shared, src=0)
+    if save_shared[0]:
+        raise RuntimeError(f"Failed to export pretrained model to {output_dir}: {save_shared[0]}")
 
 
 def _save_deepspeed_checkpoint_to_dir(
@@ -5428,6 +5708,7 @@ def _should_enable_xcomet_runtime(cfg: RLPostTrainConfig) -> bool:
 
 
 def run_metric_only_eval(cfg: RLPostTrainConfig) -> dict[str, Any]:
+    _require_transformers_import("run_metric_only_eval")
     set_seed(cfg.misc.seed)
     hf_token = resolve_huggingface_token(
         explicit_token=cfg.misc.huggingface_token,
@@ -5555,6 +5836,7 @@ def run_metric_only_eval(cfg: RLPostTrainConfig) -> dict[str, Any]:
 
 
 def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
+    _require_transformers_import("run_toy_rl")
     set_seed(cfg.misc.seed)
     _configure_nccl_heartbeat_timeout(cfg)
     _configure_cuda_allocator()

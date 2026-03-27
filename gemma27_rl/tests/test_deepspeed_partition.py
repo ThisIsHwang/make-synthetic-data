@@ -4,6 +4,7 @@ import datetime
 import json
 from contextlib import nullcontext
 import os
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -18,10 +19,16 @@ from gemma27_rl.trainer import (
     _configure_nccl_heartbeat_timeout,
     _init_deepspeed_distributed,
     _is_deepspeed_resume_shard_mismatch_error,
+    _load_policy_model,
+    _read_local_adapter_lora_rank,
+    _resolve_vllm_server_lora_rank,
+    _resolve_vllm_runtime_host,
+    _resolve_vllm_current_adapter_target,
     _rewrite_peft_adapter_config_for_vllm,
     _rewrite_peft_state_dict_for_vllm,
     _register_qwen35_zero3_external_parameters,
-    _load_policy_model,
+    _sync_vllm_rollout_adapter,
+    _validate_exported_vllm_adapter_dir,
     _validate_deepspeed_partition_strict,
 )
 
@@ -86,6 +93,35 @@ def test_deepspeed_partition_colocated_reference_overlap_allowed(monkeypatch: py
     monkeypatch.setenv("LOCAL_RANK", "0")
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1,2,3,4,5,6,7")
     _validate_deepspeed_partition_strict(cfg)
+
+
+def test_resolve_vllm_runtime_host_uses_master_addr_for_multinode_loopback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = _base_cfg()
+    cfg.model.policy_gpu_ids = [0, 1, 2, 3]
+    cfg.vllm.host = "127.0.0.1"
+    monkeypatch.setenv("WORLD_SIZE", "8")
+    monkeypatch.delenv("LOCAL_WORLD_SIZE", raising=False)
+    monkeypatch.setenv("MASTER_ADDR", "10.0.0.8")
+
+    resolved = _resolve_vllm_runtime_host(cfg)
+
+    assert resolved == "10.0.0.8"
+
+
+def test_resolve_vllm_runtime_host_raises_for_multinode_loopback_without_reachable_master_addr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = _base_cfg()
+    cfg.model.policy_gpu_ids = [0, 1, 2, 3]
+    cfg.vllm.host = "localhost"
+    monkeypatch.setenv("WORLD_SIZE", "8")
+    monkeypatch.delenv("LOCAL_WORLD_SIZE", raising=False)
+    monkeypatch.setenv("MASTER_ADDR", "127.0.0.1")
+
+    with pytest.raises(ValueError, match="Multi-node DeepSpeed with vLLM requires vllm.host"):
+        _resolve_vllm_runtime_host(cfg)
 
 
 def test_assign_disjoint_keeps_physical_reserved_ids_under_deepspeed_include(
@@ -184,6 +220,23 @@ def test_save_deepspeed_checkpoint_wrapper_passes_hf_model(monkeypatch: pytest.M
 
     assert result == tmp_path / "checkpoint-7"
     assert captured["hf_model"] is hf_model
+
+
+def test_load_causal_lm_raises_clear_error_when_transformers_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(trainer_mod, "AutoModelForCausalLM", None)
+    monkeypatch.setattr(trainer_mod, "AutoTokenizer", None)
+    monkeypatch.setattr(trainer_mod, "_TRANSFORMERS_IMPORT_ERROR", ModuleNotFoundError("transformers"))
+
+    with pytest.raises(RuntimeError, match="Loading the policy model requires the `transformers` package"):
+        trainer_mod._load_causal_lm(
+            model_name_or_path="dummy",
+            kwargs={},
+            single_device="cpu",
+            gpu_ids=[0],
+            component_name="policy",
+        )
 
 
 def test_save_deepspeed_resume_checkpoint_wrapper_passes_hf_model(
@@ -389,6 +442,163 @@ def test_build_zero3_peft_state_dict_gathers_trainable_params(monkeypatch: pytes
     assert isinstance(params, list)
     assert params == [model.lora]
     assert captured["modifier_rank"] == 0
+
+
+def test_validate_exported_vllm_adapter_dir_requires_weight_artifact(tmp_path: Path) -> None:
+    (tmp_path / "adapter_config.json").write_text('{"base_model_name_or_path": "base"}', encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="missing adapter weights"):
+        _validate_exported_vllm_adapter_dir(tmp_path)
+
+
+def test_read_local_adapter_lora_rank_reads_rank_from_adapter_config(tmp_path: Path) -> None:
+    (tmp_path / "adapter_config.json").write_text('{"base_model_name_or_path": "base", "r": 96}', encoding="utf-8")
+
+    assert _read_local_adapter_lora_rank(tmp_path) == 96
+
+
+def test_resolve_vllm_server_lora_rank_uses_larger_adapter_rank(tmp_path: Path) -> None:
+    cfg = _base_cfg()
+    cfg.model.lora.enabled = True
+    cfg.model.lora.r = 64
+    (tmp_path / "adapter_config.json").write_text('{"base_model_name_or_path": "base", "r": 128}', encoding="utf-8")
+
+    assert _resolve_vllm_server_lora_rank(cfg, str(tmp_path)) == 128
+
+
+def test_sync_vllm_rollout_adapter_promotes_candidate_after_success(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    adapter_root = tmp_path / "vllm_adapters"
+    current_dir = adapter_root / "current"
+    old_dir = adapter_root / "candidate-5"
+    old_dir.mkdir(parents=True)
+    (old_dir / "adapter_config.json").write_text('{"base_model_name_or_path": "base"}', encoding="utf-8")
+    (old_dir / "adapter_model.safetensors").write_text("old", encoding="utf-8")
+    current_dir.symlink_to(old_dir, target_is_directory=True)
+
+    saved_paths: list[Path] = []
+    load_calls: list[Path] = []
+    unload_calls: list[str] = []
+
+    class _FakeClient:
+        adapter_dir = current_dir
+
+        def unload_adapter(self) -> None:
+            unload_calls.append("unload")
+
+        def load_adapter(self, adapter_path: Path) -> None:
+            load_calls.append(adapter_path)
+
+    def _fake_save(model, output_dir: Path, *, require_peft_adapter: bool = False) -> None:  # type: ignore[no-untyped-def]
+        assert require_peft_adapter is True
+        saved_paths.append(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "adapter_config.json").write_text('{"base_model_name_or_path": "base"}', encoding="utf-8")
+        (output_dir / "adapter_model.safetensors").write_text("new", encoding="utf-8")
+
+    monkeypatch.setattr(trainer_mod, "_save_pretrained_model", _fake_save)
+    monkeypatch.setattr(trainer_mod, "_dist_barrier", lambda: None)
+    monkeypatch.setattr(trainer_mod, "_broadcast_object_list", lambda payload, src=0: payload)
+    monkeypatch.setattr(trainer_mod, "_is_rank0", lambda: True)
+
+    _sync_vllm_rollout_adapter(update_idx=6, vllm_rollout_client=_FakeClient(), policy_model=object())
+
+    candidate_dir = adapter_root / "candidate-6"
+    assert saved_paths == [candidate_dir]
+    assert unload_calls == ["unload"]
+    assert load_calls == [candidate_dir]
+    assert current_dir.is_symlink()
+    assert _resolve_vllm_current_adapter_target(current_dir) == candidate_dir
+    assert candidate_dir.exists()
+    assert not old_dir.exists()
+
+
+def test_sync_vllm_rollout_adapter_restores_previous_candidate_on_load_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    adapter_root = tmp_path / "vllm_adapters"
+    current_dir = adapter_root / "current"
+    old_dir = adapter_root / "candidate-11"
+    old_dir.mkdir(parents=True)
+    (old_dir / "adapter_config.json").write_text('{"base_model_name_or_path": "base"}', encoding="utf-8")
+    (old_dir / "adapter_model.safetensors").write_text("old", encoding="utf-8")
+    current_dir.symlink_to(old_dir, target_is_directory=True)
+
+    load_calls: list[Path] = []
+    unload_calls: list[str] = []
+
+    class _FakeClient:
+        adapter_dir = current_dir
+
+        def unload_adapter(self) -> None:
+            unload_calls.append("unload")
+
+        def load_adapter(self, adapter_path: Path) -> None:
+            load_calls.append(adapter_path)
+            if adapter_path.name == "candidate-12":
+                raise RuntimeError("vLLM returned 500")
+
+    def _fake_save(model, output_dir: Path, *, require_peft_adapter: bool = False) -> None:  # type: ignore[no-untyped-def]
+        assert require_peft_adapter is True
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "adapter_config.json").write_text('{"base_model_name_or_path": "base"}', encoding="utf-8")
+        (output_dir / "adapter_model.safetensors").write_text("new", encoding="utf-8")
+
+    monkeypatch.setattr(trainer_mod, "_save_pretrained_model", _fake_save)
+    monkeypatch.setattr(trainer_mod, "_dist_barrier", lambda: None)
+    monkeypatch.setattr(trainer_mod, "_broadcast_object_list", lambda payload, src=0: payload)
+    monkeypatch.setattr(trainer_mod, "_is_rank0", lambda: True)
+
+    with pytest.raises(RuntimeError, match="failed to refresh vLLM rollout adapter: RuntimeError: vLLM returned 500"):
+        _sync_vllm_rollout_adapter(update_idx=12, vllm_rollout_client=_FakeClient(), policy_model=object())
+
+    candidate_dir = adapter_root / "candidate-12"
+    assert unload_calls == ["unload"]
+    assert load_calls == [candidate_dir, old_dir]
+    assert current_dir.is_symlink()
+    assert _resolve_vllm_current_adapter_target(current_dir) == old_dir
+    assert old_dir.exists()
+    assert candidate_dir.exists()
+
+
+def test_sync_vllm_rollout_adapter_raises_clear_error_when_candidate_rank_exceeds_server_limit(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    adapter_root = tmp_path / "vllm_adapters"
+    current_dir = adapter_root / "current"
+    old_dir = adapter_root / "candidate-20"
+    old_dir.mkdir(parents=True)
+    (old_dir / "adapter_config.json").write_text('{"base_model_name_or_path": "base", "r": 64}', encoding="utf-8")
+    (old_dir / "adapter_model.safetensors").write_text("old", encoding="utf-8")
+    current_dir.symlink_to(old_dir, target_is_directory=True)
+
+    class _FakeClient:
+        adapter_dir = current_dir
+        max_lora_rank = 64
+
+        def unload_adapter(self) -> None:
+            raise AssertionError("unload_adapter should not be reached when rank validation fails")
+
+        def load_adapter(self, adapter_path: Path) -> None:
+            raise AssertionError("load_adapter should not be reached when rank validation fails")
+
+    def _fake_save(model, output_dir: Path, *, require_peft_adapter: bool = False) -> None:  # type: ignore[no-untyped-def]
+        assert require_peft_adapter is True
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "adapter_config.json").write_text('{"base_model_name_or_path": "base", "r": 128}', encoding="utf-8")
+        (output_dir / "adapter_model.safetensors").write_text("new", encoding="utf-8")
+
+    monkeypatch.setattr(trainer_mod, "_save_pretrained_model", _fake_save)
+    monkeypatch.setattr(trainer_mod, "_dist_barrier", lambda: None)
+    monkeypatch.setattr(trainer_mod, "_broadcast_object_list", lambda payload, src=0: payload)
+    monkeypatch.setattr(trainer_mod, "_is_rank0", lambda: True)
+
+    with pytest.raises(RuntimeError, match="adapter_r=128 max_lora_rank=64"):
+        _sync_vllm_rollout_adapter(update_idx=21, vllm_rollout_client=_FakeClient(), policy_model=object())
 
 
 def test_load_policy_model_falls_back_when_resume_adapter_artifacts_are_zero_sized(

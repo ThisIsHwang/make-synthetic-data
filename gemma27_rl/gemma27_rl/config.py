@@ -501,7 +501,7 @@ def _resolve_optional_path(value: str | None, base_dir: Path) -> str | None:
         return None
     text = str(value).strip()
     if not text:
-        return value
+        return None
     path = Path(text).expanduser()
     if path.is_absolute():
         return str(path)
@@ -769,6 +769,12 @@ def _validate_config(cfg: RLPostTrainConfig) -> None:
         raise ValueError("vllm.port must be in 1..65535")
     if cfg.vllm.python_executable is not None and not str(cfg.vllm.python_executable).strip():
         raise ValueError("vllm.python_executable must not be empty when set")
+    if cfg.vllm.adapter_root_dir is not None:
+        adapter_root_dir = str(cfg.vllm.adapter_root_dir).strip()
+        if not adapter_root_dir:
+            raise ValueError("vllm.adapter_root_dir must not be empty when set")
+        if not Path(adapter_root_dir).expanduser().is_absolute():
+            raise ValueError("vllm.adapter_root_dir must be an absolute path when set")
     if float(cfg.vllm.startup_timeout_sec) <= 0:
         raise ValueError("vllm.startup_timeout_sec must be > 0")
     if float(cfg.vllm.request_timeout_sec) <= 0:
