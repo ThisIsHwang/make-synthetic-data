@@ -503,6 +503,62 @@ def test_build_zero3_peft_state_dict_gathers_trainable_params(monkeypatch: pytes
     assert captured["modifier_rank"] == 0
 
 
+def test_save_pretrained_model_preserves_filtered_lora_keys_in_saved_adapter(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    class _FakePeftConfig:
+        def __init__(self) -> None:
+            self.base_model_name_or_path = "base-model"
+            self.inference_mode = False
+            self.task_type = "CAUSAL_LM"
+            self.is_prompt_learning = False
+            self.target_modules = ["q_proj"]
+
+        def save_pretrained(self, output_dir: str, auto_mapping_dict=None) -> None:  # type: ignore[no-untyped-def]
+            del auto_mapping_dict
+            Path(output_dir).mkdir(parents=True, exist_ok=True)
+            (Path(output_dir) / "adapter_config.json").write_text(
+                json.dumps(
+                    {
+                        "base_model_name_or_path": self.base_model_name_or_path,
+                        "target_modules": list(self.target_modules),
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+    class _FakeExportModel(_FakePeftModelBase):
+        def __init__(self) -> None:
+            super().__init__()
+            self.active_adapter = "default"
+            self.peft_config = {"default": _FakePeftConfig()}
+
+        def create_or_update_model_card(self, output_dir: str) -> None:
+            Path(output_dir).mkdir(parents=True, exist_ok=True)
+            (Path(output_dir) / "README.md").write_text("test\n", encoding="utf-8")
+
+    state_dict = {
+        "base_model.model.model.language_model.layers.0.self_attn.q_proj.lora_A.weight": torch.ones(1),
+        "base_model.model.model.language_model.layers.0.self_attn.q_proj.lora_B.weight": torch.ones(1),
+    }
+    monkeypatch.setattr(trainer_mod, "PeftModel", _FakeExportModel)
+    monkeypatch.setattr(trainer_mod, "_build_zero3_peft_state_dict", lambda model: dict(state_dict))
+    monkeypatch.setattr(trainer_mod, "_all_gather_object", lambda value: [value])
+    monkeypatch.setattr(trainer_mod, "_broadcast_object_list", lambda payload, src=0: payload)
+    monkeypatch.setattr(trainer_mod, "_is_rank0", lambda: True)
+
+    model = _FakeExportModel()
+    trainer_mod._save_pretrained_model(model, tmp_path, require_peft_adapter=True)
+
+    _validate_exported_vllm_adapter_dir(tmp_path)
+    from safetensors import safe_open
+
+    with safe_open(str(tmp_path / "adapter_model.safetensors"), framework="pt", device="cpu") as handle:
+        assert sorted(handle.keys()) == sorted(state_dict)
+
+
 def test_validate_exported_vllm_adapter_dir_requires_weight_artifact(tmp_path: Path) -> None:
     (tmp_path / "adapter_config.json").write_text('{"base_model_name_or_path": "base"}', encoding="utf-8")
 

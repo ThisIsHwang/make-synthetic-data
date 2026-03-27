@@ -5639,6 +5639,68 @@ def _rewrite_peft_adapter_config_for_vllm(model: Any, output_dir: Path) -> None:
     del model, output_dir
 
 
+def _save_peft_adapter_weights_and_config(
+    export_model: Any,
+    output_dir: Path,
+    state_dict: dict[str, Any],
+) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    create_or_update_model_card = getattr(export_model, "create_or_update_model_card", None)
+    if callable(create_or_update_model_card):
+        create_or_update_model_card(str(output_dir))
+
+    adapter_name = getattr(export_model, "active_adapter", None)
+    if not isinstance(adapter_name, str) or (not adapter_name.strip()):
+        adapter_name = "default"
+    peft_configs = getattr(export_model, "peft_config", None)
+    peft_config = peft_configs.get(adapter_name) if isinstance(peft_configs, dict) else None
+    if peft_config is None:
+        raise RuntimeError(
+            f"Failed to resolve PEFT config for adapter export: adapter_name={adapter_name!r}"
+        )
+
+    if getattr(peft_config, "base_model_name_or_path", None) is None:
+        base_model = getattr(export_model, "base_model", None)
+        if getattr(peft_config, "is_prompt_learning", False):
+            base_name = getattr(base_model, "name_or_path", None)
+        else:
+            base_name = getattr(getattr(base_model, "model", None), "name_or_path", None)
+        if base_name:
+            peft_config.base_model_name_or_path = base_name
+
+    auto_mapping_dict: dict[str, str] | None = None
+    if getattr(peft_config, "task_type", None) is None:
+        get_base_model_class = getattr(export_model, "_get_base_model_class", None)
+        if callable(get_base_model_class):
+            base_model_class = get_base_model_class(
+                is_prompt_tuning=bool(getattr(peft_config, "is_prompt_learning", False))
+            )
+            auto_mapping_dict = {
+                "base_model_class": str(getattr(base_model_class, "__name__", "")),
+                "parent_library": str(getattr(base_model_class, "__module__", "")),
+            }
+
+    inference_mode = getattr(peft_config, "inference_mode", None)
+    if inference_mode is not None:
+        peft_config.inference_mode = True
+    try:
+        peft_config.save_pretrained(str(output_dir), auto_mapping_dict=auto_mapping_dict)
+    finally:
+        if inference_mode is not None:
+            peft_config.inference_mode = inference_mode
+
+    try:
+        from safetensors.torch import save_file as safe_save_file
+    except Exception:
+        safe_save_file = None
+
+    if callable(safe_save_file):
+        safe_save_file(state_dict, str(output_dir / "adapter_model.safetensors"), metadata={"format": "pt"})
+    else:
+        torch.save(state_dict, output_dir / "adapter_model.bin")
+
+
 def _build_zero3_peft_state_dict(model: Any) -> dict[str, Any] | None:
     if PeftModel is None or get_peft_model_state_dict is None:
         return None
@@ -5720,7 +5782,7 @@ def _save_pretrained_model(model: Any, output_dir: Path, *, require_peft_adapter
                     len(zero3_state_dict),
                     list(zero3_state_dict.keys())[:5],
                 )
-                export_model.save_pretrained(output_dir, state_dict=zero3_state_dict)
+                _save_peft_adapter_weights_and_config(export_model, output_dir, zero3_state_dict)
                 if require_peft_adapter:
                     _rewrite_peft_adapter_config_for_vllm(export_model, output_dir)
             else:
