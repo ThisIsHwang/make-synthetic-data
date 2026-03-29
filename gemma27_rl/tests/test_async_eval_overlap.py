@@ -258,14 +258,14 @@ def test_async_eval_scoring_overlaps_next_train_rollout(monkeypatch, tmp_path) -
         _fake_prepare_training_batch_rollouts_and_advantages,
     )
 
-    def _fake_prepare_eval_rollouts(**kwargs):  # type: ignore[no-untyped-def]
+    def _fake_prepare_eval_rollouts_for_async_eval(**kwargs):  # type: ignore[no-untyped-def]
         events.append("prepare_async_eval_rollouts")
-        return [_rollout("eval-rollout")]
+        return [_rollout("eval-rollout")], object()
 
-    monkeypatch.setattr(trainer_mod, "prepare_eval_rollouts", _fake_prepare_eval_rollouts)
+    monkeypatch.setattr(trainer_mod, "prepare_eval_rollouts_for_async_eval", _fake_prepare_eval_rollouts_for_async_eval)
     monkeypatch.setattr(
         trainer_mod,
-        "build_eval_report_from_rollouts",
+        "build_eval_report_from_scored_rollouts",
         lambda **kwargs: dict(async_reports[0]),
     )
 

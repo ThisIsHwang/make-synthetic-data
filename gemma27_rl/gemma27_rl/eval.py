@@ -1035,6 +1035,91 @@ def build_eval_report_from_rollouts(
     )
 
 
+def build_eval_report_from_scored_rollouts(
+    *,
+    rollouts: list[Rollout],
+    scored_rollouts: _EvalScoringBatch,
+    tokenizer: PreTrainedTokenizerBase,
+    collect_outputs: bool = False,
+) -> dict[str, Any]:
+    return _build_eval_report_from_scored_rollouts(
+        rollouts=rollouts,
+        scored_rollouts=scored_rollouts,
+        tokenizer=tokenizer,
+        collect_outputs=collect_outputs,
+    )
+
+
+def prepare_eval_rollouts_for_async_eval(
+    *,
+    examples: list[Example],
+    policy_model: PreTrainedModel,
+    tokenizer: PreTrainedTokenizerBase,
+    cfg: RLPostTrainConfig,
+    device: str,
+    vllm_rollout_client: LocalVLLMRolloutClient | None = None,
+    show_progress: bool = False,
+    distributed_eval_shard: bool = False,
+    distributed_rank: int = 0,
+    distributed_world_size: int = 1,
+    metricx_scorer: MetricXQEScorer | None = None,
+    xcomet_scorer: XCometXLScorer | None = None,
+    mqm_scorer: OpenAICompatibleMQMScorer | None = None,
+    esa_scorer: OpenAICompatibleESAScorer | None = None,
+) -> tuple[list[Rollout], _EvalScoringBatch | None]:
+    if not examples:
+        return [], None
+
+    shard_eval = bool(distributed_eval_shard and distributed_world_size > 1)
+    pipeline_enabled = (
+        (not shard_eval)
+        and _should_pipeline_eval_api_scoring(cfg=cfg, mqm_scorer=mqm_scorer, esa_scorer=esa_scorer)
+        and _resolve_eval_rollout_pipeline_chunk_size(total_examples=len(examples), cfg=cfg) < len(examples)
+    )
+    if not pipeline_enabled:
+        rollouts = prepare_eval_rollouts(
+            examples=examples,
+            policy_model=policy_model,
+            tokenizer=tokenizer,
+            cfg=cfg,
+            device=device,
+            vllm_rollout_client=vllm_rollout_client,
+            show_progress=bool(show_progress),
+            distributed_eval_shard=distributed_eval_shard,
+            distributed_rank=distributed_rank,
+            distributed_world_size=distributed_world_size,
+        )
+        return rollouts, None
+
+    local_rollouts, local_scored_rollouts = _generate_and_score_eval_rollouts_pipelined(
+        examples=examples,
+        policy_model=policy_model,
+        tokenizer=tokenizer,
+        gen_cfg=_resolve_eval_generation_config(cfg),
+        cfg=cfg,
+        device=device,
+        vllm_rollout_client=vllm_rollout_client,
+        show_progress=bool(show_progress),
+        score_on_this_rank=bool(distributed_world_size <= 1 or distributed_rank == 0),
+        metricx_scorer=metricx_scorer,
+        xcomet_scorer=xcomet_scorer,
+        mqm_scorer=mqm_scorer,
+        esa_scorer=esa_scorer,
+    )
+    rollouts = local_rollouts if distributed_rank == 0 else []
+    scored_rollouts = local_scored_rollouts if distributed_rank == 0 else None
+    if distributed_world_size > 1 and distributed_rank == 0:
+        logger.info(
+            "evaluate_on_dataset: non-sharded distributed eval; using rank0 local rollouts only "
+            "(rollouts=%s, world_size=%s).",
+            len(rollouts),
+            distributed_world_size,
+        )
+    if distributed_rank == 0:
+        logger.info("evaluate_on_dataset: rollout complete rollouts=%s", len(rollouts))
+    return rollouts, scored_rollouts
+
+
 def _generate_and_score_eval_rollouts_pipelined(
     *,
     examples: list[Example],

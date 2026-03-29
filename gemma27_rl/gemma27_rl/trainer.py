@@ -54,7 +54,12 @@ from .advantage import (
 )
 from .config import RLPostTrainConfig, dump_config
 from .data import load_examples
-from .eval import build_eval_report_from_rollouts, evaluate_on_dataset, prepare_eval_rollouts
+from .eval import (
+    build_eval_report_from_rollouts,
+    build_eval_report_from_scored_rollouts,
+    evaluate_on_dataset,
+    prepare_eval_rollouts_for_async_eval,
+)
 from .grpo import update_policy
 from .preprocess import filter_examples_by_max_prompt_tokens, prepare_prompt_token_lengths
 from .prompting import (
@@ -6721,7 +6726,8 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
         if async_eval_enabled and ((not use_deepspeed) or rank0):
             logger.info(
                 "Async eval scoring enabled: eval rollout generation stays synchronous, "
-                "but MQM/ESA report scoring overlaps the next training rollout before policy update."
+                "API scoring starts chunk-by-chunk during eval rollout, and final report assembly "
+                "overlaps the next training rollout before policy update."
             )
 
         def _run_eval_once(*, update_idx: int, collect_outputs: bool, show_progress: bool) -> dict[str, Any]:
@@ -6794,7 +6800,7 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
                 vllm_rollout_client=vllm_rollout_client,
                 policy_model=policy_eval_model,
             )
-            eval_rollouts = prepare_eval_rollouts(
+            eval_rollouts, eval_scored_rollouts = prepare_eval_rollouts_for_async_eval(
                 examples=eval_examples,
                 policy_model=policy_eval_model,
                 tokenizer=tokenizer,
@@ -6805,21 +6811,34 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
                 distributed_eval_shard=distributed_eval_shard,
                 distributed_rank=rank,
                 distributed_world_size=world_size,
+                metricx_scorer=metricx_scorer,
+                xcomet_scorer=xcomet_scorer,
+                mqm_scorer=mqm_scorer,
+                esa_scorer=esa_scorer,
             )
             future = None
             if rank0:
                 assert async_eval_executor is not None
-                future = async_eval_executor.submit(
-                    build_eval_report_from_rollouts,
-                    rollouts=eval_rollouts,
-                    tokenizer=tokenizer,
-                    cfg=cfg,
-                    metricx_scorer=metricx_scorer,
-                    xcomet_scorer=xcomet_scorer,
-                    mqm_scorer=mqm_scorer,
-                    esa_scorer=esa_scorer,
-                    collect_outputs=collect_outputs,
-                )
+                if eval_scored_rollouts is not None:
+                    future = async_eval_executor.submit(
+                        build_eval_report_from_scored_rollouts,
+                        rollouts=eval_rollouts,
+                        scored_rollouts=eval_scored_rollouts,
+                        tokenizer=tokenizer,
+                        collect_outputs=collect_outputs,
+                    )
+                else:
+                    future = async_eval_executor.submit(
+                        build_eval_report_from_rollouts,
+                        rollouts=eval_rollouts,
+                        tokenizer=tokenizer,
+                        cfg=cfg,
+                        metricx_scorer=metricx_scorer,
+                        xcomet_scorer=xcomet_scorer,
+                        mqm_scorer=mqm_scorer,
+                        esa_scorer=esa_scorer,
+                        collect_outputs=collect_outputs,
+                    )
             pending_async_eval = _PendingAsyncEval(
                 update_idx=update_idx,
                 run_before_train=run_before_train,
